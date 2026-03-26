@@ -11,7 +11,7 @@ use crate::storage::engine::KvEngine;
 /// and writes back the response.
 fn handle_client(mut stream: TcpStream, engine: KvEngine) {
     let peer = stream.peer_addr().unwrap();
-    println!("[INFO] Client connected: {}", peer);
+    eprintln!("[INFO] Client connected: {}", peer);
 
     let reader = BufReader::new(stream.try_clone().unwrap());
 
@@ -22,24 +22,24 @@ fn handle_client(mut stream: TcpStream, engine: KvEngine) {
                 if input.is_empty() {
                     continue;
                 }
-                println!("[DEBUG] recv from {}: {}", peer, input);
+                eprintln!("[DEBUG] recv from {}: {}", peer, input);
 
                 let response = execute_command(&input, &engine);
-                println!("[DEBUG] resp to {}: {}", peer, response);
+                eprintln!("[DEBUG] resp to {}: {}", peer, response);
 
                 if let Err(e) = writeln!(stream, "{}", response) {
-                    println!("[ERROR] write failed for {}: {}", peer, e);
+                    eprintln!("[ERROR] write failed for {}: {}", peer, e);
                     break;
                 }
             }
             Err(e) => {
-                println!("[ERROR] read failed for {}: {}", peer, e);
+                eprintln!("[ERROR] read failed for {}: {}", peer, e);
                 break;
             }
         }
     }
 
-    println!("[INFO] Client disconnected: {}", peer);
+    eprintln!("[INFO] Client disconnected: {}", peer);
 }
 
 /// Parse and execute a command against the KV engine, returning the response string
@@ -86,7 +86,7 @@ pub fn start(addr: &str, engine: KvEngine) {
                 });
             }
             Err(e) => {
-                println!("[ERROR] connection failed: {}", e);
+                eprintln!("[ERROR] connection failed: {}", e);
             }
         }
     }

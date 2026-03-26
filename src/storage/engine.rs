@@ -10,6 +10,12 @@ pub struct KvEngine {
     store: Arc<RwLock<HashMap<String, String>>>,
 }
 
+impl Default for KvEngine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl KvEngine {
     /// Create a new empty KV engine
     pub fn new() -> Self {
