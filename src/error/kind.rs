@@ -1,4 +1,5 @@
 use std::fmt;
+use std::sync::PoisonError;
 
 /// Unified error type for FerrumKV
 #[derive(Debug)]
@@ -36,5 +37,11 @@ impl std::error::Error for FerrumError {
 impl From<std::io::Error> for FerrumError {
     fn from(err: std::io::Error) -> Self {
         Self::IoError(err)
+    }
+}
+
+impl<T> From<PoisonError<T>> for FerrumError {
+    fn from(err: PoisonError<T>) -> Self {
+        Self::StorageError(format!("lock poisoned: {err}"))
     }
 }
