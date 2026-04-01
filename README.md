@@ -33,7 +33,7 @@ flowchart TB
     subgraph ProcessLayer ["⚙️ Processing Pipeline"]
         direction LR
         Parser["Protocol Parser (Text)"]
-        Exec("Command Executor (GET/SET/DEL)")
+        Exec("Command Executor (SET/GET/DEL/PING/DBSIZE/FLUSHDB)")
         Fmt["Response Formatter"]
         
         Parser -->|"yield command"| Exec
@@ -85,13 +85,25 @@ telnet 127.0.0.1 6380
 | `GET key`         | Retrieve value by key        | value or `NULL`   |
 | `DEL key`         | Delete a key                 | `OK` or `NULL`    |
 | `PING`            | Health check                 | `PONG`            |
+| `DBSIZE`          | Return number of keys        | count             |
+| `FLUSHDB`         | Remove all keys              | `OK`              |
 
 Commands are **case-insensitive**. Values can contain spaces (e.g. `SET msg hello world`).
 
+## Error Handling
+
+All operations return structured error responses instead of panicking:
+
+- Parse errors: `ERR wrong number of arguments for 'SET' command`
+- Unknown commands: `ERR unknown command: FOOBAR`
+- Internal errors: `ERR internal error: lock poisoned`
+
 ## Roadmap
 
-- [ ] TTL (key expiration)
+- [x] Core KV engine (SET/GET/DEL/PING/DBSIZE/FLUSHDB)
+- [x] Unified error handling with Result propagation
 - [ ] AOF persistence
+- [ ] TTL (key expiration)
 - [ ] RESP protocol support
 - [ ] Async I/O (tokio)
 
