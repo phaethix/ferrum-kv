@@ -22,6 +22,21 @@ fn main() -> ExitCode {
     let mut engine = KvEngine::new();
 
     if let Some(aof_config) = args.aof_config() {
+        match ferrum_kv::persistence::replay(aof_config.path(), &engine) {
+            Ok(stats) => {
+                if stats.applied > 0 || stats.skipped > 0 || stats.truncated_tail {
+                    eprintln!(
+                        "[INFO] AOF replay: applied={} skipped={} truncated_tail={}",
+                        stats.applied, stats.skipped, stats.truncated_tail
+                    );
+                }
+            }
+            Err(e) => {
+                eprintln!("[FATAL] AOF replay failed: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+
         match AofWriter::open(&aof_config) {
             Ok(writer) => {
                 eprintln!(
