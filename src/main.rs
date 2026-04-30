@@ -21,8 +21,6 @@ mod cli;
 const LOG_ENV: &str = "FERRUM_LOG";
 
 fn main() -> ExitCode {
-    init_logger();
-
     let args = match CliArgs::parse(env::args().skip(1)) {
         Ok(Invocation::Run(args)) => args,
         Ok(Invocation::Help) => {
@@ -30,11 +28,15 @@ fn main() -> ExitCode {
             return ExitCode::SUCCESS;
         }
         Err(msg) => {
-            error!("{msg}");
+            // Logger not yet initialised: write straight to stderr so the
+            // user sees the problem even if `RUST_LOG` is misconfigured.
+            eprintln!("ferrum-kv: {msg}");
             eprintln!("{USAGE}");
             return ExitCode::from(2);
         }
     };
+
+    init_logger(args.loglevel());
 
     let engine = match build_engine(&args) {
         Ok(engine) => engine,
@@ -92,16 +94,19 @@ fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// Initialises `env_logger` with a pragmatic default.
+/// Initialises `env_logger` with the following precedence (highest wins):
 ///
-/// Priority order for picking the filter string:
 /// 1. `FERRUM_LOG` — project-specific, takes precedence.
 /// 2. `RUST_LOG`   — the standard `env_logger` convention.
-/// 3. `info`       — sensible default for a server binary.
-fn init_logger() {
+/// 3. `--loglevel` / `loglevel` directive from the config file.
+/// 4. `info`       — sensible default for a server binary.
+///
+/// Environment variables win so that operators can always crank the log
+/// level up (or down) without editing the config file.
+fn init_logger(cli_level: Option<&str>) {
     let filter = env::var(LOG_ENV)
         .or_else(|_| env::var("RUST_LOG"))
-        .unwrap_or_else(|_| "info".to_string());
+        .unwrap_or_else(|_| cli_level.unwrap_or("info").to_string());
     // `try_init` so re-invocations (e.g. in tests) do not panic.
     let _ = env_logger::Builder::new()
         .parse_filters(&filter)
