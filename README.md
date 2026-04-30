@@ -1,7 +1,7 @@
 # FerrumKV 🦀
 
 [![CI](https://github.com/phaethix/ferrum-kv/actions/workflows/ci.yml/badge.svg)](https://github.com/phaethix/ferrum-kv/actions/workflows/ci.yml)
-![version](https://img.shields.io/badge/version-v0.2.0-blue)
+![version](https://img.shields.io/badge/version-v0.3.0-blue)
 
 A lightweight, multi-threaded KV storage server written in Rust — built from scratch for systems programming practice.
 
@@ -156,12 +156,12 @@ Fsync policies follow Redis semantics:
 ## Testing & Benchmarks
 
 ```bash
-cargo test                    # all unit + integration tests (82 unit tests, 5 integration suites)
+cargo test                    # all unit + integration tests (185 unit + 9 integration suites)
 cargo bench                   # Criterion microbenchmarks (engine + RESP2 codec)
 ./scripts/bench-smoke.sh      # native load generator: SET / GET / MIXED @ 100K ops
 ```
 
-The GitHub Actions pipeline runs `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test`, and `cargo bench --no-run` on every push and pull request.
+The GitHub Actions pipeline runs `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test`, and `cargo bench --no-run` on every push and pull request. A `redis-benchmark` smoke run against a release binary (loopback, 100K ops, 50 clients) is captured in [`benches/redis-benchmark.md`](benches/redis-benchmark.md) and refreshed at release time.
 
 ## Roadmap
 
@@ -174,8 +174,8 @@ The GitHub Actions pipeline runs `cargo fmt --check`, `cargo clippy -- -D warnin
 - [x] Structured logging (`log` + `env_logger`) & Redis-style config file
 - [x] Unit / integration / concurrency tests + Criterion benchmarks + CI
 - [x] Key expiration: `EXPIRE` / `PEXPIRE` / `PEXPIREAT` / `PERSIST` / `TTL` / `PTTL` with lazy + active scanning
-- [x] Memory cap + sampled eviction: `noeviction` / `allkeys_lru` / `allkeys_random` / `volatile_lru` / `volatile_random` / `volatile_ttl` (+ `MEMORY USAGE`, `INFO memory`)
-- [ ] LFU & adaptive hybrid eviction (AHE) — *Week 7, in progress*
+- [x] Memory cap + sampled eviction: `noeviction` / `allkeys-lru` / `allkeys-lfu` / `allkeys-random` / `allkeys-ahe` / `volatile-lru` / `volatile-lfu` / `volatile-random` / `volatile-ttl` / `volatile-ahe`
+- [x] Observability: `MEMORY USAGE`, `INFO memory` (incl. `ahe_alpha`), `INFO stats` (`keyspace_hits` / `keyspace_misses`)
 - [ ] Async I/O (Tokio)
 
 ## License
