@@ -176,7 +176,15 @@ fn write_ferrum_error(out: &mut Vec<u8>, err: &FerrumError) {
 pub fn start(addr: &str, engine: KvEngine) -> Result<(), FerrumError> {
     let listener = TcpListener::bind(addr)?;
     eprintln!("[INFO] FerrumKV listening on {addr}");
+    run_listener(listener, engine)
+}
 
+/// Runs the accept loop on an already-bound [`TcpListener`].
+///
+/// Split out from [`start`] so that tests (and future embeddings) can bind
+/// their own listener — for example to port `0` to obtain an OS-assigned
+/// ephemeral port — and drive the server from there.
+pub fn run_listener(listener: TcpListener, engine: KvEngine) -> Result<(), FerrumError> {
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
