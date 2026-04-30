@@ -134,6 +134,14 @@ pub fn execute_command(cmd: Command, engine: &KvEngine, out: &mut Vec<u8>) {
             None => encoder::encode_simple_string(out, "PONG"),
             Some(m) => encoder::encode_bulk_string(out, &m),
         },
+        Command::Append { key, value } => match engine.append(key, value) {
+            Ok(n) => encoder::encode_integer(out, n as i64),
+            Err(e) => write_ferrum_error(out, &e),
+        },
+        Command::StrLen { key } => match engine.strlen(&key) {
+            Ok(n) => encoder::encode_integer(out, n as i64),
+            Err(e) => write_ferrum_error(out, &e),
+        },
         Command::DbSize => match engine.dbsize() {
             Ok(n) => encoder::encode_integer(out, n as i64),
             Err(e) => write_ferrum_error(out, &e),

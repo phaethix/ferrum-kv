@@ -16,6 +16,10 @@ pub enum Command {
     Exists { key: Vec<u8> },
     /// `PING [message]`
     Ping { msg: Option<Vec<u8>> },
+    /// `APPEND key value`
+    Append { key: Vec<u8>, value: Vec<u8> },
+    /// `STRLEN key`
+    StrLen { key: Vec<u8> },
     /// `DBSIZE`, which returns the number of keys.
     DbSize,
     /// `FLUSHDB`, which removes all keys.
@@ -251,6 +255,24 @@ fn build_command(parts: Vec<Vec<u8>>) -> Result<Command, FerrumError> {
             }),
             _ => Err(FerrumError::WrongArity { cmd: "PING" }),
         },
+        b"APPEND" => {
+            if args.len() != 2 {
+                return Err(FerrumError::WrongArity { cmd: "APPEND" });
+            }
+            let mut it = args.into_iter();
+            Ok(Command::Append {
+                key: it.next().unwrap(),
+                value: it.next().unwrap(),
+            })
+        }
+        b"STRLEN" => {
+            if args.len() != 1 {
+                return Err(FerrumError::WrongArity { cmd: "STRLEN" });
+            }
+            Ok(Command::StrLen {
+                key: args.into_iter().next().unwrap(),
+            })
+        }
         b"DBSIZE" => {
             if !args.is_empty() {
                 return Err(FerrumError::WrongArity { cmd: "DBSIZE" });
@@ -379,6 +401,24 @@ mod frame_tests {
     fn parses_dbsize_and_flushdb() {
         assert_eq!(parse_exact(b"*1\r\n$6\r\nDBSIZE\r\n"), Command::DbSize);
         assert_eq!(parse_exact(b"*1\r\n$7\r\nFLUSHDB\r\n"), Command::FlushDb);
+    }
+
+    #[test]
+    fn parses_append_command() {
+        let cmd = parse_exact(b"*3\r\n$6\r\nAPPEND\r\n$1\r\nk\r\n$3\r\nabc\r\n");
+        assert_eq!(
+            cmd,
+            Command::Append {
+                key: b"k".to_vec(),
+                value: b"abc".to_vec(),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_strlen_command() {
+        let cmd = parse_exact(b"*2\r\n$6\r\nSTRLEN\r\n$1\r\nk\r\n");
+        assert_eq!(cmd, Command::StrLen { key: b"k".to_vec() });
     }
 
     #[test]

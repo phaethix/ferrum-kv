@@ -126,6 +126,42 @@ impl KvEngine {
         Ok(store.len())
     }
 
+    /// Appends `suffix` to the value at `key` and returns the new length.
+    ///
+    /// If `key` is absent, the command behaves like `SET` with an empty
+    /// initial value (the same contract as Redis). The resulting value is
+    /// subject to the usual size validation, and the AOF records the new
+    /// full value with a `SET` entry so that replay is guaranteed to
+    /// converge to the same state regardless of history.
+    pub fn append(&self, key: Vec<u8>, suffix: Vec<u8>) -> Result<usize, FerrumError> {
+        validate_key(&key)?;
+
+        let mut store = self.store.write()?;
+        let new_value = match store.get(key.as_slice()) {
+            Some(existing) => {
+                let mut buf = Vec::with_capacity(existing.len() + suffix.len());
+                buf.extend_from_slice(existing);
+                buf.extend_from_slice(&suffix);
+                buf
+            }
+            None => suffix,
+        };
+        validate_value(&new_value)?;
+
+        if let Some(aof) = &self.aof {
+            log_aof_result("APPEND", aof.append_set(&key, &new_value));
+        }
+        let new_len = new_value.len();
+        store.insert(key, new_value);
+        Ok(new_len)
+    }
+
+    /// Returns the byte length of the value at `key`, or `0` if absent.
+    pub fn strlen(&self, key: &[u8]) -> Result<usize, FerrumError> {
+        let store = self.store.read()?;
+        Ok(store.get(key).map(|v| v.len()).unwrap_or(0))
+    }
+
     /// Removes all keys from the store.
     pub fn flushdb(&self) -> Result<(), FerrumError> {
         let mut store = self.store.write()?;
@@ -275,6 +311,68 @@ mod tests {
         );
         assert_eq!(bytes, expected.as_bytes());
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn append_to_missing_key_creates_it() {
+        let engine = KvEngine::new();
+        let len = engine.append(b"k".to_vec(), b"hello".to_vec()).unwrap();
+        assert_eq!(len, 5);
+        assert_eq!(engine.get(b"k").unwrap(), Some(b"hello".to_vec()));
+    }
+
+    #[test]
+    fn append_extends_existing_value() {
+        let engine = KvEngine::new();
+        engine.set(b"k".to_vec(), b"hello ".to_vec()).unwrap();
+        let len = engine.append(b"k".to_vec(), b"world".to_vec()).unwrap();
+        assert_eq!(len, 11);
+        assert_eq!(engine.get(b"k").unwrap(), Some(b"hello world".to_vec()));
+    }
+
+    #[test]
+    fn append_respects_value_size_limit() {
+        let engine = KvEngine::new();
+        let big = vec![b'x'; VALUE_MAX_BYTES];
+        engine.set(b"k".to_vec(), big).unwrap();
+        let err = engine.append(b"k".to_vec(), vec![b'y']).unwrap_err();
+        assert!(matches!(err, FerrumError::ValueTooLarge { .. }));
+    }
+
+    #[test]
+    fn append_persists_final_state_to_aof() {
+        let path = tmp_aof_path("append");
+        let (engine, writer) = engine_with_aof(&path);
+
+        engine.append(b"k".to_vec(), b"hello ".to_vec()).unwrap();
+        engine.append(b"k".to_vec(), b"world".to_vec()).unwrap();
+        drop(engine);
+        drop(writer);
+
+        // Each APPEND is logged as a SET carrying the new full value so
+        // replay converges regardless of the order records are applied in.
+        let bytes = fs::read(&path).unwrap();
+        let expected = concat!(
+            "*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$6\r\nhello \r\n",
+            "*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$11\r\nhello world\r\n",
+        );
+        assert_eq!(bytes, expected.as_bytes());
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn strlen_returns_zero_for_missing_key() {
+        let engine = KvEngine::new();
+        assert_eq!(engine.strlen(b"missing").unwrap(), 0);
+    }
+
+    #[test]
+    fn strlen_counts_raw_bytes() {
+        let engine = KvEngine::new();
+        engine
+            .set(b"k".to_vec(), vec![0x00, 0xff, b'a', b'b'])
+            .unwrap();
+        assert_eq!(engine.strlen(b"k").unwrap(), 4);
     }
 
     #[test]

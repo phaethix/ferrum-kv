@@ -142,6 +142,42 @@ fn del_with_multiple_keys_returns_removed_count() {
 }
 
 #[test]
+fn append_creates_and_extends_value() {
+    let server = spawn_server();
+    let mut s = connect(&server.addr);
+
+    round_trip(
+        &mut s,
+        &build_request(&[b"APPEND", b"k", b"hello "]),
+        b":6\r\n",
+    );
+    round_trip(
+        &mut s,
+        &build_request(&[b"APPEND", b"k", b"world"]),
+        b":11\r\n",
+    );
+    round_trip(
+        &mut s,
+        &build_request(&[b"GET", b"k"]),
+        b"$11\r\nhello world\r\n",
+    );
+}
+
+#[test]
+fn strlen_returns_value_byte_length() {
+    let server = spawn_server();
+    let mut s = connect(&server.addr);
+
+    round_trip(&mut s, &build_request(&[b"STRLEN", b"k"]), b":0\r\n");
+    round_trip(
+        &mut s,
+        &build_request(&[b"SET", b"k", b"hello"]),
+        b"+OK\r\n",
+    );
+    round_trip(&mut s, &build_request(&[b"STRLEN", b"k"]), b":5\r\n");
+}
+
+#[test]
 fn get_missing_key_returns_null_bulk() {
     let server = spawn_server();
     let mut s = connect(&server.addr);
