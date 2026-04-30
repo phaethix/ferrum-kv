@@ -125,6 +125,23 @@ fn set_get_del_exists_roundtrip() {
 }
 
 #[test]
+fn del_with_multiple_keys_returns_removed_count() {
+    let server = spawn_server();
+    let mut s = connect(&server.addr);
+
+    round_trip(&mut s, &build_request(&[b"SET", b"a", b"1"]), b"+OK\r\n");
+    round_trip(&mut s, &build_request(&[b"SET", b"b", b"2"]), b"+OK\r\n");
+    // Two of the three keys exist, so DEL returns :2 and the missing key is
+    // ignored without affecting the tally.
+    round_trip(
+        &mut s,
+        &build_request(&[b"DEL", b"a", b"missing", b"b"]),
+        b":2\r\n",
+    );
+    round_trip(&mut s, &build_request(&[b"DBSIZE"]), b":0\r\n");
+}
+
+#[test]
 fn get_missing_key_returns_null_bulk() {
     let server = spawn_server();
     let mut s = connect(&server.addr);

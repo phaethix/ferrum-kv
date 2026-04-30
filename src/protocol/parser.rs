@@ -10,8 +10,8 @@ pub enum Command {
     Set { key: Vec<u8>, value: Vec<u8> },
     /// `GET key`
     Get { key: Vec<u8> },
-    /// `DEL key`
-    Del { key: Vec<u8> },
+    /// `DEL key [key ...]`
+    Del { keys: Vec<Vec<u8>> },
     /// `EXISTS key`
     Exists { key: Vec<u8> },
     /// `PING [message]`
@@ -231,12 +231,10 @@ fn build_command(parts: Vec<Vec<u8>>) -> Result<Command, FerrumError> {
             })
         }
         b"DEL" => {
-            if args.len() != 1 {
+            if args.is_empty() {
                 return Err(FerrumError::WrongArity { cmd: "DEL" });
             }
-            Ok(Command::Del {
-                key: args.into_iter().next().unwrap(),
-            })
+            Ok(Command::Del { keys: args })
         }
         b"EXISTS" => {
             if args.len() != 1 {
@@ -330,7 +328,23 @@ mod frame_tests {
     #[test]
     fn parses_del_command() {
         let cmd = parse_exact(b"*2\r\n$3\r\nDEL\r\n$1\r\nk\r\n");
-        assert_eq!(cmd, Command::Del { key: b"k".to_vec() });
+        assert_eq!(
+            cmd,
+            Command::Del {
+                keys: vec![b"k".to_vec()],
+            }
+        );
+    }
+
+    #[test]
+    fn parses_del_with_multiple_keys() {
+        let cmd = parse_exact(b"*4\r\n$3\r\nDEL\r\n$1\r\na\r\n$1\r\nb\r\n$1\r\nc\r\n");
+        assert_eq!(
+            cmd,
+            Command::Del {
+                keys: vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()],
+            }
+        );
     }
 
     #[test]
@@ -524,6 +538,15 @@ mod frame_tests {
         assert!(matches!(err, FerrumError::WrongArity { cmd: "SET" }));
         // The full frame was consumed so the connection can keep going.
         assert_eq!(consumed, b"*2\r\n$3\r\nSET\r\n$1\r\nk\r\n".len());
+    }
+
+    #[test]
+    fn del_without_any_key_is_wrong_arity() {
+        let (err, _) = match parse_frame(b"*1\r\n$3\r\nDEL\r\n").unwrap() {
+            FrameParse::Invalid { error, consumed } => (error, consumed),
+            other => panic!("expected Invalid, got {other:?}"),
+        };
+        assert!(matches!(err, FerrumError::WrongArity { cmd: "DEL" }));
     }
 
     #[test]

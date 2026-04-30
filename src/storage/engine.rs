@@ -87,6 +87,33 @@ impl KvEngine {
         Ok(existed)
     }
 
+    /// Deletes every key in `keys` and returns the count of keys that
+    /// actually existed.
+    ///
+    /// The write lock is held for the entire batch so the operation is
+    /// atomic from an observer's point of view: concurrent readers see
+    /// either all deletions or none of them. Persisted log records are
+    /// appended only for keys that were actually removed, mirroring
+    /// Redis' behaviour.
+    pub fn del_many(&self, keys: &[Vec<u8>]) -> Result<usize, FerrumError> {
+        if keys.is_empty() {
+            return Ok(0);
+        }
+        let mut store = self.store.write()?;
+        let mut removed: Vec<&[u8]> = Vec::with_capacity(keys.len());
+        for key in keys {
+            if store.remove(key.as_slice()).is_some() {
+                removed.push(key.as_slice());
+            }
+        }
+        if let Some(aof) = &self.aof {
+            for key in &removed {
+                log_aof_result("DEL", aof.append_del(key));
+            }
+        }
+        Ok(removed.len())
+    }
+
     /// Returns `true` if `key` exists.
     pub fn exists(&self, key: &[u8]) -> Result<bool, FerrumError> {
         let store = self.store.read()?;
@@ -208,6 +235,46 @@ mod tests {
     fn test_del_nonexistent() {
         let engine = KvEngine::new();
         assert!(!engine.del(b"missing").unwrap());
+    }
+
+    #[test]
+    fn del_many_counts_existing_keys_only() {
+        let engine = KvEngine::new();
+        engine.set(b"a".to_vec(), b"1".to_vec()).unwrap();
+        engine.set(b"b".to_vec(), b"2".to_vec()).unwrap();
+
+        let removed = engine
+            .del_many(&[b"a".to_vec(), b"missing".to_vec(), b"b".to_vec()])
+            .unwrap();
+        assert_eq!(removed, 2);
+        assert_eq!(engine.dbsize().unwrap(), 0);
+    }
+
+    #[test]
+    fn del_many_with_empty_input_returns_zero() {
+        let engine = KvEngine::new();
+        assert_eq!(engine.del_many(&[]).unwrap(), 0);
+    }
+
+    #[test]
+    fn del_many_logs_only_existing_keys_to_aof() {
+        let path = tmp_aof_path("del-many");
+        let (engine, writer) = engine_with_aof(&path);
+
+        engine.set(b"a".to_vec(), b"1".to_vec()).unwrap();
+        engine
+            .del_many(&[b"a".to_vec(), b"missing".to_vec()])
+            .unwrap();
+        drop(engine);
+        drop(writer);
+
+        let bytes = fs::read(&path).unwrap();
+        let expected = concat!(
+            "*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\n1\r\n",
+            "*2\r\n$3\r\nDEL\r\n$1\r\na\r\n",
+        );
+        assert_eq!(bytes, expected.as_bytes());
+        let _ = fs::remove_file(&path);
     }
 
     #[test]

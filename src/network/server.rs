@@ -121,9 +121,8 @@ pub fn execute_command(cmd: Command, engine: &KvEngine, out: &mut Vec<u8>) {
             Ok(None) => encoder::encode_null_bulk(out),
             Err(e) => write_ferrum_error(out, &e),
         },
-        Command::Del { key } => match engine.del(&key) {
-            Ok(true) => encoder::encode_integer(out, 1),
-            Ok(false) => encoder::encode_integer(out, 0),
+        Command::Del { keys } => match engine.del_many(&keys) {
+            Ok(n) => encoder::encode_integer(out, n as i64),
             Err(e) => write_ferrum_error(out, &e),
         },
         Command::Exists { key } => match engine.exists(&key) {
