@@ -92,6 +92,22 @@ impl AofWriter {
         self.append(&[b"FLUSHDB"])
     }
 
+    /// Appends a `PEXPIREAT key abs_epoch_ms` entry to the log.
+    ///
+    /// The absolute millisecond timestamp is recorded rather than a relative
+    /// offset so replay stays correct regardless of how long the log has been
+    /// sitting on disk. Any already-past timestamp encountered during replay
+    /// makes the key be dropped immediately.
+    pub fn append_pexpireat(&self, key: &[u8], abs_epoch_ms: i64) -> Result<(), FerrumError> {
+        let ts = abs_epoch_ms.to_string();
+        self.append(&[b"PEXPIREAT", key, ts.as_bytes()])
+    }
+
+    /// Appends a `PERSIST key` entry to the log.
+    pub fn append_persist(&self, key: &[u8]) -> Result<(), FerrumError> {
+        self.append(&[b"PERSIST", key])
+    }
+
     fn append(&self, parts: &[&[u8]]) -> Result<(), FerrumError> {
         let bytes = encode_command(parts);
         self.write_bytes(&bytes)

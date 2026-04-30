@@ -10,6 +10,7 @@ use ferrum_kv::network::server::ServerConfig;
 use ferrum_kv::network::shutdown::Shutdown;
 use ferrum_kv::persistence::AofWriter;
 use ferrum_kv::storage::engine::KvEngine;
+use ferrum_kv::storage::expire;
 
 use crate::cli::{CliArgs, Invocation, USAGE};
 
@@ -83,9 +84,13 @@ fn main() -> ExitCode {
         info!("maxclients: {}", server_config.max_clients);
     }
 
-    if let Err(e) =
-        ferrum_kv::network::server::run_listener(listener, engine, shutdown, server_config)
-    {
+    let expire_handle = expire::spawn(engine.clone(), shutdown.clone());
+
+    let server_result =
+        ferrum_kv::network::server::run_listener(listener, engine, shutdown, server_config);
+    expire_handle.shutdown();
+
+    if let Err(e) = server_result {
         error!("server error: {e}");
         return ExitCode::FAILURE;
     }

@@ -11,7 +11,7 @@ use crate::error::FerrumError;
 use crate::network::shutdown::Shutdown;
 use crate::protocol::encoder;
 use crate::protocol::parser::{self, Command, FrameParse};
-use crate::storage::engine::KvEngine;
+use crate::storage::engine::{KvEngine, TtlStatus, current_epoch_ms};
 
 /// Initial capacity of each per-connection read buffer.
 ///
@@ -306,6 +306,71 @@ pub fn execute_command(cmd: Command, engine: &KvEngine, out: &mut Vec<u8>) {
             Ok(()) => encoder::encode_simple_string(out, "OK"),
             Err(e) => write_ferrum_error(out, &e),
         },
+        Command::Expire { key, seconds } => {
+            let reply = expire_reply(engine, &key, checked_seconds_to_ms(seconds));
+            write_bool_integer(out, reply);
+        }
+        Command::PExpire { key, millis } => {
+            let reply = expire_reply(engine, &key, Some(millis));
+            write_bool_integer(out, reply);
+        }
+        Command::PExpireAt { key, abs_epoch_ms } => match engine.expire_at_ms(&key, abs_epoch_ms) {
+            Ok(true) => encoder::encode_integer(out, 1),
+            Ok(false) => encoder::encode_integer(out, 0),
+            Err(e) => write_ferrum_error(out, &e),
+        },
+        Command::Persist { key } => match engine.persist(&key) {
+            Ok(true) => encoder::encode_integer(out, 1),
+            Ok(false) => encoder::encode_integer(out, 0),
+            Err(e) => write_ferrum_error(out, &e),
+        },
+        Command::Ttl { key } => match engine.ttl_ms(&key) {
+            Ok(TtlStatus::Missing) => encoder::encode_integer(out, -2),
+            Ok(TtlStatus::NoExpire) => encoder::encode_integer(out, -1),
+            Ok(TtlStatus::Millis(ms)) => encoder::encode_integer(out, (ms + 999) / 1000),
+            Err(e) => write_ferrum_error(out, &e),
+        },
+        Command::PTtl { key } => match engine.ttl_ms(&key) {
+            Ok(TtlStatus::Missing) => encoder::encode_integer(out, -2),
+            Ok(TtlStatus::NoExpire) => encoder::encode_integer(out, -1),
+            Ok(TtlStatus::Millis(ms)) => encoder::encode_integer(out, ms),
+            Err(e) => write_ferrum_error(out, &e),
+        },
+    }
+}
+
+/// Converts an `EXPIRE` second delta to milliseconds, saturating on overflow.
+///
+/// A `None` return means the caller should treat the request as "delete this
+/// key right now" — which is how [`KvEngine::expire_at_ms`] interprets an
+/// already-past absolute timestamp.
+fn checked_seconds_to_ms(seconds: i64) -> Option<i64> {
+    seconds.checked_mul(1_000)
+}
+
+/// Computes the absolute epoch-millisecond deadline for `EXPIRE`/`PEXPIRE`
+/// and forwards it to the engine.
+///
+/// A delta that overflows `i64` when expressed in milliseconds (only possible
+/// with `EXPIRE` and astronomically large second counts) is treated the same
+/// way as an in-the-past deadline: the key is dropped on the spot. That keeps
+/// the wire contract simple — either the key existed and was updated
+/// (`:1`), or it did not (`:0`).
+fn expire_reply(engine: &KvEngine, key: &[u8], delta_ms: Option<i64>) -> Result<bool, FerrumError> {
+    let now_ms = current_epoch_ms();
+    let abs_ms = match delta_ms {
+        Some(d) => now_ms.saturating_add(d),
+        None => now_ms, // treat overflow as "expire immediately"
+    };
+    engine.expire_at_ms(key, abs_ms)
+}
+
+/// Writes a `Result<bool, _>` as a RESP integer (`0`/`1`) or as an error.
+fn write_bool_integer(out: &mut Vec<u8>, reply: Result<bool, FerrumError>) {
+    match reply {
+        Ok(true) => encoder::encode_integer(out, 1),
+        Ok(false) => encoder::encode_integer(out, 0),
+        Err(e) => write_ferrum_error(out, &e),
     }
 }
 

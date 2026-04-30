@@ -363,6 +363,29 @@ fn apply_record(engine: &KvEngine, parts: &[Vec<u8>]) -> Result<(), ApplyError> 
             }
             engine.flushdb().map_err(ApplyError::Engine)
         }
+        b"PEXPIREAT" => {
+            if parts.len() != 3 {
+                return Err(ApplyError::Arity(cmd_name(cmd)));
+            }
+            let ts_text =
+                std::str::from_utf8(&parts[2]).map_err(|_| ApplyError::Arity(cmd_name(cmd)))?;
+            let abs_ms: i64 = ts_text
+                .parse()
+                .map_err(|_| ApplyError::Arity(cmd_name(cmd)))?;
+            engine
+                .expire_at_ms(&parts[1], abs_ms)
+                .map(|_| ())
+                .map_err(ApplyError::Engine)
+        }
+        b"PERSIST" => {
+            if parts.len() != 2 {
+                return Err(ApplyError::Arity(cmd_name(cmd)));
+            }
+            engine
+                .persist(&parts[1])
+                .map(|_| ())
+                .map_err(ApplyError::Engine)
+        }
         _ => Err(ApplyError::Unknown(cmd_name(cmd))),
     }
 }
@@ -497,6 +520,75 @@ mod tests {
         let engine = KvEngine::new();
         let stats = replay(&path, &engine).unwrap();
         assert_eq!(stats, ReplayStats::default());
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn replays_pexpireat_and_expires_key_after_deadline() {
+        use crate::storage::engine::TtlStatus;
+
+        let path = tmp_path("pexpireat");
+        let now_ms = crate::storage::engine::current_epoch_ms();
+        let abs_ms = now_ms + 60_000;
+        let abs_text = abs_ms.to_string();
+        let mut content = String::new();
+        content.push_str("*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n");
+        content.push_str(&format!(
+            "*3\r\n$9\r\nPEXPIREAT\r\n$1\r\nk\r\n${}\r\n{}\r\n",
+            abs_text.len(),
+            abs_text,
+        ));
+        fs::write(&path, &content).unwrap();
+
+        let engine = KvEngine::new();
+        let stats = replay(&path, &engine).unwrap();
+        assert_eq!(stats.applied, 2);
+        assert!(matches!(engine.ttl_ms(b"k").unwrap(), TtlStatus::Millis(_)));
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn replay_drops_keys_whose_pexpireat_is_already_past() {
+        let path = tmp_path("pexpireat-past");
+        let now_ms = crate::storage::engine::current_epoch_ms();
+        let abs_ms = now_ms - 1_000; // already expired
+        let abs_text = abs_ms.to_string();
+        let mut content = String::new();
+        content.push_str("*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n");
+        content.push_str(&format!(
+            "*3\r\n$9\r\nPEXPIREAT\r\n$1\r\nk\r\n${}\r\n{}\r\n",
+            abs_text.len(),
+            abs_text,
+        ));
+        fs::write(&path, &content).unwrap();
+
+        let engine = KvEngine::new();
+        replay(&path, &engine).unwrap();
+        assert_eq!(engine.get(b"k").unwrap(), None);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn replays_persist_and_clears_ttl() {
+        use crate::storage::engine::TtlStatus;
+
+        let path = tmp_path("persist");
+        let now_ms = crate::storage::engine::current_epoch_ms();
+        let abs_ms = now_ms + 60_000;
+        let abs_text = abs_ms.to_string();
+        let mut content = String::new();
+        content.push_str("*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n");
+        content.push_str(&format!(
+            "*3\r\n$9\r\nPEXPIREAT\r\n$1\r\nk\r\n${}\r\n{}\r\n",
+            abs_text.len(),
+            abs_text,
+        ));
+        content.push_str("*2\r\n$7\r\nPERSIST\r\n$1\r\nk\r\n");
+        fs::write(&path, &content).unwrap();
+
+        let engine = KvEngine::new();
+        replay(&path, &engine).unwrap();
+        assert!(matches!(engine.ttl_ms(b"k").unwrap(), TtlStatus::NoExpire));
         let _ = fs::remove_file(&path);
     }
 }

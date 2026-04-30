@@ -33,6 +33,19 @@ pub enum Command {
     DbSize,
     /// `FLUSHDB`, which removes all keys.
     FlushDb,
+    /// `EXPIRE key seconds` — set TTL in seconds.
+    Expire { key: Vec<u8>, seconds: i64 },
+    /// `PEXPIRE key milliseconds` — set TTL in milliseconds.
+    PExpire { key: Vec<u8>, millis: i64 },
+    /// `PEXPIREAT key ms-timestamp` — set TTL as an absolute
+    /// Unix epoch millisecond timestamp.
+    PExpireAt { key: Vec<u8>, abs_epoch_ms: i64 },
+    /// `PERSIST key` — remove any TTL.
+    Persist { key: Vec<u8> },
+    /// `TTL key` — remaining TTL in whole seconds.
+    Ttl { key: Vec<u8> },
+    /// `PTTL key` — remaining TTL in milliseconds.
+    PTtl { key: Vec<u8> },
 }
 
 /// Outcome of attempting to parse a single RESP2 frame from a byte buffer.
@@ -360,6 +373,57 @@ fn build_command(parts: Vec<Vec<u8>>) -> Result<Command, FerrumError> {
                 return Err(FerrumError::WrongArity { cmd: "FLUSHDB" });
             }
             Ok(Command::FlushDb)
+        }
+        b"EXPIRE" => {
+            if args.len() != 2 {
+                return Err(FerrumError::WrongArity { cmd: "EXPIRE" });
+            }
+            let mut it = args.into_iter();
+            let key = it.next().unwrap();
+            let seconds = parse_integer_argument(&it.next().unwrap(), "EXPIRE")?;
+            Ok(Command::Expire { key, seconds })
+        }
+        b"PEXPIRE" => {
+            if args.len() != 2 {
+                return Err(FerrumError::WrongArity { cmd: "PEXPIRE" });
+            }
+            let mut it = args.into_iter();
+            let key = it.next().unwrap();
+            let millis = parse_integer_argument(&it.next().unwrap(), "PEXPIRE")?;
+            Ok(Command::PExpire { key, millis })
+        }
+        b"PEXPIREAT" => {
+            if args.len() != 2 {
+                return Err(FerrumError::WrongArity { cmd: "PEXPIREAT" });
+            }
+            let mut it = args.into_iter();
+            let key = it.next().unwrap();
+            let abs_epoch_ms = parse_integer_argument(&it.next().unwrap(), "PEXPIREAT")?;
+            Ok(Command::PExpireAt { key, abs_epoch_ms })
+        }
+        b"PERSIST" => {
+            if args.len() != 1 {
+                return Err(FerrumError::WrongArity { cmd: "PERSIST" });
+            }
+            Ok(Command::Persist {
+                key: args.into_iter().next().unwrap(),
+            })
+        }
+        b"TTL" => {
+            if args.len() != 1 {
+                return Err(FerrumError::WrongArity { cmd: "TTL" });
+            }
+            Ok(Command::Ttl {
+                key: args.into_iter().next().unwrap(),
+            })
+        }
+        b"PTTL" => {
+            if args.len() != 1 {
+                return Err(FerrumError::WrongArity { cmd: "PTTL" });
+            }
+            Ok(Command::PTtl {
+                key: args.into_iter().next().unwrap(),
+            })
         }
         _ => Err(FerrumError::UnknownCommand(
             String::from_utf8_lossy(&name).into_owned(),
@@ -778,5 +842,61 @@ mod frame_tests {
         // trying to allocate or read elements.
         let err = parse_frame(b"*1000000\r\n").unwrap_err();
         assert!(matches!(err, FerrumError::ParseError(_)));
+    }
+
+    #[test]
+    fn parses_expire_and_ttl_family() {
+        assert_eq!(
+            parse_exact(b"*3\r\n$6\r\nEXPIRE\r\n$1\r\nk\r\n$2\r\n60\r\n"),
+            Command::Expire {
+                key: b"k".to_vec(),
+                seconds: 60,
+            }
+        );
+        assert_eq!(
+            parse_exact(b"*3\r\n$7\r\nPEXPIRE\r\n$1\r\nk\r\n$4\r\n1500\r\n"),
+            Command::PExpire {
+                key: b"k".to_vec(),
+                millis: 1500,
+            }
+        );
+        assert_eq!(
+            parse_exact(b"*3\r\n$9\r\nPEXPIREAT\r\n$1\r\nk\r\n$13\r\n1700000000000\r\n"),
+            Command::PExpireAt {
+                key: b"k".to_vec(),
+                abs_epoch_ms: 1_700_000_000_000,
+            }
+        );
+        assert_eq!(
+            parse_exact(b"*2\r\n$7\r\nPERSIST\r\n$1\r\nk\r\n"),
+            Command::Persist { key: b"k".to_vec() }
+        );
+        assert_eq!(
+            parse_exact(b"*2\r\n$3\r\nTTL\r\n$1\r\nk\r\n"),
+            Command::Ttl { key: b"k".to_vec() }
+        );
+        assert_eq!(
+            parse_exact(b"*2\r\n$4\r\nPTTL\r\n$1\r\nk\r\n"),
+            Command::PTtl { key: b"k".to_vec() }
+        );
+    }
+
+    #[test]
+    fn expire_with_non_integer_is_invalid() {
+        let (err, _) = match parse_frame(b"*3\r\n$6\r\nEXPIRE\r\n$1\r\nk\r\n$3\r\nabc\r\n").unwrap()
+        {
+            FrameParse::Invalid { error, consumed } => (error, consumed),
+            other => panic!("expected Invalid, got {other:?}"),
+        };
+        assert!(matches!(err, FerrumError::ParseError(_)));
+    }
+
+    #[test]
+    fn ttl_without_key_is_wrong_arity() {
+        let err = match parse_frame(b"*1\r\n$3\r\nTTL\r\n").unwrap() {
+            FrameParse::Invalid { error, .. } => error,
+            other => panic!("expected Invalid, got {other:?}"),
+        };
+        assert!(matches!(err, FerrumError::WrongArity { cmd: "TTL" }));
     }
 }
