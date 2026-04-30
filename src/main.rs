@@ -4,6 +4,8 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::thread;
 
+use log::{error, info, warn};
+
 use ferrum_kv::network::server::ServerConfig;
 use ferrum_kv::network::shutdown::Shutdown;
 use ferrum_kv::persistence::AofWriter;
@@ -13,7 +15,14 @@ use crate::cli::{CliArgs, Invocation, USAGE};
 
 mod cli;
 
+/// Environment variable consulted by `env_logger`. We prefer a project-specific
+/// name so that users embedding FerrumKV as a library can keep their own
+/// `RUST_LOG` unaffected; we still fall back to `RUST_LOG` for convenience.
+const LOG_ENV: &str = "FERRUM_LOG";
+
 fn main() -> ExitCode {
+    init_logger();
+
     let args = match CliArgs::parse(env::args().skip(1)) {
         Ok(Invocation::Run(args)) => args,
         Ok(Invocation::Help) => {
@@ -21,7 +30,7 @@ fn main() -> ExitCode {
             return ExitCode::SUCCESS;
         }
         Err(msg) => {
-            eprintln!("[FATAL] {msg}");
+            error!("{msg}");
             eprintln!("{USAGE}");
             return ExitCode::from(2);
         }
@@ -37,22 +46,22 @@ fn main() -> ExitCode {
     let listener = match TcpListener::bind(&args.addr) {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("[FATAL] failed to bind {}: {}", args.addr, e);
+            error!("failed to bind {}: {}", args.addr, e);
             return ExitCode::FAILURE;
         }
     };
     let local = match listener.local_addr() {
         Ok(a) => a,
         Err(e) => {
-            eprintln!("[FATAL] local_addr failed: {e}");
+            error!("local_addr failed: {e}");
             return ExitCode::FAILURE;
         }
     };
-    eprintln!("[INFO] FerrumKV listening on {local}");
+    info!("FerrumKV listening on {local}");
 
     let shutdown = Shutdown::new();
     if let Err(e) = install_signal_handlers(shutdown.clone(), local) {
-        eprintln!("[FATAL] failed to install signal handlers: {e}");
+        error!("failed to install signal handlers: {e}");
         return ExitCode::FAILURE;
     }
 
@@ -63,24 +72,41 @@ fn main() -> ExitCode {
             .unwrap_or_else(|| ServerConfig::default().max_clients),
     };
     match server_config.client_timeout {
-        Some(d) => eprintln!("[INFO] client idle timeout: {}s", d.as_secs()),
-        None => eprintln!("[INFO] client idle timeout: disabled"),
+        Some(d) => info!("client idle timeout: {}s", d.as_secs()),
+        None => info!("client idle timeout: disabled"),
     }
     if server_config.max_clients == 0 {
-        eprintln!("[INFO] maxclients: unlimited");
+        info!("maxclients: unlimited");
     } else {
-        eprintln!("[INFO] maxclients: {}", server_config.max_clients);
+        info!("maxclients: {}", server_config.max_clients);
     }
 
     if let Err(e) =
         ferrum_kv::network::server::run_listener(listener, engine, shutdown, server_config)
     {
-        eprintln!("[FATAL] server error: {e}");
+        error!("server error: {e}");
         return ExitCode::FAILURE;
     }
 
-    eprintln!("[INFO] shutdown complete");
+    info!("shutdown complete");
     ExitCode::SUCCESS
+}
+
+/// Initialises `env_logger` with a pragmatic default.
+///
+/// Priority order for picking the filter string:
+/// 1. `FERRUM_LOG` — project-specific, takes precedence.
+/// 2. `RUST_LOG`   — the standard `env_logger` convention.
+/// 3. `info`       — sensible default for a server binary.
+fn init_logger() {
+    let filter = env::var(LOG_ENV)
+        .or_else(|_| env::var("RUST_LOG"))
+        .unwrap_or_else(|_| "info".to_string());
+    // `try_init` so re-invocations (e.g. in tests) do not panic.
+    let _ = env_logger::Builder::new()
+        .parse_filters(&filter)
+        .format_timestamp_secs()
+        .try_init();
 }
 
 /// Builds a `KvEngine`, replaying any existing AOF and attaching a writer
@@ -95,22 +121,22 @@ fn build_engine(args: &CliArgs) -> Result<KvEngine, ExitCode> {
     match ferrum_kv::persistence::replay(aof_config.path(), &engine) {
         Ok(stats) => {
             if stats.applied > 0 || stats.skipped > 0 || stats.truncated_tail {
-                eprintln!(
-                    "[INFO] AOF replay: applied={} skipped={} truncated_tail={}",
+                info!(
+                    "AOF replay: applied={} skipped={} truncated_tail={}",
                     stats.applied, stats.skipped, stats.truncated_tail
                 );
             }
         }
         Err(e) => {
-            eprintln!("[FATAL] AOF replay failed: {e}");
+            error!("AOF replay failed: {e}");
             return Err(ExitCode::FAILURE);
         }
     }
 
     match AofWriter::open(&aof_config) {
         Ok(writer) => {
-            eprintln!(
-                "[INFO] AOF enabled: path={} fsync={:?}",
+            info!(
+                "AOF enabled: path={} fsync={:?}",
                 aof_config.path().display(),
                 aof_config.fsync
             );
@@ -118,7 +144,7 @@ fn build_engine(args: &CliArgs) -> Result<KvEngine, ExitCode> {
             Ok(engine)
         }
         Err(e) => {
-            eprintln!("[FATAL] failed to open AOF file: {e}");
+            error!("failed to open AOF file: {e}");
             Err(ExitCode::FAILURE)
         }
     }
@@ -143,7 +169,7 @@ fn install_signal_handlers(shutdown: Shutdown, wake_addr: SocketAddr) -> std::io
                     SIGTERM => "SIGTERM",
                     _ => "signal",
                 };
-                eprintln!("[INFO] received {name}, initiating graceful shutdown");
+                warn!("received {name}, initiating graceful shutdown");
                 shutdown.trigger();
                 Shutdown::wake_listener(wake_addr);
             }

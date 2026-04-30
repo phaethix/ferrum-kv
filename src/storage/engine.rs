@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
+use log::warn;
+
 use crate::error::FerrumError;
 use crate::persistence::AofWriter;
 
@@ -296,7 +298,7 @@ fn validate_value(value: &[u8]) -> Result<(), FerrumError> {
 /// reported but does not propagate to the client.
 fn log_aof_result(cmd: &str, result: Result<(), FerrumError>) {
     if let Err(e) = result {
-        eprintln!("[WARN] aof append for {cmd} failed: {e}");
+        warn!("aof append for {cmd} failed: {e}");
     }
 }
 
