@@ -18,6 +18,8 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 
+use log::warn;
+
 use crate::error::FerrumError;
 use crate::storage::engine::KvEngine;
 
@@ -65,8 +67,8 @@ fn replay_from_file(
             Ok(None) => break,
             Err(ReadError::UnexpectedEof { consumed }) => {
                 if consumed > 0 {
-                    eprintln!(
-                        "[WARN] aof replay: truncating partial trailing record \
+                    warn!(
+                        "aof replay: truncating partial trailing record \
                          ({consumed} bytes) in '{}'",
                         path.display()
                     );
@@ -75,8 +77,8 @@ fn replay_from_file(
                 break;
             }
             Err(ReadError::Malformed { message, consumed }) => {
-                eprintln!(
-                    "[WARN] aof replay: skipping malformed record ({message}) \
+                warn!(
+                    "aof replay: skipping malformed record ({message}) \
                      in '{}' at byte {last_good}",
                     path.display()
                 );
@@ -107,16 +109,16 @@ fn replay_from_file(
                 last_good = stream_position(&mut reader)?;
             }
             Err(ApplyError::Unknown(cmd)) => {
-                eprintln!(
-                    "[WARN] aof replay: skipping unknown command '{cmd}' in '{}'",
+                warn!(
+                    "aof replay: skipping unknown command '{cmd}' in '{}'",
                     path.display()
                 );
                 stats.skipped += 1;
                 last_good = stream_position(&mut reader)?;
             }
             Err(ApplyError::Arity(cmd)) => {
-                eprintln!(
-                    "[WARN] aof replay: skipping '{cmd}' with wrong argument count in '{}'",
+                warn!(
+                    "aof replay: skipping '{cmd}' with wrong argument count in '{}'",
                     path.display()
                 );
                 stats.skipped += 1;

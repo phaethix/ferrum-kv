@@ -16,6 +16,8 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use log::warn;
+
 use crate::error::FerrumError;
 
 use super::config::{AofConfig, FsyncPolicy};
@@ -201,11 +203,11 @@ fn run(inner: Arc<Mutex<BufWriter<File>>>, shared: Arc<FlusherShared>, interval:
 
         if let Ok(mut guard) = inner.lock() {
             if let Err(e) = guard.flush() {
-                eprintln!("[WARN] aof flush failed: {e}");
+                warn!("aof flush failed: {e}");
                 continue;
             }
             if let Err(e) = guard.get_ref().sync_data() {
-                eprintln!("[WARN] aof fsync failed: {e}");
+                warn!("aof fsync failed: {e}");
             }
         }
     }

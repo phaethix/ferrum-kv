@@ -1,0 +1,34 @@
+# ====================================================================
+# Example FerrumKV configuration file
+# ====================================================================
+#
+# Usage:
+#   cargo run --release -- --config ferrum.conf
+#
+# All directives are optional. Command-line flags (e.g. --addr, --maxclients)
+# always override anything set here. Environment variables FERRUM_LOG and
+# RUST_LOG override the `loglevel` directive below.
+# --------------------------------------------------------------------
+
+# Host and port the server binds to. If both are given they are combined
+# into "host:port"; if one is missing the default (127.0.0.1:6380) fills in.
+bind 127.0.0.1
+port 6380
+
+# Close idle client connections after this many seconds (0 = disabled).
+timeout 300
+
+# Upper bound on concurrent client connections (0 = unlimited).
+maxclients 10000
+
+# Log verbosity: off | error | warn | info | debug | trace
+loglevel info
+
+# ---- Persistence (AOF) ---------------------------------------------
+# Enable Append-Only File persistence. When turned on, `appendfilename`
+# is the path to the log file. Defaults to `appendonly.aof` if omitted.
+# appendonly yes
+# appendfilename "appendonly.aof"
+
+# fsync policy: always | everysec | no
+# appendfsync everysec

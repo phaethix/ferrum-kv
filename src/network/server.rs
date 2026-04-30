@@ -5,6 +5,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::Duration;
 
+use log::{debug, error, info, warn};
+
 use crate::error::FerrumError;
 use crate::network::shutdown::Shutdown;
 use crate::protocol::encoder;
@@ -132,16 +134,16 @@ fn handle_client(
     config: ServerConfig,
 ) -> Result<(), FerrumError> {
     let peer = stream.peer_addr()?;
-    eprintln!("[INFO] Client connected: {peer}");
+    debug!("client connected: {peer}");
 
     // Apply idle timeouts, if configured. A failure here is logged but not
     // fatal: the connection can still function, just without the timeout.
     if let Some(timeout) = config.client_timeout {
         if let Err(e) = stream.set_read_timeout(Some(timeout)) {
-            eprintln!("[WARN] set_read_timeout failed for {peer}: {e}");
+            warn!("set_read_timeout failed for {peer}: {e}");
         }
         if let Err(e) = stream.set_write_timeout(Some(timeout)) {
-            eprintln!("[WARN] set_write_timeout failed for {peer}: {e}");
+            warn!("set_write_timeout failed for {peer}: {e}");
         }
     }
 
@@ -157,11 +159,11 @@ fn handle_client(
             Ok(0) => break, // Orderly EOF: client closed the connection.
             Ok(n) => n,
             Err(e) if is_timeout(&e) => {
-                eprintln!("[INFO] {peer} idle timeout, closing connection");
+                info!("{peer} idle timeout, closing connection");
                 return Ok(());
             }
             Err(e) => {
-                eprintln!("[ERROR] read failed for {peer}: {e}");
+                error!("read failed for {peer}: {e}");
                 return Err(e.into());
             }
         };
@@ -174,7 +176,7 @@ fn handle_client(
                     outbuf.clear();
                     execute_command(command, &engine, &mut outbuf);
                     if let Err(e) = stream.write_all(&outbuf) {
-                        eprintln!("[ERROR] write failed for {peer}: {e}");
+                        error!("write failed for {peer}: {e}");
                         return Err(e.into());
                     }
                     inbuf.drain(..consumed);
@@ -186,7 +188,7 @@ fn handle_client(
                     outbuf.clear();
                     write_ferrum_error(&mut outbuf, &error);
                     if let Err(e) = stream.write_all(&outbuf) {
-                        eprintln!("[ERROR] write failed for {peer}: {e}");
+                        error!("write failed for {peer}: {e}");
                         return Err(e.into());
                     }
                     inbuf.drain(..consumed);
@@ -198,7 +200,7 @@ fn handle_client(
                     outbuf.clear();
                     write_ferrum_error(&mut outbuf, &e);
                     let _ = stream.write_all(&outbuf);
-                    eprintln!("[WARN] protocol error from {peer}: {e}");
+                    warn!("protocol error from {peer}: {e}");
                     return Ok(());
                 }
             }
@@ -208,12 +210,12 @@ fn handle_client(
             outbuf.clear();
             encoder::encode_error(&mut outbuf, "ERR request too large");
             let _ = stream.write_all(&outbuf);
-            eprintln!("[WARN] request buffer overflow from {peer}");
+            warn!("request buffer overflow from {peer}");
             return Ok(());
         }
     }
 
-    eprintln!("[INFO] Client disconnected: {peer}");
+    debug!("client disconnected: {peer}");
     Ok(())
 }
 
@@ -342,7 +344,7 @@ pub fn start(
 ) -> Result<(), FerrumError> {
     let listener = TcpListener::bind(addr)?;
     let local = listener.local_addr()?;
-    eprintln!("[INFO] FerrumKV listening on {local}");
+    info!("FerrumKV listening on {local}");
     run_listener(listener, engine, shutdown, config)
 }
 
@@ -373,8 +375,8 @@ pub fn run_listener(
                         .peer_addr()
                         .map(|a| a.to_string())
                         .unwrap_or_else(|_| "<unknown>".into());
-                    eprintln!(
-                        "[WARN] rejecting {peer}: max_clients={} reached",
+                    warn!(
+                        "rejecting {peer}: max_clients={} reached",
                         config.max_clients
                     );
                     let mut out = Vec::with_capacity(64);
@@ -387,17 +389,17 @@ pub fn run_listener(
                 let config = config.clone();
                 thread::spawn(move || {
                     if let Err(e) = handle_client(stream, engine, shutdown, config) {
-                        eprintln!("[ERROR] client handler error: {e}");
+                        error!("client handler error: {e}");
                     }
                     drop(guard);
                 });
             }
             Err(e) => {
-                eprintln!("[ERROR] connection failed: {e}");
+                error!("connection failed: {e}");
             }
         }
     }
 
-    eprintln!("[INFO] accept loop exiting");
+    info!("accept loop exiting");
     Ok(())
 }
