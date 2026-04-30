@@ -58,21 +58,21 @@ impl AofWriter {
     }
 
     /// Appends a `SET key value` entry to the log.
-    pub fn append_set(&self, key: &str, value: &str) -> Result<(), FerrumError> {
-        self.append(&["SET", key, value])
+    pub fn append_set(&self, key: &[u8], value: &[u8]) -> Result<(), FerrumError> {
+        self.append(&[b"SET", key, value])
     }
 
     /// Appends a `DEL key` entry to the log.
-    pub fn append_del(&self, key: &str) -> Result<(), FerrumError> {
-        self.append(&["DEL", key])
+    pub fn append_del(&self, key: &[u8]) -> Result<(), FerrumError> {
+        self.append(&[b"DEL", key])
     }
 
     /// Appends a `FLUSHDB` entry to the log.
     pub fn append_flushdb(&self) -> Result<(), FerrumError> {
-        self.append(&["FLUSHDB"])
+        self.append(&[b"FLUSHDB"])
     }
 
-    fn append(&self, parts: &[&str]) -> Result<(), FerrumError> {
+    fn append(&self, parts: &[&[u8]]) -> Result<(), FerrumError> {
         let bytes = encode_command(parts);
         let mut guard = self.inner.lock()?;
         guard
@@ -215,7 +215,7 @@ mod tests {
         let cfg = AofConfig::new(&path, FsyncPolicy::Always);
         {
             let writer = AofWriter::open(&cfg).unwrap();
-            writer.append_set("name", "ferrum").unwrap();
+            writer.append_set(b"name", b"ferrum").unwrap();
         }
 
         let bytes = fs::read(&path).unwrap();
@@ -229,8 +229,8 @@ mod tests {
         let cfg = AofConfig::new(&path, FsyncPolicy::Always);
         {
             let writer = AofWriter::open(&cfg).unwrap();
-            writer.append_set("a", "1").unwrap();
-            writer.append_del("a").unwrap();
+            writer.append_set(b"a", b"1").unwrap();
+            writer.append_del(b"a").unwrap();
             writer.append_flushdb().unwrap();
         }
 
@@ -250,11 +250,11 @@ mod tests {
         let cfg = AofConfig::new(&path, FsyncPolicy::Always);
         {
             let writer = AofWriter::open(&cfg).unwrap();
-            writer.append_set("k", "v1").unwrap();
+            writer.append_set(b"k", b"v1").unwrap();
         }
         {
             let writer = AofWriter::open(&cfg).unwrap();
-            writer.append_set("k", "v2").unwrap();
+            writer.append_set(b"k", b"v2").unwrap();
         }
 
         let bytes = fs::read(&path).unwrap();
@@ -272,7 +272,7 @@ mod tests {
         let cfg = AofConfig::new(&path, FsyncPolicy::No);
         {
             let writer = AofWriter::open(&cfg).unwrap();
-            writer.append_set("k", "v").unwrap();
+            writer.append_set(b"k", b"v").unwrap();
             // `No` may keep data buffered; Drop must flush it out.
         }
 
@@ -286,7 +286,7 @@ mod tests {
         let path = tmp_path("everysec");
         let cfg = AofConfig::new(&path, FsyncPolicy::EverySec);
         let writer = AofWriter::open(&cfg).unwrap();
-        writer.append_set("k", "v").unwrap();
+        writer.append_set(b"k", b"v").unwrap();
         // Give the background flusher time to sync at least once.
         thread::sleep(Duration::from_millis(1500));
         let bytes = fs::read(&path).unwrap();
@@ -305,7 +305,8 @@ mod tests {
         for i in 0..16 {
             let w = Arc::clone(&writer);
             handles.push(thread::spawn(move || {
-                w.append_set(&format!("k{i}"), &format!("v{i}")).unwrap();
+                w.append_set(format!("k{i}").as_bytes(), format!("v{i}").as_bytes())
+                    .unwrap();
             }));
         }
         for h in handles {

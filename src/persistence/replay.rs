@@ -167,7 +167,10 @@ enum ApplyError {
 /// Reads a single RESP2 Array-of-Bulk-Strings record.
 ///
 /// Returns `Ok(None)` on clean EOF before any byte of the next record.
-fn read_record<R: Read>(reader: &mut R) -> Result<Option<Vec<String>>, ReadError> {
+/// Bulk payloads are returned as raw bytes because the AOF must faithfully
+/// replay whatever the write path committed, including values that are not
+/// valid UTF-8.
+fn read_record<R: Read>(reader: &mut R) -> Result<Option<Vec<Vec<u8>>>, ReadError> {
     let mut consumed = 0usize;
 
     let first = match read_byte(reader)? {
@@ -193,7 +196,7 @@ fn read_record<R: Read>(reader: &mut R) -> Result<Option<Vec<String>>, ReadError
         });
     }
 
-    let mut parts = Vec::with_capacity(array_len as usize);
+    let mut parts: Vec<Vec<u8>> = Vec::with_capacity(array_len as usize);
     for _ in 0..array_len {
         let marker = expect_byte(reader, &mut consumed)?;
         if marker != b'$' {
@@ -219,11 +222,7 @@ fn read_record<R: Read>(reader: &mut R) -> Result<Option<Vec<String>>, ReadError
                 consumed,
             });
         }
-        let part = String::from_utf8(buf).map_err(|e| ReadError::Malformed {
-            message: format!("non-UTF8 bulk string: {e}"),
-            consumed,
-        })?;
-        parts.push(part);
+        parts.push(buf);
     }
 
     Ok(Some(parts))
@@ -331,38 +330,44 @@ fn resync_to_next_array<R: Read + Seek>(reader: &mut R) -> Result<bool, FerrumEr
     }
 }
 
-fn apply_record(engine: &KvEngine, parts: &[String]) -> Result<(), ApplyError> {
+fn apply_record(engine: &KvEngine, parts: &[Vec<u8>]) -> Result<(), ApplyError> {
     let Some(cmd) = parts.first() else {
         return Err(ApplyError::Arity(String::new()));
     };
 
-    match cmd.to_ascii_uppercase().as_str() {
-        "SET" => {
+    let upper: Vec<u8> = cmd.iter().map(|b| b.to_ascii_uppercase()).collect();
+    match upper.as_slice() {
+        b"SET" => {
             if parts.len() != 3 {
-                return Err(ApplyError::Arity(cmd.clone()));
+                return Err(ApplyError::Arity(cmd_name(cmd)));
             }
             engine
                 .set(parts[1].clone(), parts[2].clone())
                 .map(|_| ())
                 .map_err(ApplyError::Engine)
         }
-        "DEL" => {
+        b"DEL" => {
             if parts.len() != 2 {
-                return Err(ApplyError::Arity(cmd.clone()));
+                return Err(ApplyError::Arity(cmd_name(cmd)));
             }
             engine
                 .del(&parts[1])
                 .map(|_| ())
                 .map_err(ApplyError::Engine)
         }
-        "FLUSHDB" => {
+        b"FLUSHDB" => {
             if parts.len() != 1 {
-                return Err(ApplyError::Arity(cmd.clone()));
+                return Err(ApplyError::Arity(cmd_name(cmd)));
             }
             engine.flushdb().map_err(ApplyError::Engine)
         }
-        _ => Err(ApplyError::Unknown(cmd.clone())),
+        _ => Err(ApplyError::Unknown(cmd_name(cmd))),
     }
+}
+
+/// Renders a command name for log messages, escaping non-UTF8 bytes.
+fn cmd_name(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).into_owned()
 }
 
 #[cfg(test)]
@@ -407,8 +412,8 @@ mod tests {
         assert_eq!(stats.applied, 3);
         assert_eq!(stats.skipped, 0);
         assert!(!stats.truncated_tail);
-        assert_eq!(engine.get("a").unwrap(), None);
-        assert_eq!(engine.get("b").unwrap(), Some("2".into()));
+        assert_eq!(engine.get(b"a").unwrap(), None);
+        assert_eq!(engine.get(b"b").unwrap(), Some(b"2".to_vec()));
 
         let _ = fs::remove_file(&path);
     }
@@ -441,8 +446,8 @@ mod tests {
         let stats = replay(&path, &engine).unwrap();
         assert_eq!(stats.applied, 1);
         assert!(stats.truncated_tail);
-        assert_eq!(engine.get("a").unwrap(), Some("1".into()));
-        assert_eq!(engine.get("b").unwrap(), None);
+        assert_eq!(engine.get(b"a").unwrap(), Some(b"1".to_vec()));
+        assert_eq!(engine.get(b"b").unwrap(), None);
 
         // The file should now end exactly at the last good record boundary.
         let bytes = fs::read(&path).unwrap();
@@ -464,8 +469,8 @@ mod tests {
         let stats = replay(&path, &engine).unwrap();
         assert_eq!(stats.applied, 2);
         assert_eq!(stats.skipped, 1);
-        assert_eq!(engine.get("a").unwrap(), Some("1".into()));
-        assert_eq!(engine.get("b").unwrap(), Some("2".into()));
+        assert_eq!(engine.get(b"a").unwrap(), Some(b"1".to_vec()));
+        assert_eq!(engine.get(b"b").unwrap(), Some(b"2".to_vec()));
         let _ = fs::remove_file(&path);
     }
 
@@ -478,7 +483,7 @@ mod tests {
 
         let engine = KvEngine::new();
         replay(&path, &engine).unwrap();
-        assert_eq!(engine.get("k").unwrap(), Some("a\r\nb".into()));
+        assert_eq!(engine.get(b"k").unwrap(), Some(b"a\r\nb".to_vec()));
         let _ = fs::remove_file(&path);
     }
 

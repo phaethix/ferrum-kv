@@ -39,9 +39,9 @@ fn writes_survive_restart_with_always_policy() {
     let path = tmp_path("restart-always");
     {
         let (engine, writer) = engine_with_writer(&path, FsyncPolicy::Always);
-        engine.set("name".into(), "ferrum".into()).unwrap();
-        engine.set("lang".into(), "rust".into()).unwrap();
-        engine.del("lang").unwrap();
+        engine.set(b"name".to_vec(), b"ferrum".to_vec()).unwrap();
+        engine.set(b"lang".to_vec(), b"rust".to_vec()).unwrap();
+        engine.del(b"lang").unwrap();
         drop(engine);
         drop(writer);
     }
@@ -52,8 +52,8 @@ fn writes_survive_restart_with_always_policy() {
     assert_eq!(stats.skipped, 0);
     assert!(!stats.truncated_tail);
 
-    assert_eq!(restored.get("name").unwrap(), Some("ferrum".into()));
-    assert_eq!(restored.get("lang").unwrap(), None);
+    assert_eq!(restored.get(b"name").unwrap(), Some(b"ferrum".to_vec()));
+    assert_eq!(restored.get(b"lang").unwrap(), None);
     assert_eq!(restored.dbsize().unwrap(), 1);
 
     let _ = fs::remove_file(&path);
@@ -65,10 +65,11 @@ fn writes_survive_restart_with_everysec_policy() {
     {
         let (engine, writer) = engine_with_writer(&path, FsyncPolicy::EverySec);
         for i in 0..20 {
-            engine.set(format!("k{i}"), format!("v{i}")).unwrap();
+            engine
+                .set(format!("k{i}").into_bytes(), format!("v{i}").into_bytes())
+                .unwrap();
         }
         drop(engine);
-        // Dropping the writer flushes + fsyncs before returning.
         drop(writer);
     }
 
@@ -76,8 +77,8 @@ fn writes_survive_restart_with_everysec_policy() {
     replay(&path, &restored).unwrap();
     for i in 0..20 {
         assert_eq!(
-            restored.get(&format!("k{i}")).unwrap(),
-            Some(format!("v{i}"))
+            restored.get(format!("k{i}").as_bytes()).unwrap(),
+            Some(format!("v{i}").into_bytes())
         );
     }
 
@@ -89,14 +90,14 @@ fn writes_survive_restart_with_no_policy() {
     let path = tmp_path("restart-no");
     {
         let (engine, writer) = engine_with_writer(&path, FsyncPolicy::No);
-        engine.set("k".into(), "v".into()).unwrap();
+        engine.set(b"k".to_vec(), b"v".to_vec()).unwrap();
         drop(engine);
         drop(writer);
     }
 
     let restored = KvEngine::new();
     replay(&path, &restored).unwrap();
-    assert_eq!(restored.get("k").unwrap(), Some("v".into()));
+    assert_eq!(restored.get(b"k").unwrap(), Some(b"v".to_vec()));
 
     let _ = fs::remove_file(&path);
 }
@@ -106,19 +107,19 @@ fn flushdb_is_replayed_and_resets_state() {
     let path = tmp_path("flushdb");
     {
         let (engine, writer) = engine_with_writer(&path, FsyncPolicy::Always);
-        engine.set("a".into(), "1".into()).unwrap();
-        engine.set("b".into(), "2".into()).unwrap();
+        engine.set(b"a".to_vec(), b"1".to_vec()).unwrap();
+        engine.set(b"b".to_vec(), b"2".to_vec()).unwrap();
         engine.flushdb().unwrap();
-        engine.set("c".into(), "3".into()).unwrap();
+        engine.set(b"c".to_vec(), b"3".to_vec()).unwrap();
         drop(engine);
         drop(writer);
     }
 
     let restored = KvEngine::new();
     replay(&path, &restored).unwrap();
-    assert_eq!(restored.get("a").unwrap(), None);
-    assert_eq!(restored.get("b").unwrap(), None);
-    assert_eq!(restored.get("c").unwrap(), Some("3".into()));
+    assert_eq!(restored.get(b"a").unwrap(), None);
+    assert_eq!(restored.get(b"b").unwrap(), None);
+    assert_eq!(restored.get(b"c").unwrap(), Some(b"3".to_vec()));
     assert_eq!(restored.dbsize().unwrap(), 1);
 
     let _ = fs::remove_file(&path);
@@ -129,8 +130,8 @@ fn read_only_commands_do_not_grow_the_log() {
     let path = tmp_path("readonly");
     {
         let (engine, writer) = engine_with_writer(&path, FsyncPolicy::Always);
-        engine.get("missing").unwrap();
-        engine.exists("missing").unwrap();
+        engine.get(b"missing").unwrap();
+        engine.exists(b"missing").unwrap();
         engine.dbsize().unwrap();
         drop(engine);
         drop(writer);
@@ -147,17 +148,37 @@ fn read_only_commands_do_not_grow_the_log() {
 #[test]
 fn values_containing_crlf_round_trip_through_aof() {
     let path = tmp_path("crlf");
-    let tricky = "line1\r\nline2\r\n";
+    let tricky: &[u8] = b"line1\r\nline2\r\n";
     {
         let (engine, writer) = engine_with_writer(&path, FsyncPolicy::Always);
-        engine.set("k".into(), tricky.into()).unwrap();
+        engine.set(b"k".to_vec(), tricky.to_vec()).unwrap();
         drop(engine);
         drop(writer);
     }
 
     let restored = KvEngine::new();
     replay(&path, &restored).unwrap();
-    assert_eq!(restored.get("k").unwrap(), Some(tricky.into()));
+    assert_eq!(restored.get(b"k").unwrap(), Some(tricky.to_vec()));
+
+    let _ = fs::remove_file(&path);
+}
+
+#[test]
+fn binary_keys_and_values_round_trip_through_aof() {
+    let path = tmp_path("binary");
+    let key: Vec<u8> = vec![0x00, 0xff, 0x01, b'\r', b'\n'];
+    let value: Vec<u8> = vec![0x80, 0x00, 0xc3, 0x28, 0xfe, 0x01];
+    {
+        let (engine, writer) = engine_with_writer(&path, FsyncPolicy::Always);
+        engine.set(key.clone(), value.clone()).unwrap();
+        drop(engine);
+        drop(writer);
+    }
+
+    let restored = KvEngine::new();
+    let stats = replay(&path, &restored).unwrap();
+    assert_eq!(stats.applied, 1);
+    assert_eq!(restored.get(&key).unwrap(), Some(value));
 
     let _ = fs::remove_file(&path);
 }
@@ -167,7 +188,7 @@ fn partial_tail_is_recovered_and_file_is_truncated() {
     let path = tmp_path("partial-tail");
     {
         let (engine, writer) = engine_with_writer(&path, FsyncPolicy::Always);
-        engine.set("a".into(), "1".into()).unwrap();
+        engine.set(b"a".to_vec(), b"1".to_vec()).unwrap();
         drop(engine);
         drop(writer);
     }
@@ -185,8 +206,8 @@ fn partial_tail_is_recovered_and_file_is_truncated() {
     let stats = replay(&path, &restored).unwrap();
     assert!(stats.truncated_tail);
     assert_eq!(stats.applied, 1);
-    assert_eq!(restored.get("a").unwrap(), Some("1".into()));
-    assert_eq!(restored.get("b").unwrap(), None);
+    assert_eq!(restored.get(b"a").unwrap(), Some(b"1".to_vec()));
+    assert_eq!(restored.get(b"b").unwrap(), None);
 
     // Second replay should be a clean pass over the truncated file.
     let second = KvEngine::new();
@@ -203,12 +224,11 @@ fn reopening_writer_does_not_duplicate_prior_records() {
 
     {
         let (engine, writer) = engine_with_writer(&path, FsyncPolicy::Always);
-        engine.set("a".into(), "1".into()).unwrap();
+        engine.set(b"a".to_vec(), b"1".to_vec()).unwrap();
         drop(engine);
         drop(writer);
     }
 
-    // Simulate server restart: replay, then reopen writer in append mode.
     let restored = KvEngine::new();
     replay(&path, &restored).unwrap();
     let (engine, writer) = {
@@ -217,16 +237,15 @@ fn reopening_writer_does_not_duplicate_prior_records() {
         let engine = restored.with_aof(Arc::clone(&writer));
         (engine, writer)
     };
-    engine.set("b".into(), "2".into()).unwrap();
+    engine.set(b"b".to_vec(), b"2".to_vec()).unwrap();
     drop(engine);
     drop(writer);
 
-    // Final replay should see exactly two commands, no duplicates.
     let final_engine = KvEngine::new();
     let stats = replay(&path, &final_engine).unwrap();
     assert_eq!(stats.applied, 2);
-    assert_eq!(final_engine.get("a").unwrap(), Some("1".into()));
-    assert_eq!(final_engine.get("b").unwrap(), Some("2".into()));
+    assert_eq!(final_engine.get(b"a").unwrap(), Some(b"1".to_vec()));
+    assert_eq!(final_engine.get(b"b").unwrap(), Some(b"2".to_vec()));
 
     let _ = fs::remove_file(&path);
 }

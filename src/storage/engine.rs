@@ -12,9 +12,10 @@ pub const VALUE_MAX_BYTES: usize = 16 * 1024 * 1024;
 
 /// A thread-safe key-value storage engine backed by a [`HashMap`].
 ///
-/// The store uses `Arc<RwLock<HashMap<String, String>>>` for concurrent access.
-/// Multiple readers may access the map at the same time, while writers acquire
-/// exclusive access.
+/// Keys and values are stored as `Vec<u8>`, making the engine fully
+/// binary-safe: NUL bytes, bytes above 0x7F, and embedded CRLF are all
+/// preserved verbatim. This matches the contract of the RESP2 bulk string,
+/// which is already byte-oriented on the wire.
 ///
 /// Mutating commands (`SET`, `DEL`, `FLUSHDB`) are optionally forwarded to an
 /// [`AofWriter`] so changes survive a restart. The log is appended while the
@@ -26,7 +27,7 @@ pub const VALUE_MAX_BYTES: usize = 16 * 1024 * 1024;
 /// of causing a panic.
 #[derive(Clone)]
 pub struct KvEngine {
-    store: Arc<RwLock<HashMap<String, String>>>,
+    store: Arc<RwLock<HashMap<Vec<u8>, Vec<u8>>>>,
     aof: Option<Arc<AofWriter>>,
 }
 
@@ -58,26 +59,26 @@ impl KvEngine {
     ///
     /// Returns [`FerrumError::KeyTooLong`] or [`FerrumError::ValueTooLarge`] if
     /// the configured size limits are exceeded.
-    pub fn set(&self, key: String, value: String) -> Result<Option<String>, FerrumError> {
+    pub fn set(&self, key: Vec<u8>, value: Vec<u8>) -> Result<Option<Vec<u8>>, FerrumError> {
         validate_key(&key)?;
         validate_value(&value)?;
 
         let mut store = self.store.write()?;
-        let previous = store.insert(key.clone(), value.clone());
         if let Some(aof) = &self.aof {
             log_aof_result("SET", aof.append_set(&key, &value));
         }
+        let previous = store.insert(key, value);
         Ok(previous)
     }
 
     /// Returns the value for `key`, or `None` if the key does not exist.
-    pub fn get(&self, key: &str) -> Result<Option<String>, FerrumError> {
+    pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, FerrumError> {
         let store = self.store.read()?;
         Ok(store.get(key).cloned())
     }
 
     /// Deletes `key` and returns `true` if it existed.
-    pub fn del(&self, key: &str) -> Result<bool, FerrumError> {
+    pub fn del(&self, key: &[u8]) -> Result<bool, FerrumError> {
         let mut store = self.store.write()?;
         let existed = store.remove(key).is_some();
         if existed && let Some(aof) = &self.aof {
@@ -87,7 +88,7 @@ impl KvEngine {
     }
 
     /// Returns `true` if `key` exists.
-    pub fn exists(&self, key: &str) -> Result<bool, FerrumError> {
+    pub fn exists(&self, key: &[u8]) -> Result<bool, FerrumError> {
         let store = self.store.read()?;
         Ok(store.contains_key(key))
     }
@@ -109,8 +110,7 @@ impl KvEngine {
     }
 }
 
-/// Validates the key length constraint.
-fn validate_key(key: &str) -> Result<(), FerrumError> {
+fn validate_key(key: &[u8]) -> Result<(), FerrumError> {
     let len = key.len();
     if len == 0 {
         return Err(FerrumError::ParseError("key must not be empty".into()));
@@ -124,8 +124,7 @@ fn validate_key(key: &str) -> Result<(), FerrumError> {
     Ok(())
 }
 
-/// Validates the value length constraint.
-fn validate_value(value: &str) -> Result<(), FerrumError> {
+fn validate_value(value: &[u8]) -> Result<(), FerrumError> {
     let len = value.len();
     if len > VALUE_MAX_BYTES {
         return Err(FerrumError::ValueTooLarge {
@@ -178,49 +177,47 @@ mod tests {
     #[test]
     fn test_set_and_get() {
         let engine = KvEngine::new();
-        engine
-            .set("name".to_string(), "ferrum".to_string())
-            .unwrap();
-        assert_eq!(engine.get("name").unwrap(), Some("ferrum".to_string()));
+        engine.set(b"name".to_vec(), b"ferrum".to_vec()).unwrap();
+        assert_eq!(engine.get(b"name").unwrap(), Some(b"ferrum".to_vec()));
     }
 
     #[test]
     fn test_get_nonexistent() {
         let engine = KvEngine::new();
-        assert_eq!(engine.get("missing").unwrap(), None);
+        assert_eq!(engine.get(b"missing").unwrap(), None);
     }
 
     #[test]
     fn test_set_overwrite() {
         let engine = KvEngine::new();
-        engine.set("key".to_string(), "v1".to_string()).unwrap();
-        let old = engine.set("key".to_string(), "v2".to_string()).unwrap();
-        assert_eq!(old, Some("v1".to_string()));
-        assert_eq!(engine.get("key").unwrap(), Some("v2".to_string()));
+        engine.set(b"key".to_vec(), b"v1".to_vec()).unwrap();
+        let old = engine.set(b"key".to_vec(), b"v2".to_vec()).unwrap();
+        assert_eq!(old, Some(b"v1".to_vec()));
+        assert_eq!(engine.get(b"key").unwrap(), Some(b"v2".to_vec()));
     }
 
     #[test]
     fn test_del_existing() {
         let engine = KvEngine::new();
-        engine.set("key".to_string(), "value".to_string()).unwrap();
-        assert!(engine.del("key").unwrap());
-        assert_eq!(engine.get("key").unwrap(), None);
+        engine.set(b"key".to_vec(), b"value".to_vec()).unwrap();
+        assert!(engine.del(b"key").unwrap());
+        assert_eq!(engine.get(b"key").unwrap(), None);
     }
 
     #[test]
     fn test_del_nonexistent() {
         let engine = KvEngine::new();
-        assert!(!engine.del("missing").unwrap());
+        assert!(!engine.del(b"missing").unwrap());
     }
 
     #[test]
     fn test_exists() {
         let engine = KvEngine::new();
-        assert!(!engine.exists("key").unwrap());
-        engine.set("key".to_string(), "value".to_string()).unwrap();
-        assert!(engine.exists("key").unwrap());
-        engine.del("key").unwrap();
-        assert!(!engine.exists("key").unwrap());
+        assert!(!engine.exists(b"key").unwrap());
+        engine.set(b"key".to_vec(), b"value".to_vec()).unwrap();
+        assert!(engine.exists(b"key").unwrap());
+        engine.del(b"key").unwrap();
+        assert!(!engine.exists(b"key").unwrap());
     }
 
     #[test]
@@ -232,35 +229,35 @@ mod tests {
     #[test]
     fn test_dbsize_after_operations() {
         let engine = KvEngine::new();
-        engine.set("a".to_string(), "1".to_string()).unwrap();
-        engine.set("b".to_string(), "2".to_string()).unwrap();
+        engine.set(b"a".to_vec(), b"1".to_vec()).unwrap();
+        engine.set(b"b".to_vec(), b"2".to_vec()).unwrap();
         assert_eq!(engine.dbsize().unwrap(), 2);
-        engine.del("a").unwrap();
+        engine.del(b"a").unwrap();
         assert_eq!(engine.dbsize().unwrap(), 1);
     }
 
     #[test]
     fn test_flushdb() {
         let engine = KvEngine::new();
-        engine.set("a".to_string(), "1".to_string()).unwrap();
-        engine.set("b".to_string(), "2".to_string()).unwrap();
+        engine.set(b"a".to_vec(), b"1".to_vec()).unwrap();
+        engine.set(b"b".to_vec(), b"2".to_vec()).unwrap();
         engine.flushdb().unwrap();
         assert_eq!(engine.dbsize().unwrap(), 0);
-        assert_eq!(engine.get("a").unwrap(), None);
+        assert_eq!(engine.get(b"a").unwrap(), None);
     }
 
     #[test]
     fn test_set_rejects_empty_key() {
         let engine = KvEngine::new();
-        let err = engine.set(String::new(), "v".into()).unwrap_err();
+        let err = engine.set(Vec::new(), b"v".to_vec()).unwrap_err();
         assert!(matches!(err, FerrumError::ParseError(_)));
     }
 
     #[test]
     fn test_set_rejects_oversized_key() {
         let engine = KvEngine::new();
-        let big_key = "k".repeat(KEY_MAX_BYTES + 1);
-        let err = engine.set(big_key, "v".into()).unwrap_err();
+        let big_key = vec![b'k'; KEY_MAX_BYTES + 1];
+        let err = engine.set(big_key, b"v".to_vec()).unwrap_err();
         assert!(matches!(
             err,
             FerrumError::KeyTooLong {
@@ -273,16 +270,16 @@ mod tests {
     #[test]
     fn test_set_accepts_boundary_key_length() {
         let engine = KvEngine::new();
-        let key = "k".repeat(KEY_MAX_BYTES);
-        assert!(engine.set(key.clone(), "v".into()).is_ok());
-        assert_eq!(engine.get(&key).unwrap(), Some("v".into()));
+        let key = vec![b'k'; KEY_MAX_BYTES];
+        assert!(engine.set(key.clone(), b"v".to_vec()).is_ok());
+        assert_eq!(engine.get(&key).unwrap(), Some(b"v".to_vec()));
     }
 
     #[test]
     fn test_set_rejects_oversized_value() {
         let engine = KvEngine::new();
-        let big_value = "v".repeat(VALUE_MAX_BYTES + 1);
-        let err = engine.set("k".into(), big_value).unwrap_err();
+        let big_value = vec![b'v'; VALUE_MAX_BYTES + 1];
+        let err = engine.set(b"k".to_vec(), big_value).unwrap_err();
         assert!(matches!(
             err,
             FerrumError::ValueTooLarge {
@@ -293,17 +290,33 @@ mod tests {
     }
 
     #[test]
+    fn binary_safe_key_and_value_round_trip() {
+        let engine = KvEngine::new();
+        let key: Vec<u8> = vec![0x00, 0x01, 0xff, 0xfe];
+        let value: Vec<u8> = vec![0x80, 0x00, b'\r', b'\n', 0xc3, 0x28];
+        engine.set(key.clone(), value.clone()).unwrap();
+        assert_eq!(engine.get(&key).unwrap(), Some(value));
+        assert!(engine.exists(&key).unwrap());
+        assert!(engine.del(&key).unwrap());
+        assert_eq!(engine.get(&key).unwrap(), None);
+    }
+
+    #[test]
     fn test_concurrent_access() {
         use std::thread;
 
         let engine = KvEngine::new();
         let mut handles = vec![];
 
-        // Spawn 10 writer threads
         for i in 0..10 {
             let engine = engine.clone();
             handles.push(thread::spawn(move || {
-                engine.set(format!("key{i}"), format!("value{i}")).unwrap();
+                engine
+                    .set(
+                        format!("key{i}").into_bytes(),
+                        format!("value{i}").into_bytes(),
+                    )
+                    .unwrap();
             }));
         }
 
@@ -311,11 +324,10 @@ mod tests {
             handle.join().unwrap();
         }
 
-        // Verify all keys were written
         for i in 0..10 {
             assert_eq!(
-                engine.get(&format!("key{i}")).unwrap(),
-                Some(format!("value{i}"))
+                engine.get(format!("key{i}").as_bytes()).unwrap(),
+                Some(format!("value{i}").into_bytes())
             );
         }
     }
@@ -325,8 +337,8 @@ mod tests {
         let path = tmp_aof_path("mutating");
         let (engine, writer) = engine_with_aof(&path);
 
-        engine.set("a".into(), "1".into()).unwrap();
-        engine.del("a").unwrap();
+        engine.set(b"a".to_vec(), b"1".to_vec()).unwrap();
+        engine.del(b"a").unwrap();
         engine.flushdb().unwrap();
         drop(engine);
         drop(writer);
@@ -346,8 +358,8 @@ mod tests {
         let path = tmp_aof_path("readonly");
         let (engine, writer) = engine_with_aof(&path);
 
-        engine.get("missing").unwrap();
-        engine.exists("missing").unwrap();
+        engine.get(b"missing").unwrap();
+        engine.exists(b"missing").unwrap();
         engine.dbsize().unwrap();
         drop(engine);
         drop(writer);
@@ -362,7 +374,7 @@ mod tests {
         let path = tmp_aof_path("del-missing");
         let (engine, writer) = engine_with_aof(&path);
 
-        assert!(!engine.del("missing").unwrap());
+        assert!(!engine.del(b"missing").unwrap());
         drop(engine);
         drop(writer);
 

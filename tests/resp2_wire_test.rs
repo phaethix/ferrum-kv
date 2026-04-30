@@ -153,11 +153,6 @@ fn embedded_crlf_in_value_does_not_confuse_framing() {
     // treated as ordinary bytes, not as a frame delimiter. A naive
     // line-oriented parser would split the payload on `\r\n` and lose data;
     // the RESP2 parser reads exactly `$<len>` bytes regardless of content.
-    //
-    // Full binary safety (NUL bytes, bytes >= 0x80) is currently limited by
-    // the engine storing keys and values as `String`. When the engine moves
-    // to `Vec<u8>` on a dedicated branch, this test should be extended with
-    // non-UTF-8 payloads.
     let payload: &[u8] = b"line1\r\nline2\r\nline3 with trailing CRLF\r\n";
     round_trip(&mut s, &build_request(&[b"SET", b"k", payload]), b"+OK\r\n");
 
@@ -288,4 +283,30 @@ fn multiple_clients_share_engine_state() {
         &build_request(&[b"GET", b"shared"]),
         b"$2\r\n42\r\n",
     );
+}
+
+#[test]
+fn non_utf8_key_and_value_round_trip_end_to_end() {
+    let server = spawn_server();
+    let mut s = connect(&server.addr);
+
+    // Arbitrary binary payloads: NUL, bytes >= 0x80, and an invalid UTF-8
+    // sequence (`0xc3 0x28`). The engine must preserve them byte-for-byte.
+    let key: &[u8] = &[0x00, 0xff, 0x01, b'\r', b'\n'];
+    let value: &[u8] = &[0x80, 0x00, 0xc3, 0x28, 0xfe, 0x01, 0x02];
+
+    round_trip(&mut s, &build_request(&[b"SET", key, value]), b"+OK\r\n");
+
+    let request = build_request(&[b"GET", key]);
+    s.write_all(&request).expect("write");
+    let header = format!("${}\r\n", value.len());
+    let total = header.len() + value.len() + 2;
+    let mut reply = vec![0u8; total];
+    s.read_exact(&mut reply).expect("read");
+
+    let mut expected = Vec::with_capacity(total);
+    expected.extend_from_slice(header.as_bytes());
+    expected.extend_from_slice(value);
+    expected.extend_from_slice(b"\r\n");
+    assert_eq!(reply, expected);
 }
