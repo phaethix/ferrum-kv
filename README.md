@@ -1,5 +1,8 @@
 # FerrumKV 🦀
 
+[![CI](https://github.com/phaethix/ferrum-kv/actions/workflows/ci.yml/badge.svg)](https://github.com/phaethix/ferrum-kv/actions/workflows/ci.yml)
+![version](https://img.shields.io/badge/version-v0.2.0-blue)
+
 A lightweight, multi-threaded KV storage server written in Rust — built from scratch for systems programming practice.
 
 ## Architecture
@@ -150,6 +153,16 @@ Fsync policies follow Redis semantics:
 - `everysec` — fsync once per second on a background tick (default)
 - `no` — let the OS decide (fastest, least durable)
 
+## Testing & Benchmarks
+
+```bash
+cargo test                    # all unit + integration tests (82 unit tests, 5 integration suites)
+cargo bench                   # Criterion microbenchmarks (engine + RESP2 codec)
+./scripts/bench-smoke.sh      # native load generator: SET / GET / MIXED @ 100K ops
+```
+
+The GitHub Actions pipeline runs `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test`, and `cargo bench --no-run` on every push and pull request.
+
 ## Roadmap
 
 - [x] Core KV engine (`SET` / `GET` / `DEL` / `EXISTS` / `PING` / `DBSIZE` / `FLUSHDB`)
@@ -157,7 +170,9 @@ Fsync policies follow Redis semantics:
 - [x] RESP2 protocol (binary-safe, compatible with `redis-cli`)
 - [x] AOF persistence with configurable fsync + replay on startup
 - [x] String-family commands (`MSET` / `MGET` / `APPEND` / `STRLEN` / `SETNX` / `INCR*` / `DECR*`)
-- [ ] Graceful shutdown (SIGINT / SIGTERM) + structured logging
+- [x] Graceful shutdown (SIGINT / SIGTERM), connection timeouts, max-connections cap
+- [x] Structured logging (`log` + `env_logger`) & Redis-style config file
+- [x] Unit / integration / concurrency tests + Criterion benchmarks + CI
 - [ ] TTL (key expiration) & memory eviction (LRU / LFU / AHE)
 - [ ] Async I/O (Tokio)
 
