@@ -1,6 +1,7 @@
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::thread;
+use std::time::Duration;
 
 use crate::error::FerrumError;
 use crate::network::shutdown::Shutdown;
@@ -23,6 +24,26 @@ const READ_BUF_MAX: usize = 16 * 1024 * 1024;
 /// Size of each `read()` scratch buffer.
 const READ_CHUNK: usize = 8 * 1024;
 
+/// Tunable per-server runtime knobs.
+///
+/// Defaults are intentionally permissive so that unit tests and casual users
+/// do not need to supply a config at all. Production deployments override the
+/// fields they care about through CLI flags or the configuration file.
+#[derive(Debug, Clone, Default)]
+pub struct ServerConfig {
+    /// Per-connection idle timeout. When `Some(d)`, a client that neither
+    /// sends nor receives any bytes for `d` is closed. `None` disables the
+    /// timeout, matching Redis' `timeout 0` semantics.
+    pub client_timeout: Option<Duration>,
+}
+
+impl ServerConfig {
+    /// Convenience constructor used by tests that want explicit defaults.
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
 /// Handles a single client connection using the RESP2 protocol.
 ///
 /// Bytes are read into a per-connection buffer and fed to [`parser::parse_frame`]
@@ -34,9 +55,21 @@ fn handle_client(
     mut stream: TcpStream,
     engine: KvEngine,
     shutdown: Shutdown,
+    config: ServerConfig,
 ) -> Result<(), FerrumError> {
     let peer = stream.peer_addr()?;
     eprintln!("[INFO] Client connected: {peer}");
+
+    // Apply idle timeouts, if configured. A failure here is logged but not
+    // fatal: the connection can still function, just without the timeout.
+    if let Some(timeout) = config.client_timeout {
+        if let Err(e) = stream.set_read_timeout(Some(timeout)) {
+            eprintln!("[WARN] set_read_timeout failed for {peer}: {e}");
+        }
+        if let Err(e) = stream.set_write_timeout(Some(timeout)) {
+            eprintln!("[WARN] set_write_timeout failed for {peer}: {e}");
+        }
+    }
 
     let mut inbuf: Vec<u8> = Vec::with_capacity(READ_BUF_INITIAL);
     let mut chunk = [0u8; READ_CHUNK];
@@ -49,6 +82,10 @@ fn handle_client(
         let n = match stream.read(&mut chunk) {
             Ok(0) => break, // Orderly EOF: client closed the connection.
             Ok(n) => n,
+            Err(e) if is_timeout(&e) => {
+                eprintln!("[INFO] {peer} idle timeout, closing connection");
+                return Ok(());
+            }
             Err(e) => {
                 eprintln!("[ERROR] read failed for {peer}: {e}");
                 return Err(e.into());
@@ -104,6 +141,16 @@ fn handle_client(
 
     eprintln!("[INFO] Client disconnected: {peer}");
     Ok(())
+}
+
+/// Returns `true` when a `read`/`write` I/O error is the kind produced by an
+/// expired [`TcpStream`] timeout.
+///
+/// Platforms disagree on which `ErrorKind` a blocking-socket timeout surfaces
+/// as: Linux reports `WouldBlock`, macOS and Windows prefer `TimedOut`. We
+/// treat both as the same signal so callers do not have to care.
+fn is_timeout(err: &std::io::Error) -> bool {
+    matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut)
 }
 
 /// Executes a parsed command against the engine and appends its RESP2 reply
@@ -213,11 +260,16 @@ fn write_ferrum_error(out: &mut Vec<u8>, err: &FerrumError) {
 ///
 /// Each accepted connection is handled on a separate thread that shares the
 /// same [`KvEngine`] instance.
-pub fn start(addr: &str, engine: KvEngine, shutdown: Shutdown) -> Result<(), FerrumError> {
+pub fn start(
+    addr: &str,
+    engine: KvEngine,
+    shutdown: Shutdown,
+    config: ServerConfig,
+) -> Result<(), FerrumError> {
     let listener = TcpListener::bind(addr)?;
     let local = listener.local_addr()?;
     eprintln!("[INFO] FerrumKV listening on {local}");
-    run_listener(listener, engine, shutdown)
+    run_listener(listener, engine, shutdown, config)
 }
 
 /// Runs the accept loop on an already-bound [`TcpListener`].
@@ -229,6 +281,7 @@ pub fn run_listener(
     listener: TcpListener,
     engine: KvEngine,
     shutdown: Shutdown,
+    config: ServerConfig,
 ) -> Result<(), FerrumError> {
     for stream in listener.incoming() {
         if shutdown.is_triggered() {
@@ -241,8 +294,9 @@ pub fn run_listener(
                 }
                 let engine = engine.clone();
                 let shutdown = shutdown.clone();
+                let config = config.clone();
                 thread::spawn(move || {
-                    if let Err(e) = handle_client(stream, engine, shutdown) {
+                    if let Err(e) = handle_client(stream, engine, shutdown, config) {
                         eprintln!("[ERROR] client handler error: {e}");
                     }
                 });

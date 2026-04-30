@@ -12,7 +12,7 @@ use std::net::{TcpListener, TcpStream};
 use std::thread;
 use std::time::Duration;
 
-use ferrum_kv::network::server;
+use ferrum_kv::network::server::{self, ServerConfig};
 use ferrum_kv::network::shutdown::Shutdown;
 use ferrum_kv::protocol::encoder;
 use ferrum_kv::storage::engine::KvEngine;
@@ -38,7 +38,7 @@ fn spawn_server() -> ServerGuard {
     let handle = thread::spawn(move || {
         // `run_listener` only returns on listener failure or shutdown; in
         // tests we never trigger shutdown and let it run until process exit.
-        let _ = server::run_listener(listener, engine, Shutdown::new());
+        let _ = server::run_listener(listener, engine, Shutdown::new(), ServerConfig::default());
     });
     ServerGuard {
         addr,

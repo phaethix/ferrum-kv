@@ -13,7 +13,7 @@ use std::net::{TcpListener, TcpStream};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use ferrum_kv::network::server;
+use ferrum_kv::network::server::{self, ServerConfig};
 use ferrum_kv::network::shutdown::Shutdown;
 use ferrum_kv::storage::engine::KvEngine;
 
@@ -26,7 +26,13 @@ fn accept_loop_exits_after_shutdown_triggered() {
 
     let shutdown_for_thread = shutdown.clone();
     let handle = thread::spawn(move || {
-        server::run_listener(listener, engine, shutdown_for_thread).expect("run_listener");
+        server::run_listener(
+            listener,
+            engine,
+            shutdown_for_thread,
+            ServerConfig::default(),
+        )
+        .expect("run_listener");
     });
 
     // Prove the server is actually up by completing one round-trip.

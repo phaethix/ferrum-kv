@@ -4,6 +4,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::thread;
 
+use ferrum_kv::network::server::ServerConfig;
 use ferrum_kv::network::shutdown::Shutdown;
 use ferrum_kv::persistence::AofWriter;
 use ferrum_kv::storage::engine::KvEngine;
@@ -55,7 +56,17 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    if let Err(e) = ferrum_kv::network::server::run_listener(listener, engine, shutdown) {
+    let server_config = ServerConfig {
+        client_timeout: args.client_timeout(),
+    };
+    match server_config.client_timeout {
+        Some(d) => eprintln!("[INFO] client idle timeout: {}s", d.as_secs()),
+        None => eprintln!("[INFO] client idle timeout: disabled"),
+    }
+
+    if let Err(e) =
+        ferrum_kv::network::server::run_listener(listener, engine, shutdown, server_config)
+    {
         eprintln!("[FATAL] server error: {e}");
         return ExitCode::FAILURE;
     }

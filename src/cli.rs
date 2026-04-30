@@ -5,13 +5,17 @@
 //! so they can exercise private fields directly.
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use ferrum_kv::persistence::config::{AofConfig, FsyncPolicy};
 
 pub const DEFAULT_ADDR: &str = "127.0.0.1:6380";
 
-pub const USAGE: &str =
-    "usage: ferrum-kv [--addr HOST:PORT] [--aof-path PATH] [--appendfsync always|everysec|no]";
+pub const USAGE: &str = concat!(
+    "usage: ferrum-kv [--addr HOST:PORT] [--aof-path PATH]\n",
+    "                 [--appendfsync always|everysec|no]\n",
+    "                 [--client-timeout SECONDS]"
+);
 
 /// Outcome of parsing `argv`.
 ///
@@ -29,6 +33,9 @@ pub struct CliArgs {
     pub addr: String,
     aof_path: Option<PathBuf>,
     appendfsync: Option<FsyncPolicy>,
+    /// Per-connection idle timeout. `None` (CLI value `0`) disables the
+    /// timeout entirely, matching Redis' `timeout 0`.
+    client_timeout: Option<Duration>,
 }
 
 impl CliArgs {
@@ -38,6 +45,7 @@ impl CliArgs {
         let mut addr = DEFAULT_ADDR.to_string();
         let mut aof_path: Option<PathBuf> = None;
         let mut appendfsync: Option<FsyncPolicy> = None;
+        let mut client_timeout: Option<Duration> = None;
 
         while let Some(arg) = iter.next() {
             match arg.as_str() {
@@ -61,6 +69,12 @@ impl CliArgs {
                             .map_err(|e| format!("invalid --appendfsync: {e}"))?,
                     );
                 }
+                "--client-timeout" => {
+                    let value = iter
+                        .next()
+                        .ok_or_else(|| "--client-timeout requires a value".to_string())?;
+                    client_timeout = parse_timeout_seconds(&value)?;
+                }
                 "-h" | "--help" => return Ok(Invocation::Help),
                 other => return Err(format!("unrecognised argument: '{other}'")),
             }
@@ -74,6 +88,7 @@ impl CliArgs {
             addr,
             aof_path,
             appendfsync,
+            client_timeout,
         }))
     }
 
@@ -82,6 +97,26 @@ impl CliArgs {
         self.aof_path
             .as_ref()
             .map(|path| AofConfig::new(path.clone(), self.appendfsync.unwrap_or_default()))
+    }
+
+    /// Returns the idle timeout applied to every accepted connection, if any.
+    pub fn client_timeout(&self) -> Option<Duration> {
+        self.client_timeout
+    }
+}
+
+/// Parses a non-negative integer number of seconds.
+///
+/// `0` is treated as "disabled" and returns `Ok(None)`, matching Redis'
+/// convention for the `timeout` directive.
+fn parse_timeout_seconds(raw: &str) -> Result<Option<Duration>, String> {
+    let secs: u64 = raw
+        .parse()
+        .map_err(|_| format!("invalid --client-timeout: '{raw}' is not a non-negative integer"))?;
+    if secs == 0 {
+        Ok(None)
+    } else {
+        Ok(Some(Duration::from_secs(secs)))
     }
 }
 
@@ -149,5 +184,39 @@ mod tests {
     fn help_flag_returns_help_variant() {
         assert!(matches!(parse(&["--help"]).unwrap(), Invocation::Help));
         assert!(matches!(parse(&["-h"]).unwrap(), Invocation::Help));
+    }
+
+    #[test]
+    fn client_timeout_defaults_to_none() {
+        assert!(parse_run(&[]).client_timeout().is_none());
+    }
+
+    #[test]
+    fn client_timeout_zero_is_disabled() {
+        assert!(
+            parse_run(&["--client-timeout", "0"])
+                .client_timeout()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn client_timeout_positive_is_parsed() {
+        assert_eq!(
+            parse_run(&["--client-timeout", "30"]).client_timeout(),
+            Some(std::time::Duration::from_secs(30))
+        );
+    }
+
+    #[test]
+    fn client_timeout_rejects_non_integer() {
+        let err = parse(&["--client-timeout", "abc"]).unwrap_err();
+        assert!(err.contains("--client-timeout"));
+    }
+
+    #[test]
+    fn client_timeout_rejects_negative() {
+        let err = parse(&["--client-timeout", "-1"]).unwrap_err();
+        assert!(err.contains("--client-timeout"));
     }
 }
