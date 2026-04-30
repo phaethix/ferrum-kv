@@ -121,6 +121,22 @@ pub fn execute_command(cmd: Command, engine: &KvEngine, out: &mut Vec<u8>) {
             Ok(false) => encoder::encode_integer(out, 0),
             Err(e) => write_ferrum_error(out, &e),
         },
+        Command::MSet { pairs } => match engine.mset(pairs) {
+            Ok(()) => encoder::encode_simple_string(out, "OK"),
+            Err(e) => write_ferrum_error(out, &e),
+        },
+        Command::MGet { keys } => match engine.mget(&keys) {
+            Ok(values) => {
+                encoder::encode_array_header(out, values.len());
+                for value in values {
+                    match value {
+                        Some(v) => encoder::encode_bulk_string(out, &v),
+                        None => encoder::encode_null_bulk(out),
+                    }
+                }
+            }
+            Err(e) => write_ferrum_error(out, &e),
+        },
         Command::Get { key } => match engine.get(&key) {
             Ok(Some(v)) => encoder::encode_bulk_string(out, &v),
             Ok(None) => encoder::encode_null_bulk(out),

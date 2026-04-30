@@ -62,6 +62,24 @@ impl AofWriter {
         self.append(&[b"SET", key, value])
     }
 
+    /// Appends a batch of `SET key value` entries as a single write.
+    ///
+    /// All records are serialised first and then committed to the file in
+    /// one `write_all`, which keeps the batch atomic with respect to other
+    /// writers: concurrent appenders never observe a partially written
+    /// batch. This backs `MSET`, whose multi-key mutation must either
+    /// appear entirely in the log or not at all.
+    pub fn append_set_many(&self, pairs: &[(Vec<u8>, Vec<u8>)]) -> Result<(), FerrumError> {
+        if pairs.is_empty() {
+            return Ok(());
+        }
+        let mut bytes = Vec::new();
+        for (k, v) in pairs {
+            bytes.extend_from_slice(&encode_command(&[b"SET", k.as_slice(), v.as_slice()]));
+        }
+        self.write_bytes(&bytes)
+    }
+
     /// Appends a `DEL key` entry to the log.
     pub fn append_del(&self, key: &[u8]) -> Result<(), FerrumError> {
         self.append(&[b"DEL", key])
@@ -74,9 +92,13 @@ impl AofWriter {
 
     fn append(&self, parts: &[&[u8]]) -> Result<(), FerrumError> {
         let bytes = encode_command(parts);
+        self.write_bytes(&bytes)
+    }
+
+    fn write_bytes(&self, bytes: &[u8]) -> Result<(), FerrumError> {
         let mut guard = self.inner.lock()?;
         guard
-            .write_all(&bytes)
+            .write_all(bytes)
             .map_err(|e| FerrumError::PersistenceError(format!("aof write failed: {e}")))?;
 
         match self.policy {

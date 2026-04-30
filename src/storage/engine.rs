@@ -91,6 +91,40 @@ impl KvEngine {
         Ok(true)
     }
 
+    /// Sets every `(key, value)` pair in `pairs` atomically.
+    ///
+    /// Each pair is validated before any mutation happens, so either the
+    /// whole batch is applied or none of it is. The AOF log records the
+    /// batch in a single write so concurrent appenders never observe a
+    /// half-committed MSET.
+    pub fn mset(&self, pairs: Vec<(Vec<u8>, Vec<u8>)>) -> Result<(), FerrumError> {
+        for (k, v) in &pairs {
+            validate_key(k)?;
+            validate_value(v)?;
+        }
+
+        let mut store = self.store.write()?;
+        if let Some(aof) = &self.aof {
+            log_aof_result("MSET", aof.append_set_many(&pairs));
+        }
+        for (k, v) in pairs {
+            store.insert(k, v);
+        }
+        Ok(())
+    }
+
+    /// Returns the stored value for every key in `keys`, preserving order.
+    ///
+    /// Missing keys map to `None` so the caller can serialise them as
+    /// null bulk strings without ambiguity.
+    pub fn mget(&self, keys: &[Vec<u8>]) -> Result<Vec<Option<Vec<u8>>>, FerrumError> {
+        let store = self.store.read()?;
+        Ok(keys
+            .iter()
+            .map(|k| store.get(k.as_slice()).cloned())
+            .collect())
+    }
+
     /// Returns the value for `key`, or `None` if the key does not exist.
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, FerrumError> {
         let store = self.store.read()?;
@@ -423,6 +457,74 @@ mod tests {
         let bytes = fs::read(&path).unwrap();
         assert_eq!(bytes, b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n");
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn mset_inserts_every_pair() {
+        let engine = KvEngine::new();
+        engine
+            .mset(vec![
+                (b"a".to_vec(), b"1".to_vec()),
+                (b"b".to_vec(), b"2".to_vec()),
+            ])
+            .unwrap();
+        assert_eq!(engine.get(b"a").unwrap(), Some(b"1".to_vec()));
+        assert_eq!(engine.get(b"b").unwrap(), Some(b"2".to_vec()));
+    }
+
+    #[test]
+    fn mset_rejects_batch_without_applying_any_pair() {
+        let engine = KvEngine::new();
+        engine.set(b"existing".to_vec(), b"keep".to_vec()).unwrap();
+
+        let too_big = vec![b'x'; VALUE_MAX_BYTES + 1];
+        let err = engine
+            .mset(vec![
+                (b"a".to_vec(), b"1".to_vec()),
+                (b"b".to_vec(), too_big),
+            ])
+            .unwrap_err();
+        assert!(matches!(err, FerrumError::ValueTooLarge { .. }));
+        // Neither pair made it into the store because validation happens
+        // before any mutation.
+        assert_eq!(engine.get(b"a").unwrap(), None);
+        assert_eq!(engine.get(b"b").unwrap(), None);
+        assert_eq!(engine.get(b"existing").unwrap(), Some(b"keep".to_vec()));
+    }
+
+    #[test]
+    fn mset_writes_batch_atomically_to_aof() {
+        let path = tmp_aof_path("mset");
+        let (engine, writer) = engine_with_aof(&path);
+
+        engine
+            .mset(vec![
+                (b"a".to_vec(), b"1".to_vec()),
+                (b"b".to_vec(), b"2".to_vec()),
+            ])
+            .unwrap();
+        drop(engine);
+        drop(writer);
+
+        let bytes = fs::read(&path).unwrap();
+        let expected = concat!(
+            "*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\n1\r\n",
+            "*3\r\n$3\r\nSET\r\n$1\r\nb\r\n$1\r\n2\r\n",
+        );
+        assert_eq!(bytes, expected.as_bytes());
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn mget_returns_values_in_request_order() {
+        let engine = KvEngine::new();
+        engine.set(b"a".to_vec(), b"1".to_vec()).unwrap();
+        engine.set(b"c".to_vec(), b"3".to_vec()).unwrap();
+
+        let values = engine
+            .mget(&[b"a".to_vec(), b"missing".to_vec(), b"c".to_vec()])
+            .unwrap();
+        assert_eq!(values, vec![Some(b"1".to_vec()), None, Some(b"3".to_vec())]);
     }
 
     #[test]

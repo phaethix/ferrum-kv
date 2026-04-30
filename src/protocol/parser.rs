@@ -10,6 +10,10 @@ pub enum Command {
     Set { key: Vec<u8>, value: Vec<u8> },
     /// `SETNX key value` — set only if the key does not exist.
     SetNx { key: Vec<u8>, value: Vec<u8> },
+    /// `MSET key value [key value ...]`
+    MSet { pairs: Vec<(Vec<u8>, Vec<u8>)> },
+    /// `MGET key [key ...]`
+    MGet { keys: Vec<Vec<u8>> },
     /// `GET key`
     Get { key: Vec<u8> },
     /// `DEL key [key ...]`
@@ -238,6 +242,24 @@ fn build_command(parts: Vec<Vec<u8>>) -> Result<Command, FerrumError> {
                 value: it.next().unwrap(),
             })
         }
+        b"MSET" => {
+            if args.is_empty() || args.len() % 2 != 0 {
+                return Err(FerrumError::WrongArity { cmd: "MSET" });
+            }
+            let mut pairs = Vec::with_capacity(args.len() / 2);
+            let mut it = args.into_iter();
+            while let Some(k) = it.next() {
+                let v = it.next().expect("args length is even");
+                pairs.push((k, v));
+            }
+            Ok(Command::MSet { pairs })
+        }
+        b"MGET" => {
+            if args.is_empty() {
+                return Err(FerrumError::WrongArity { cmd: "MGET" });
+            }
+            Ok(Command::MGet { keys: args })
+        }
         b"GET" => {
             if args.len() != 1 {
                 return Err(FerrumError::WrongArity { cmd: "GET" });
@@ -430,6 +452,41 @@ mod frame_tests {
             Command::SetNx {
                 key: b"k".to_vec(),
                 value: b"v".to_vec(),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_mset_command() {
+        let cmd = parse_exact(b"*5\r\n$4\r\nMSET\r\n$1\r\na\r\n$1\r\n1\r\n$1\r\nb\r\n$1\r\n2\r\n");
+        assert_eq!(
+            cmd,
+            Command::MSet {
+                pairs: vec![
+                    (b"a".to_vec(), b"1".to_vec()),
+                    (b"b".to_vec(), b"2".to_vec()),
+                ],
+            }
+        );
+    }
+
+    #[test]
+    fn mset_with_odd_argument_count_is_rejected() {
+        let (err, _) =
+            match parse_frame(b"*4\r\n$4\r\nMSET\r\n$1\r\na\r\n$1\r\n1\r\n$1\r\nb\r\n").unwrap() {
+                FrameParse::Invalid { error, consumed } => (error, consumed),
+                other => panic!("expected Invalid, got {other:?}"),
+            };
+        assert!(matches!(err, FerrumError::WrongArity { cmd: "MSET" }));
+    }
+
+    #[test]
+    fn parses_mget_command() {
+        let cmd = parse_exact(b"*3\r\n$4\r\nMGET\r\n$1\r\na\r\n$1\r\nb\r\n");
+        assert_eq!(
+            cmd,
+            Command::MGet {
+                keys: vec![b"a".to_vec(), b"b".to_vec()],
             }
         );
     }

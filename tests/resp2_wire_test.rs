@@ -199,6 +199,26 @@ fn setnx_inserts_only_when_key_is_absent() {
 }
 
 #[test]
+fn mset_then_mget_returns_array_with_order_preserved() {
+    let server = spawn_server();
+    let mut s = connect(&server.addr);
+
+    round_trip(
+        &mut s,
+        &build_request(&[b"MSET", b"a", b"1", b"b", b"2"]),
+        b"+OK\r\n",
+    );
+    // MGET on two keys that exist and one that does not: the missing entry
+    // must serialise as a null bulk (`$-1`) while the others are ordinary
+    // bulks, preserving the request order.
+    round_trip(
+        &mut s,
+        &build_request(&[b"MGET", b"a", b"missing", b"b"]),
+        b"*3\r\n$1\r\n1\r\n$-1\r\n$1\r\n2\r\n",
+    );
+}
+
+#[test]
 fn get_missing_key_returns_null_bulk() {
     let server = spawn_server();
     let mut s = connect(&server.addr);
