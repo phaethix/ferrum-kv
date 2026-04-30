@@ -3,8 +3,9 @@
 //! These tests bring up a real listener, spawn the accept loop on a
 //! background thread, and verify that:
 //!
-//! 1. Triggering the [`Shutdown`] handle and waking the listener causes the
-//!    accept loop to return in bounded time.
+//! 1. Triggering the [`Shutdown`] handle causes the accept loop to return
+//!    in bounded time. With the async runtime the flag wakes waiters via
+//!    `tokio::sync::Notify`, so no external "self-connect" nudge is needed.
 //! 2. After shutdown the listener port is released, so a fresh server can
 //!    bind the same ephemeral address again without `EADDRINUSE`.
 
@@ -46,9 +47,10 @@ fn accept_loop_exits_after_shutdown_triggered() {
     assert!(n > 0, "expected a reply for PING");
     drop(stream);
 
-    // Now trigger shutdown and wake the blocked accept.
+    // Now trigger shutdown. The accept loop is parked on `shutdown.notified()`
+    // alongside `listener.accept()` inside `tokio::select!`, so flipping the
+    // flag wakes it up directly.
     shutdown.trigger();
-    Shutdown::wake_listener(addr);
 
     // The accept loop must terminate promptly.
     let start = Instant::now();

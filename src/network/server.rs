@@ -1,11 +1,13 @@
-use std::io::{ErrorKind, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpListener as StdTcpListener;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::thread;
 use std::time::Duration;
 
 use log::{debug, error, info, warn};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::runtime::Builder;
+use tokio::time::timeout;
 
 use crate::error::FerrumError;
 use crate::network::shutdown::Shutdown;
@@ -43,6 +45,10 @@ pub struct ServerConfig {
     ///
     /// `0` disables the limit entirely. Matches Redis' `maxclients` default.
     pub max_clients: usize,
+    /// Number of worker threads backing the tokio runtime when the server
+    /// spins one up internally. `0` asks tokio to pick a sensible default
+    /// (usually the CPU core count).
+    pub worker_threads: usize,
 }
 
 impl Default for ServerConfig {
@@ -50,6 +56,7 @@ impl Default for ServerConfig {
         Self {
             client_timeout: None,
             max_clients: 10_000,
+            worker_threads: 0,
         }
     }
 }
@@ -64,8 +71,8 @@ impl ServerConfig {
 /// RAII counter that tracks the number of in-flight client connections.
 ///
 /// The accept loop calls [`ConnCounter::try_acquire`] for every newly accepted
-/// socket; on success it hands the returned guard to the worker thread. When
-/// the worker finishes (normally or via panic) the guard is dropped and the
+/// socket; on success it hands the returned guard to the worker task. When
+/// the task finishes (normally or via panic) the guard is dropped and the
 /// count is decremented — so even a panicking handler cannot leak a slot.
 #[derive(Clone, Default)]
 struct ConnCounter {
@@ -127,7 +134,7 @@ impl Drop for ConnGuard {
 /// its reply is written back using the RESP2 encoders. Partial frames remain
 /// in the buffer until the next `read` fills them in, so requests that span
 /// multiple packets are handled transparently.
-fn handle_client(
+async fn handle_client(
     mut stream: TcpStream,
     engine: KvEngine,
     shutdown: Shutdown,
@@ -135,17 +142,6 @@ fn handle_client(
 ) -> Result<(), FerrumError> {
     let peer = stream.peer_addr()?;
     debug!("client connected: {peer}");
-
-    // Apply idle timeouts, if configured. A failure here is logged but not
-    // fatal: the connection can still function, just without the timeout.
-    if let Some(timeout) = config.client_timeout {
-        if let Err(e) = stream.set_read_timeout(Some(timeout)) {
-            warn!("set_read_timeout failed for {peer}: {e}");
-        }
-        if let Err(e) = stream.set_write_timeout(Some(timeout)) {
-            warn!("set_write_timeout failed for {peer}: {e}");
-        }
-    }
 
     let mut inbuf: Vec<u8> = Vec::with_capacity(READ_BUF_INITIAL);
     let mut chunk = [0u8; READ_CHUNK];
@@ -155,14 +151,25 @@ fn handle_client(
         if shutdown.is_triggered() {
             break;
         }
-        let n = match stream.read(&mut chunk) {
-            Ok(0) => break, // Orderly EOF: client closed the connection.
-            Ok(n) => n,
-            Err(e) if is_timeout(&e) => {
+
+        // Read the next chunk, racing three concurrent wake-up sources:
+        // 1. bytes arriving from the peer,
+        // 2. the idle timeout (only when configured),
+        // 3. the shared shutdown signal.
+        let read_result = tokio::select! {
+            biased;
+            _ = shutdown.notified() => break,
+            r = read_with_optional_timeout(&mut stream, &mut chunk, config.client_timeout) => r,
+        };
+
+        let n = match read_result {
+            ReadOutcome::Bytes(n) => n,
+            ReadOutcome::Eof => break,
+            ReadOutcome::IdleTimeout => {
                 info!("{peer} idle timeout, closing connection");
                 return Ok(());
             }
-            Err(e) => {
+            ReadOutcome::Err(e) => {
                 error!("read failed for {peer}: {e}");
                 return Err(e.into());
             }
@@ -175,7 +182,7 @@ fn handle_client(
                 Ok(FrameParse::Complete { command, consumed }) => {
                     outbuf.clear();
                     execute_command(command, &engine, &mut outbuf);
-                    if let Err(e) = stream.write_all(&outbuf) {
+                    if let Err(e) = stream.write_all(&outbuf).await {
                         error!("write failed for {peer}: {e}");
                         return Err(e.into());
                     }
@@ -187,7 +194,7 @@ fn handle_client(
                     // and keep the connection open so the client can retry.
                     outbuf.clear();
                     write_ferrum_error(&mut outbuf, &error);
-                    if let Err(e) = stream.write_all(&outbuf) {
+                    if let Err(e) = stream.write_all(&outbuf).await {
                         error!("write failed for {peer}: {e}");
                         return Err(e.into());
                     }
@@ -199,7 +206,7 @@ fn handle_client(
                     // resynchronised, so reply with -ERR and close.
                     outbuf.clear();
                     write_ferrum_error(&mut outbuf, &e);
-                    let _ = stream.write_all(&outbuf);
+                    let _ = stream.write_all(&outbuf).await;
                     warn!("protocol error from {peer}: {e}");
                     return Ok(());
                 }
@@ -209,7 +216,7 @@ fn handle_client(
         if inbuf.len() > READ_BUF_MAX {
             outbuf.clear();
             encoder::encode_error(&mut outbuf, "ERR request too large");
-            let _ = stream.write_all(&outbuf);
+            let _ = stream.write_all(&outbuf).await;
             warn!("request buffer overflow from {peer}");
             return Ok(());
         }
@@ -219,14 +226,35 @@ fn handle_client(
     Ok(())
 }
 
-/// Returns `true` when a `read`/`write` I/O error is the kind produced by an
-/// expired [`TcpStream`] timeout.
-///
-/// Platforms disagree on which `ErrorKind` a blocking-socket timeout surfaces
-/// as: Linux reports `WouldBlock`, macOS and Windows prefer `TimedOut`. We
-/// treat both as the same signal so callers do not have to care.
-fn is_timeout(err: &std::io::Error) -> bool {
-    matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut)
+/// Result of a single async read attempt, flattened so the caller can match
+/// on it without juggling nested `Option<Result<...>>`.
+enum ReadOutcome {
+    Bytes(usize),
+    Eof,
+    IdleTimeout,
+    Err(std::io::Error),
+}
+
+/// Reads into `chunk`, optionally enforcing a per-read idle timeout that
+/// mirrors the synchronous `SO_RCVTIMEO` behaviour from the pre-tokio era.
+async fn read_with_optional_timeout(
+    stream: &mut TcpStream,
+    chunk: &mut [u8],
+    idle: Option<Duration>,
+) -> ReadOutcome {
+    let fut = stream.read(chunk);
+    let read_result = match idle {
+        Some(d) => match timeout(d, fut).await {
+            Ok(r) => r,
+            Err(_) => return ReadOutcome::IdleTimeout,
+        },
+        None => fut.await,
+    };
+    match read_result {
+        Ok(0) => ReadOutcome::Eof,
+        Ok(n) => ReadOutcome::Bytes(n),
+        Err(e) => ReadOutcome::Err(e),
+    }
 }
 
 /// Executes a parsed command against the engine and appends its RESP2 reply
@@ -463,26 +491,60 @@ fn write_ferrum_error(out: &mut Vec<u8>, err: &FerrumError) {
 
 /// Starts the TCP server and listens for incoming connections.
 ///
-/// Each accepted connection is handled on a separate thread that shares the
-/// same [`KvEngine`] instance.
+/// Binds a fresh [`std::net::TcpListener`] on `addr` and hands control over
+/// to [`run_listener`]. The call blocks until the shared [`Shutdown`] flag
+/// flips.
 pub fn start(
     addr: &str,
     engine: KvEngine,
     shutdown: Shutdown,
     config: ServerConfig,
 ) -> Result<(), FerrumError> {
-    let listener = TcpListener::bind(addr)?;
+    let listener = StdTcpListener::bind(addr)?;
     let local = listener.local_addr()?;
     info!("FerrumKV listening on {local}");
     run_listener(listener, engine, shutdown, config)
 }
 
-/// Runs the accept loop on an already-bound [`TcpListener`].
+/// Runs the accept loop on an already-bound [`std::net::TcpListener`].
 ///
-/// Split out from [`start`] so that tests (and future embeddings) can bind
-/// their own listener — for example to port `0` to obtain an OS-assigned
-/// ephemeral port — and drive the server from there.
+/// The function is intentionally synchronous so every existing integration
+/// test — which binds its own ephemeral listener and then calls into this
+/// function from a dedicated thread — keeps working unchanged. Internally
+/// we build a multi-threaded tokio runtime, register the listener with it,
+/// and drive the async accept loop until [`Shutdown::trigger`] fires.
 pub fn run_listener(
+    listener: StdTcpListener,
+    engine: KvEngine,
+    shutdown: Shutdown,
+    config: ServerConfig,
+) -> Result<(), FerrumError> {
+    listener.set_nonblocking(true)?;
+
+    let mut builder = Builder::new_multi_thread();
+    builder.enable_all().thread_name("ferrum-worker");
+    if config.worker_threads > 0 {
+        builder.worker_threads(config.worker_threads);
+    }
+    let runtime = builder
+        .build()
+        .map_err(|e| FerrumError::Internal(format!("failed to build tokio runtime: {e}")))?;
+
+    let result = runtime.block_on(async move {
+        let listener = TcpListener::from_std(listener)
+            .map_err(|e| FerrumError::Internal(format!("TcpListener::from_std failed: {e}")))?;
+        accept_loop(listener, engine, shutdown, config).await
+    });
+
+    // Drop the runtime in a tight window: any handler still holding a socket
+    // gets a brief grace period before forced teardown. `shutdown_timeout`
+    // bounds the wait so a stuck task cannot block process exit indefinitely.
+    runtime.shutdown_timeout(Duration::from_millis(500));
+    result
+}
+
+/// Async accept loop running on the tokio runtime.
+async fn accept_loop(
     listener: TcpListener,
     engine: KvEngine,
     shutdown: Shutdown,
@@ -490,41 +552,47 @@ pub fn run_listener(
 ) -> Result<(), FerrumError> {
     let counter = ConnCounter::new();
 
-    for stream in listener.incoming() {
-        if shutdown.is_triggered() {
-            break;
-        }
-        match stream {
-            Ok(mut stream) => {
-                if shutdown.is_triggered() {
-                    break;
-                }
-                let Some(guard) = counter.try_acquire(config.max_clients) else {
-                    let peer = stream
-                        .peer_addr()
-                        .map(|a| a.to_string())
-                        .unwrap_or_else(|_| "<unknown>".into());
-                    warn!(
-                        "rejecting {peer}: max_clients={} reached",
-                        config.max_clients
-                    );
-                    let mut out = Vec::with_capacity(64);
-                    encoder::encode_error(&mut out, "ERR max number of clients reached");
-                    let _ = stream.write_all(&out);
-                    continue;
-                };
-                let engine = engine.clone();
-                let shutdown = shutdown.clone();
-                let config = config.clone();
-                thread::spawn(move || {
-                    if let Err(e) = handle_client(stream, engine, shutdown, config) {
-                        error!("client handler error: {e}");
+    loop {
+        tokio::select! {
+            biased;
+            _ = shutdown.notified() => break,
+            accepted = listener.accept() => {
+                match accepted {
+                    Ok((stream, _)) => {
+                        if shutdown.is_triggered() {
+                            break;
+                        }
+                        let Some(guard) = counter.try_acquire(config.max_clients) else {
+                            let peer = stream
+                                .peer_addr()
+                                .map(|a| a.to_string())
+                                .unwrap_or_else(|_| "<unknown>".into());
+                            warn!(
+                                "rejecting {peer}: max_clients={} reached",
+                                config.max_clients
+                            );
+                            // Best-effort refusal reply; we do not wait for
+                            // the client to drain it before closing.
+                            let mut out = Vec::with_capacity(64);
+                            encoder::encode_error(&mut out, "ERR max number of clients reached");
+                            let mut stream = stream;
+                            let _ = stream.write_all(&out).await;
+                            continue;
+                        };
+                        let engine = engine.clone();
+                        let shutdown = shutdown.clone();
+                        let config = config.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = handle_client(stream, engine, shutdown, config).await {
+                                error!("client handler error: {e}");
+                            }
+                            drop(guard);
+                        });
                     }
-                    drop(guard);
-                });
-            }
-            Err(e) => {
-                error!("connection failed: {e}");
+                    Err(e) => {
+                        error!("connection failed: {e}");
+                    }
+                }
             }
         }
     }

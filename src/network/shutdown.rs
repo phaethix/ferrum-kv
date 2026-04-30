@@ -1,28 +1,24 @@
 //! Cooperative shutdown signalling for the TCP server.
 //!
-//! A [`Shutdown`] is a cheap, cloneable handle wrapping an `AtomicBool`. The
-//! accept loop and every connection handler consult it between blocking
-//! operations; when a signal handler (or a test) flips the flag, all of them
-//! wind down at the next opportunity.
-//!
-//! Because [`TcpListener::accept`] is a blocking syscall that will not return
-//! on its own when the flag is flipped, the caller also remembers the bound
-//! address and opens a short-lived local TCP connection via
-//! [`Shutdown::wake_listener`]. That stray connection unblocks `accept`; the
-//! loop then notices the flag and exits cleanly.
+//! A [`Shutdown`] is a cheap, cloneable handle wrapping an `AtomicBool` plus
+//! a [`tokio::sync::Notify`]. Synchronous observers (the background expiration
+//! sweeper, tests) consult the atomic flag between blocking operations, while
+//! async observers (the accept loop, per-connection handlers) park on
+//! [`Shutdown::notified`] and wake up instantly when the flag flips.
 
-use std::net::{SocketAddr, TcpStream};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+
+use tokio::sync::Notify;
 
 /// Shared cooperative shutdown flag.
 ///
 /// Cloning a `Shutdown` is cheap: it only bumps the refcount on the inner
-/// `Arc`. All clones observe the same boolean.
+/// `Arc`. All clones observe the same boolean and share the same waker.
 #[derive(Clone, Default)]
 pub struct Shutdown {
     flag: Arc<AtomicBool>,
+    notify: Arc<Notify>,
 }
 
 impl Shutdown {
@@ -37,25 +33,34 @@ impl Shutdown {
         self.flag.load(Ordering::SeqCst)
     }
 
-    /// Flips the flag so every observer will see `is_triggered() == true`.
+    /// Flips the flag so every observer will see `is_triggered() == true`
+    /// and wakes every task currently parked on [`notified`](Self::notified).
     ///
     /// Safe to call multiple times and from multiple threads; subsequent
-    /// calls are no-ops.
+    /// calls re-notify waiters but are otherwise harmless.
     pub fn trigger(&self) {
         self.flag.store(true, Ordering::SeqCst);
+        self.notify.notify_waiters();
     }
 
-    /// Wakes a blocked [`std::net::TcpListener::accept`] bound to `addr` by
-    /// opening a single short-lived connection to it.
+    /// Async future that resolves as soon as [`trigger`](Self::trigger) is
+    /// called.
     ///
-    /// The connection is immediately dropped; the accept loop will receive an
-    /// `Ok(stream)`, observe the shutdown flag, and exit before doing any
-    /// work. Errors are swallowed because by the time we try to self-connect
-    /// the listener may already be closed — that is harmless.
-    pub fn wake_listener(addr: SocketAddr) {
-        if let Ok(stream) = TcpStream::connect_timeout(&addr, Duration::from_millis(200)) {
-            let _ = stream.shutdown(std::net::Shutdown::Both);
+    /// If the flag is already set the future returns on the next poll, so
+    /// callers that take the shutdown path after a blocking operation do not
+    /// deadlock.
+    pub async fn notified(&self) {
+        if self.is_triggered() {
+            return;
         }
+        let waiter = self.notify.notified();
+        // Re-check after arming the waiter to plug the race where `trigger`
+        // fires between the `is_triggered` probe above and installing the
+        // waiter.
+        if self.is_triggered() {
+            return;
+        }
+        waiter.await;
     }
 }
 
@@ -83,5 +88,23 @@ mod tests {
         s.trigger();
         s.trigger();
         assert!(s.is_triggered());
+    }
+
+    #[tokio::test]
+    async fn notified_resolves_after_trigger() {
+        let s = Shutdown::new();
+        let s2 = s.clone();
+        let task = tokio::spawn(async move { s2.notified().await });
+        // Give the task a chance to park on `notified`.
+        tokio::task::yield_now().await;
+        s.trigger();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn notified_returns_immediately_if_already_triggered() {
+        let s = Shutdown::new();
+        s.trigger();
+        s.notified().await;
     }
 }

@@ -89,6 +89,7 @@ fn main() -> ExitCode {
         max_clients: args
             .max_clients()
             .unwrap_or_else(|| ServerConfig::default().max_clients),
+        worker_threads: 0,
     };
     match server_config.client_timeout {
         Some(d) => info!("client idle timeout: {}s", d.as_secs()),
@@ -176,9 +177,11 @@ fn build_engine(args: &CliArgs) -> Result<KvEngine, ExitCode> {
     }
 }
 
-/// Installs SIGINT/SIGTERM handlers that flip the shared shutdown flag and
-/// self-connect to the listener so the blocked `accept` returns immediately.
-fn install_signal_handlers(shutdown: Shutdown, wake_addr: SocketAddr) -> std::io::Result<()> {
+/// Installs SIGINT/SIGTERM handlers that flip the shared shutdown flag. The
+/// async accept loop observes the flag via `Shutdown::notified` and exits on
+/// the next scheduler poll, so we no longer need the self-connect wake-up
+/// trick that the blocking listener required.
+fn install_signal_handlers(shutdown: Shutdown, _wake_addr: SocketAddr) -> std::io::Result<()> {
     use signal_hook::consts::{SIGINT, SIGTERM};
     use signal_hook::iterator::Signals;
 
@@ -197,7 +200,6 @@ fn install_signal_handlers(shutdown: Shutdown, wake_addr: SocketAddr) -> std::io
                 };
                 warn!("received {name}, initiating graceful shutdown");
                 shutdown.trigger();
-                Shutdown::wake_listener(wake_addr);
             }
         })?;
     Ok(())

@@ -22,6 +22,7 @@ fn second_client_is_rejected_when_maxclients_is_one() {
     let config = ServerConfig {
         client_timeout: None,
         max_clients: 1,
+        ..ServerConfig::default()
     };
 
     let _server = thread::spawn(move || {
