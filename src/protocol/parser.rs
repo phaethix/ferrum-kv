@@ -46,6 +46,12 @@ pub enum Command {
     Ttl { key: Vec<u8> },
     /// `PTTL key` — remaining TTL in milliseconds.
     PTtl { key: Vec<u8> },
+    /// `MEMORY USAGE key` — approximate byte cost of a single key.
+    MemoryUsage { key: Vec<u8> },
+    /// `INFO [section]` — server/memory/clients metrics. `None` means
+    /// "everything"; only known sections are recognised and unknown ones
+    /// produce an empty reply, as in Redis.
+    Info { section: Option<Vec<u8>> },
 }
 
 /// Outcome of attempting to parse a single RESP2 frame from a byte buffer.
@@ -423,6 +429,35 @@ fn build_command(parts: Vec<Vec<u8>>) -> Result<Command, FerrumError> {
             }
             Ok(Command::PTtl {
                 key: args.into_iter().next().unwrap(),
+            })
+        }
+        b"MEMORY" => {
+            // `MEMORY` is a container command in Redis; we currently only
+            // recognise the `USAGE key` subcommand.
+            if args.len() < 2 {
+                return Err(FerrumError::WrongArity { cmd: "MEMORY" });
+            }
+            let mut it = args.into_iter();
+            let sub = it.next().unwrap();
+            if ascii_uppercase(&sub) != b"USAGE" {
+                return Err(FerrumError::UnknownCommand(format!(
+                    "MEMORY {}",
+                    String::from_utf8_lossy(&sub)
+                )));
+            }
+            // Accept and ignore the optional `SAMPLES count` tail for
+            // compatibility; we don't sample anything, we compute exactly.
+            let key = it.next().unwrap();
+            Ok(Command::MemoryUsage { key })
+        }
+        b"INFO" => {
+            // Zero or one section argument; further sections are ignored
+            // with a WrongArity error so surprises surface early.
+            if args.len() > 1 {
+                return Err(FerrumError::WrongArity { cmd: "INFO" });
+            }
+            Ok(Command::Info {
+                section: args.into_iter().next(),
             })
         }
         _ => Err(FerrumError::UnknownCommand(
@@ -898,5 +933,45 @@ mod frame_tests {
             other => panic!("expected Invalid, got {other:?}"),
         };
         assert!(matches!(err, FerrumError::WrongArity { cmd: "TTL" }));
+    }
+
+    #[test]
+    fn parses_memory_usage() {
+        assert_eq!(
+            parse_exact(b"*3\r\n$6\r\nMEMORY\r\n$5\r\nUSAGE\r\n$1\r\nk\r\n"),
+            Command::MemoryUsage { key: b"k".to_vec() }
+        );
+    }
+
+    #[test]
+    fn memory_without_subcommand_is_wrong_arity() {
+        let err = match parse_frame(b"*1\r\n$6\r\nMEMORY\r\n").unwrap() {
+            FrameParse::Invalid { error, .. } => error,
+            other => panic!("expected Invalid, got {other:?}"),
+        };
+        assert!(matches!(err, FerrumError::WrongArity { cmd: "MEMORY" }));
+    }
+
+    #[test]
+    fn memory_unknown_subcommand_is_rejected() {
+        let err = match parse_frame(b"*3\r\n$6\r\nMEMORY\r\n$5\r\nSTATS\r\n$1\r\nk\r\n").unwrap() {
+            FrameParse::Invalid { error, .. } => error,
+            other => panic!("expected Invalid, got {other:?}"),
+        };
+        assert!(matches!(err, FerrumError::UnknownCommand(_)));
+    }
+
+    #[test]
+    fn parses_info_with_and_without_section() {
+        assert_eq!(
+            parse_exact(b"*1\r\n$4\r\nINFO\r\n"),
+            Command::Info { section: None }
+        );
+        assert_eq!(
+            parse_exact(b"*2\r\n$4\r\nINFO\r\n$6\r\nmemory\r\n"),
+            Command::Info {
+                section: Some(b"memory".to_vec())
+            }
+        );
     }
 }

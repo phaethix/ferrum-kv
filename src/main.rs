@@ -44,6 +44,22 @@ fn main() -> ExitCode {
         Err(code) => return code,
     };
 
+    let eviction_cfg = args.eviction_config();
+    if let Err(e) = engine.set_eviction_config(eviction_cfg) {
+        error!("failed to apply eviction config: {e}");
+        return ExitCode::FAILURE;
+    }
+    if eviction_cfg.max_memory == 0 {
+        info!("maxmemory: unlimited");
+    } else {
+        info!(
+            "maxmemory: {} bytes, policy={}, samples={}",
+            eviction_cfg.max_memory,
+            eviction_cfg.policy.name(),
+            eviction_cfg.samples,
+        );
+    }
+
     // Bind the listener up front so that `--addr :0` is resolved before we
     // install the signal handler that needs the concrete address.
     let listener = match TcpListener::bind(&args.addr) {

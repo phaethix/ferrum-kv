@@ -15,6 +15,7 @@ use std::time::Duration;
 
 use ferrum_kv::config::{FileConfig, FileConfigError};
 use ferrum_kv::persistence::config::{AofConfig, FsyncPolicy};
+use ferrum_kv::storage::eviction::{EvictionConfig, EvictionPolicy};
 
 pub const DEFAULT_ADDR: &str = "127.0.0.1:6380";
 
@@ -22,6 +23,8 @@ pub const USAGE: &str = concat!(
     "usage: ferrum-kv [--config PATH] [--addr HOST:PORT] [--aof-path PATH]\n",
     "                 [--appendfsync always|everysec|no]\n",
     "                 [--client-timeout SECONDS] [--maxclients N]\n",
+    "                 [--maxmemory BYTES] [--maxmemory-policy POLICY]\n",
+    "                 [--maxmemory-samples N]\n",
     "                 [--loglevel off|error|warn|info|debug|trace]"
 );
 
@@ -50,6 +53,13 @@ pub struct CliArgs {
     /// Explicit `loglevel` requested via `--loglevel` or the config file.
     /// The caller may still override this with `FERRUM_LOG`/`RUST_LOG`.
     loglevel: Option<String>,
+    /// Memory ceiling in bytes. `None` keeps the built-in default of
+    /// zero (disabled); `Some(0)` explicitly disables enforcement.
+    max_memory: Option<u64>,
+    /// Eviction policy when `maxmemory` is reached.
+    max_memory_policy: Option<EvictionPolicy>,
+    /// How many random candidates each eviction round considers.
+    max_memory_samples: Option<usize>,
 }
 
 /// Raw, un-merged values taken verbatim from the command line.
@@ -68,6 +78,9 @@ struct RawFlags {
     client_timeout: Option<Option<Duration>>, // outer Some = flag was passed, inner None = disabled
     max_clients: Option<usize>,
     loglevel: Option<String>,
+    max_memory: Option<u64>,
+    max_memory_policy: Option<EvictionPolicy>,
+    max_memory_samples: Option<usize>,
     /// Whether AOF was explicitly enabled via the config file's `appendonly yes`.
     /// CLI `--aof-path` implies enabled; this field only carries the file's
     /// intent so that a later merge step can decide.
@@ -112,6 +125,18 @@ impl CliArgs {
     /// Returns the explicit log level requested via CLI or config file.
     pub fn loglevel(&self) -> Option<&str> {
         self.loglevel.as_deref()
+    }
+
+    /// Returns the resolved eviction configuration. Defaults (unlimited
+    /// memory, `noeviction`, 5 samples) apply when neither CLI nor config
+    /// file specifies a value.
+    pub fn eviction_config(&self) -> EvictionConfig {
+        let default = EvictionConfig::default();
+        EvictionConfig {
+            max_memory: self.max_memory.unwrap_or(default.max_memory),
+            policy: self.max_memory_policy.unwrap_or(default.policy),
+            samples: self.max_memory_samples.unwrap_or(default.samples),
+        }
     }
 }
 
@@ -160,6 +185,29 @@ fn scan_argv<I: IntoIterator<Item = String>>(args: I) -> Result<ScanOutcome, Str
             "--loglevel" => {
                 let value = take_value(&mut iter, "--loglevel")?;
                 raw.loglevel = Some(validate_loglevel(&value)?);
+            }
+            "--maxmemory" => {
+                let value = take_value(&mut iter, "--maxmemory")?;
+                raw.max_memory =
+                    Some(parse_bytes(&value).map_err(|e| format!("invalid --maxmemory: {e}"))?);
+            }
+            "--maxmemory-policy" => {
+                let value = take_value(&mut iter, "--maxmemory-policy")?;
+                let name = value.to_ascii_lowercase();
+                raw.max_memory_policy =
+                    Some(EvictionPolicy::from_name(&name).ok_or_else(|| {
+                        format!(
+                            "invalid --maxmemory-policy '{value}' (expected noeviction, \
+                             allkeys-lru, volatile-lru, allkeys-random, volatile-random, \
+                             volatile-ttl)"
+                        )
+                    })?);
+            }
+            "--maxmemory-samples" => {
+                let value = take_value(&mut iter, "--maxmemory-samples")?;
+                raw.max_memory_samples = Some(value.parse().map_err(|_| {
+                    format!("invalid --maxmemory-samples: '{value}' is not a non-negative integer")
+                })?);
             }
             "-h" | "--help" => return Ok(ScanOutcome::Help),
             other => return Err(format!("unrecognised argument: '{other}'")),
@@ -221,6 +269,15 @@ fn merge(raw: RawFlags, file: Option<&FileConfig>) -> Result<CliArgs, String> {
         .loglevel
         .or_else(|| file.and_then(|f| f.loglevel.clone()));
 
+    // --- maxmemory family ---------------------------------------------------
+    let max_memory = raw.max_memory.or_else(|| file.and_then(|f| f.max_memory));
+    let max_memory_policy = raw
+        .max_memory_policy
+        .or_else(|| file.and_then(|f| f.max_memory_policy));
+    let max_memory_samples = raw
+        .max_memory_samples
+        .or_else(|| file.and_then(|f| f.max_memory_samples));
+
     Ok(CliArgs {
         addr,
         aof_path,
@@ -228,6 +285,9 @@ fn merge(raw: RawFlags, file: Option<&FileConfig>) -> Result<CliArgs, String> {
         client_timeout,
         max_clients,
         loglevel,
+        max_memory,
+        max_memory_policy,
+        max_memory_samples,
     })
 }
 
@@ -283,6 +343,34 @@ fn parse_timeout_seconds(raw: &str) -> Result<Option<Duration>, String> {
     } else {
         Ok(Some(Duration::from_secs(secs)))
     }
+}
+
+/// Parses a Redis-style byte size (`100mb`, `1gb`, plain integer, …).
+fn parse_bytes(raw: &str) -> Result<u64, String> {
+    let lower = raw.trim().to_ascii_lowercase();
+    let (num, factor): (&str, u64) = if let Some(s) = lower.strip_suffix("gb") {
+        (s, 1024 * 1024 * 1024)
+    } else if let Some(s) = lower.strip_suffix("mb") {
+        (s, 1024 * 1024)
+    } else if let Some(s) = lower.strip_suffix("kb") {
+        (s, 1024)
+    } else if let Some(s) = lower.strip_suffix('g') {
+        (s, 1024 * 1024 * 1024)
+    } else if let Some(s) = lower.strip_suffix('m') {
+        (s, 1024 * 1024)
+    } else if let Some(s) = lower.strip_suffix('k') {
+        (s, 1024)
+    } else if let Some(s) = lower.strip_suffix('b') {
+        (s, 1)
+    } else {
+        (lower.as_str(), 1)
+    };
+    let num: u64 = num
+        .trim()
+        .parse()
+        .map_err(|_| format!("'{raw}' is not a byte size"))?;
+    num.checked_mul(factor)
+        .ok_or_else(|| format!("'{raw}' overflows u64"))
 }
 
 // Marker to silence the dead_code lint on the currently-reserved fields.
@@ -517,5 +605,47 @@ mod tests {
     fn missing_config_file_reports_error() {
         let err = parse(&["--config", "/definitely/does/not/exist/xyz.conf"]).unwrap_err();
         assert!(err.contains("failed to read config"));
+    }
+
+    #[test]
+    fn maxmemory_flag_accepts_byte_suffixes() {
+        let args = parse_run(&["--maxmemory", "10mb"]);
+        assert_eq!(args.eviction_config().max_memory, 10 * 1024 * 1024);
+    }
+
+    #[test]
+    fn maxmemory_policy_flag_is_parsed() {
+        let args = parse_run(&["--maxmemory-policy", "allkeys-lru"]);
+        assert_eq!(args.eviction_config().policy, EvictionPolicy::AllKeysLru);
+    }
+
+    #[test]
+    fn maxmemory_samples_flag_is_parsed() {
+        let args = parse_run(&["--maxmemory-samples", "20"]);
+        assert_eq!(args.eviction_config().samples, 20);
+    }
+
+    #[test]
+    fn maxmemory_rejects_unknown_policy() {
+        let err = parse(&["--maxmemory-policy", "wishful"]).unwrap_err();
+        assert!(err.contains("--maxmemory-policy"));
+    }
+
+    #[test]
+    fn cli_maxmemory_overrides_config_file() {
+        let conf = TempConf::new(
+            "maxmem",
+            "maxmemory 1kb\nmaxmemory-policy allkeys-lru\nmaxmemory-samples 3\n",
+        );
+        let args = parse_run(&[
+            "--config",
+            conf.path.to_str().unwrap(),
+            "--maxmemory",
+            "2mb",
+        ]);
+        let cfg = args.eviction_config();
+        assert_eq!(cfg.max_memory, 2 * 1024 * 1024);
+        assert_eq!(cfg.policy, EvictionPolicy::AllKeysLru);
+        assert_eq!(cfg.samples, 3);
     }
 }

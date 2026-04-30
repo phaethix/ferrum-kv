@@ -336,7 +336,58 @@ pub fn execute_command(cmd: Command, engine: &KvEngine, out: &mut Vec<u8>) {
             Ok(TtlStatus::Millis(ms)) => encoder::encode_integer(out, ms),
             Err(e) => write_ferrum_error(out, &e),
         },
+        Command::MemoryUsage { key } => match engine.memory_usage(&key) {
+            Ok(Some(bytes)) => encoder::encode_integer(out, bytes as i64),
+            Ok(None) => encoder::encode_null_bulk(out),
+            Err(e) => write_ferrum_error(out, &e),
+        },
+        Command::Info { section } => {
+            let body = render_info(engine, section.as_deref());
+            encoder::encode_bulk_string(out, body.as_bytes());
+        }
     }
+}
+
+/// Produces the payload for `INFO [section]`.
+///
+/// Only the `server` and `memory` sections are currently populated, plus a
+/// small `keyspace` summary that mirrors Redis' `db0` line. Unknown sections
+/// return an empty body, matching Redis' behaviour.
+fn render_info(engine: &KvEngine, section: Option<&[u8]>) -> String {
+    let wants = |name: &str| match section {
+        None => true,
+        Some(s) => s.eq_ignore_ascii_case(name.as_bytes()),
+    };
+
+    let mut out = String::new();
+    if wants("server") {
+        out.push_str("# Server\r\n");
+        out.push_str(concat!(
+            "ferrum_version:",
+            env!("CARGO_PKG_VERSION"),
+            "\r\n"
+        ));
+        out.push_str("\r\n");
+    }
+    if wants("memory") {
+        let used = engine.used_memory();
+        let cfg = engine.eviction_config().unwrap_or_default();
+        out.push_str("# Memory\r\n");
+        out.push_str(&format!("used_memory:{used}\r\n"));
+        out.push_str(&format!("maxmemory:{}\r\n", cfg.max_memory));
+        out.push_str(&format!("maxmemory_policy:{}\r\n", cfg.policy.name()));
+        out.push_str(&format!("maxmemory_samples:{}\r\n", cfg.samples));
+        out.push_str("\r\n");
+    }
+    if wants("keyspace") {
+        let keys = engine.dbsize().unwrap_or(0);
+        out.push_str("# Keyspace\r\n");
+        if keys > 0 {
+            out.push_str(&format!("db0:keys={keys},expires=0,avg_ttl=0\r\n"));
+        }
+        out.push_str("\r\n");
+    }
+    out
 }
 
 /// Converts an `EXPIRE` second delta to milliseconds, saturating on overflow.
