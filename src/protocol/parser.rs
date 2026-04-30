@@ -1,18 +1,21 @@
 use crate::error::FerrumError;
 
 /// Represents a parsed command received from a client.
+///
+/// Keys and values are kept as raw bytes so that binary-safe payloads survive
+/// unchanged through the protocol layer.
 #[derive(Debug, PartialEq)]
 pub enum Command {
     /// `SET key value`
-    Set { key: String, value: String },
+    Set { key: Vec<u8>, value: Vec<u8> },
     /// `GET key`
-    Get { key: String },
+    Get { key: Vec<u8> },
     /// `DEL key`
-    Del { key: String },
+    Del { key: Vec<u8> },
     /// `EXISTS key`
-    Exists { key: String },
+    Exists { key: Vec<u8> },
     /// `PING [message]`
-    Ping { msg: Option<String> },
+    Ping { msg: Option<Vec<u8>> },
     /// `DBSIZE`, which returns the number of keys.
     DbSize,
     /// `FLUSHDB`, which removes all keys.
@@ -83,7 +86,7 @@ pub fn parse_frame(buf: &[u8]) -> Result<FrameParse, FerrumError> {
         )));
     }
 
-    let mut parts: Vec<String> = Vec::with_capacity(count);
+    let mut parts: Vec<Vec<u8>> = Vec::with_capacity(count);
     for _ in 0..count {
         match read_bulk_string(buf, cursor)? {
             Some((s, next)) => {
@@ -141,10 +144,11 @@ fn read_integer_line(buf: &[u8], start: usize) -> Result<Option<(i64, usize)>, F
 
 /// Reads a single `$<len>\r\n<payload>\r\n` bulk string starting at `start`.
 ///
-/// Bulk strings are binary-safe on the wire; however, this intermediate stage
-/// still materialises them as [`String`]. The conversion will be replaced with
-/// a byte-owned representation once the storage engine accepts `Vec<u8>`.
-fn read_bulk_string(buf: &[u8], start: usize) -> Result<Option<(String, usize)>, FerrumError> {
+/// Bulk strings are binary-safe on the wire and the parser preserves that
+/// guarantee by returning the payload as raw bytes without any UTF-8
+/// validation. Callers that need a textual interpretation (e.g. command-name
+/// lookup) perform the conversion themselves.
+fn read_bulk_string(buf: &[u8], start: usize) -> Result<Option<(Vec<u8>, usize)>, FerrumError> {
     if start >= buf.len() {
         return Ok(None);
     }
@@ -184,10 +188,7 @@ fn read_bulk_string(buf: &[u8], start: usize) -> Result<Option<(String, usize)>,
         ));
     }
 
-    let payload = std::str::from_utf8(&buf[after_len..payload_end])
-        .map_err(|_| FerrumError::ParseError("non-UTF-8 bulk string".into()))?
-        .to_string();
-
+    let payload = buf[after_len..payload_end].to_vec();
     Ok(Some((payload, payload_end + 2)))
 }
 
@@ -203,14 +204,15 @@ fn find_crlf(buf: &[u8], from: usize) -> Option<usize> {
 }
 
 /// Assembles a [`Command`] from the decoded argv of a RESP array.
-fn build_command(parts: Vec<String>) -> Result<Command, FerrumError> {
+fn build_command(parts: Vec<Vec<u8>>) -> Result<Command, FerrumError> {
     let mut iter = parts.into_iter();
     // `parse_frame` already rejected empty arrays, so the first element exists.
     let name = iter.next().expect("array has at least one element");
-    let args: Vec<String> = iter.collect();
+    let args: Vec<Vec<u8>> = iter.collect();
 
-    match name.to_ascii_uppercase().as_str() {
-        "SET" => {
+    let upper = ascii_uppercase(&name);
+    match upper.as_slice() {
+        b"SET" => {
             if args.len() != 2 {
                 return Err(FerrumError::WrongArity { cmd: "SET" });
             }
@@ -220,7 +222,7 @@ fn build_command(parts: Vec<String>) -> Result<Command, FerrumError> {
                 value: it.next().unwrap(),
             })
         }
-        "GET" => {
+        b"GET" => {
             if args.len() != 1 {
                 return Err(FerrumError::WrongArity { cmd: "GET" });
             }
@@ -228,7 +230,7 @@ fn build_command(parts: Vec<String>) -> Result<Command, FerrumError> {
                 key: args.into_iter().next().unwrap(),
             })
         }
-        "DEL" => {
+        b"DEL" => {
             if args.len() != 1 {
                 return Err(FerrumError::WrongArity { cmd: "DEL" });
             }
@@ -236,7 +238,7 @@ fn build_command(parts: Vec<String>) -> Result<Command, FerrumError> {
                 key: args.into_iter().next().unwrap(),
             })
         }
-        "EXISTS" => {
+        b"EXISTS" => {
             if args.len() != 1 {
                 return Err(FerrumError::WrongArity { cmd: "EXISTS" });
             }
@@ -244,27 +246,34 @@ fn build_command(parts: Vec<String>) -> Result<Command, FerrumError> {
                 key: args.into_iter().next().unwrap(),
             })
         }
-        "PING" => match args.len() {
+        b"PING" => match args.len() {
             0 => Ok(Command::Ping { msg: None }),
             1 => Ok(Command::Ping {
                 msg: Some(args.into_iter().next().unwrap()),
             }),
             _ => Err(FerrumError::WrongArity { cmd: "PING" }),
         },
-        "DBSIZE" => {
+        b"DBSIZE" => {
             if !args.is_empty() {
                 return Err(FerrumError::WrongArity { cmd: "DBSIZE" });
             }
             Ok(Command::DbSize)
         }
-        "FLUSHDB" => {
+        b"FLUSHDB" => {
             if !args.is_empty() {
                 return Err(FerrumError::WrongArity { cmd: "FLUSHDB" });
             }
             Ok(Command::FlushDb)
         }
-        other => Err(FerrumError::UnknownCommand(other.to_string())),
+        _ => Err(FerrumError::UnknownCommand(
+            String::from_utf8_lossy(&name).into_owned(),
+        )),
     }
+}
+
+/// Returns the ASCII-uppercased copy of `bytes`; non-ASCII bytes are preserved.
+fn ascii_uppercase(bytes: &[u8]) -> Vec<u8> {
+    bytes.iter().map(|b| b.to_ascii_uppercase()).collect()
 }
 
 #[cfg(test)]
@@ -301,8 +310,8 @@ mod frame_tests {
         assert_eq!(
             cmd,
             Command::Set {
-                key: "name".into(),
-                value: "ferrum".into(),
+                key: b"name".to_vec(),
+                value: b"ferrum".to_vec(),
             }
         );
     }
@@ -310,19 +319,29 @@ mod frame_tests {
     #[test]
     fn parses_get_command() {
         let cmd = parse_exact(b"*2\r\n$3\r\nGET\r\n$4\r\nname\r\n");
-        assert_eq!(cmd, Command::Get { key: "name".into() });
+        assert_eq!(
+            cmd,
+            Command::Get {
+                key: b"name".to_vec()
+            }
+        );
     }
 
     #[test]
     fn parses_del_command() {
         let cmd = parse_exact(b"*2\r\n$3\r\nDEL\r\n$1\r\nk\r\n");
-        assert_eq!(cmd, Command::Del { key: "k".into() });
+        assert_eq!(cmd, Command::Del { key: b"k".to_vec() });
     }
 
     #[test]
     fn parses_exists_command() {
         let cmd = parse_exact(b"*2\r\n$6\r\nEXISTS\r\n$4\r\nname\r\n");
-        assert_eq!(cmd, Command::Exists { key: "name".into() });
+        assert_eq!(
+            cmd,
+            Command::Exists {
+                key: b"name".to_vec()
+            }
+        );
     }
 
     #[test]
@@ -337,7 +356,7 @@ mod frame_tests {
         assert_eq!(
             cmd,
             Command::Ping {
-                msg: Some("hello".into())
+                msg: Some(b"hello".to_vec())
             }
         );
     }
@@ -354,8 +373,8 @@ mod frame_tests {
         assert_eq!(
             cmd,
             Command::Set {
-                key: "k".into(),
-                value: "v".into(),
+                key: b"k".to_vec(),
+                value: b"v".to_vec(),
             }
         );
     }
@@ -367,8 +386,8 @@ mod frame_tests {
         assert_eq!(
             cmd,
             Command::Set {
-                key: "k".into(),
-                value: "a\r\nb".into(),
+                key: b"k".to_vec(),
+                value: b"a\r\nb".to_vec(),
             }
         );
     }
@@ -379,8 +398,29 @@ mod frame_tests {
         assert_eq!(
             cmd,
             Command::Set {
-                key: "k".into(),
-                value: String::new(),
+                key: b"k".to_vec(),
+                value: Vec::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn accepts_non_utf8_payloads() {
+        // Bulk strings must survive arbitrary byte sequences, including values
+        // that are not valid UTF-8 and keys that embed NUL bytes.
+        let mut frame: Vec<u8> = Vec::new();
+        frame.extend_from_slice(b"*3\r\n$3\r\nSET\r\n$3\r\n");
+        frame.extend_from_slice(&[0x00, 0xff, 0x01]);
+        frame.extend_from_slice(b"\r\n$5\r\n");
+        frame.extend_from_slice(&[0x80, 0x00, 0xc3, 0x28, 0xfe]);
+        frame.extend_from_slice(b"\r\n");
+
+        let cmd = parse_exact(&frame);
+        assert_eq!(
+            cmd,
+            Command::Set {
+                key: vec![0x00, 0xff, 0x01],
+                value: vec![0x80, 0x00, 0xc3, 0x28, 0xfe],
             }
         );
     }
@@ -396,8 +436,8 @@ mod frame_tests {
         assert_eq!(
             command,
             Command::Set {
-                key: "a".into(),
-                value: "1".into(),
+                key: b"a".to_vec(),
+                value: b"1".to_vec(),
             }
         );
         // First frame length: "*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\n1\r\n" = 27 bytes.
@@ -409,8 +449,8 @@ mod frame_tests {
         assert_eq!(
             cmd2,
             Command::Set {
-                key: "b".into(),
-                value: "2".into(),
+                key: b"b".to_vec(),
+                value: b"2".to_vec(),
             }
         );
     }

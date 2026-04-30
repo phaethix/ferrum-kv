@@ -8,28 +8,28 @@
 /// Encodes a command and its arguments as a RESP2 Array of Bulk Strings.
 ///
 /// The first element is the command name; remaining elements are arguments.
-/// Each bulk string is length-prefixed, making the encoding binary-safe.
+/// Each bulk string is length-prefixed, making the encoding binary-safe for
+/// arbitrary byte sequences including NUL bytes and embedded CRLF.
 ///
 /// # Examples
 ///
 /// ```ignore
-/// let bytes = encode_command(&["SET", "name", "ferrum"]);
+/// let bytes = encode_command(&[b"SET", b"name", b"ferrum"]);
 /// assert_eq!(bytes, b"*3\r\n$3\r\nSET\r\n$4\r\nname\r\n$6\r\nferrum\r\n");
 /// ```
-pub(crate) fn encode_command(parts: &[&str]) -> Vec<u8> {
-    // Estimate capacity to avoid repeated reallocations for typical payloads.
+pub(crate) fn encode_command(parts: &[&[u8]]) -> Vec<u8> {
     let payload_len: usize = parts.iter().map(|p| p.len()).sum();
     let mut buf = Vec::with_capacity(16 + payload_len + parts.len() * 8);
 
-    buf.extend_from_slice(b"*");
+    buf.push(b'*');
     buf.extend_from_slice(parts.len().to_string().as_bytes());
     buf.extend_from_slice(b"\r\n");
 
     for part in parts {
-        buf.extend_from_slice(b"$");
+        buf.push(b'$');
         buf.extend_from_slice(part.len().to_string().as_bytes());
         buf.extend_from_slice(b"\r\n");
-        buf.extend_from_slice(part.as_bytes());
+        buf.extend_from_slice(part);
         buf.extend_from_slice(b"\r\n");
     }
 
@@ -42,7 +42,7 @@ mod tests {
 
     #[test]
     fn encodes_set_command() {
-        let encoded = encode_command(&["SET", "name", "ferrum"]);
+        let encoded = encode_command(&[b"SET", b"name", b"ferrum"]);
         assert_eq!(
             encoded,
             b"*3\r\n$3\r\nSET\r\n$4\r\nname\r\n$6\r\nferrum\r\n"
@@ -51,32 +51,40 @@ mod tests {
 
     #[test]
     fn encodes_del_command() {
-        let encoded = encode_command(&["DEL", "name"]);
+        let encoded = encode_command(&[b"DEL", b"name"]);
         assert_eq!(encoded, b"*2\r\n$3\r\nDEL\r\n$4\r\nname\r\n");
     }
 
     #[test]
     fn encodes_flushdb_command() {
-        let encoded = encode_command(&["FLUSHDB"]);
+        let encoded = encode_command(&[b"FLUSHDB"]);
         assert_eq!(encoded, b"*1\r\n$7\r\nFLUSHDB\r\n");
     }
 
     #[test]
     fn encodes_values_containing_crlf() {
-        let encoded = encode_command(&["SET", "k", "a\r\nb"]);
+        let encoded = encode_command(&[b"SET", b"k", b"a\r\nb"]);
         assert_eq!(encoded, b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$4\r\na\r\nb\r\n");
     }
 
     #[test]
     fn encodes_empty_value() {
-        let encoded = encode_command(&["SET", "k", ""]);
+        let encoded = encode_command(&[b"SET", b"k", b""]);
         assert_eq!(encoded, b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$0\r\n\r\n");
     }
 
     #[test]
+    fn encodes_values_with_nul_and_high_bytes() {
+        let value: &[u8] = &[0x00, 0x01, 0xff, 0xfe, 0x80];
+        let encoded = encode_command(&[b"SET", b"k", value]);
+        let expected: &[u8] = b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$5\r\n\x00\x01\xff\xfe\x80\r\n";
+        assert_eq!(encoded, expected);
+    }
+
+    #[test]
     fn encodes_large_value_length_prefix() {
-        let value = "x".repeat(1024);
-        let encoded = encode_command(&["SET", "k", &value]);
+        let value = vec![b'x'; 1024];
+        let encoded = encode_command(&[b"SET", b"k", &value]);
         assert!(encoded.starts_with(b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1024\r\n"));
         assert!(encoded.ends_with(b"\r\n"));
     }

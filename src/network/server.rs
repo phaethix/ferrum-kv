@@ -117,7 +117,7 @@ pub fn execute_command(cmd: Command, engine: &KvEngine, out: &mut Vec<u8>) {
             Err(e) => write_ferrum_error(out, &e),
         },
         Command::Get { key } => match engine.get(&key) {
-            Ok(Some(v)) => encoder::encode_bulk_string(out, v.as_bytes()),
+            Ok(Some(v)) => encoder::encode_bulk_string(out, &v),
             Ok(None) => encoder::encode_null_bulk(out),
             Err(e) => write_ferrum_error(out, &e),
         },
@@ -133,7 +133,7 @@ pub fn execute_command(cmd: Command, engine: &KvEngine, out: &mut Vec<u8>) {
         },
         Command::Ping { msg } => match msg {
             None => encoder::encode_simple_string(out, "PONG"),
-            Some(m) => encoder::encode_bulk_string(out, m.as_bytes()),
+            Some(m) => encoder::encode_bulk_string(out, &m),
         },
         Command::DbSize => match engine.dbsize() {
             Ok(n) => encoder::encode_integer(out, n as i64),
