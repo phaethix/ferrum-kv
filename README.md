@@ -1,7 +1,7 @@
 # FerrumKV 🦀
 
 [![CI](https://github.com/phaethix/ferrum-kv/actions/workflows/ci.yml/badge.svg)](https://github.com/phaethix/ferrum-kv/actions/workflows/ci.yml)
-![version](https://img.shields.io/badge/version-v0.3.0-blue)
+![version](https://img.shields.io/badge/version-v0.4.0-blue)
 
 A lightweight, multi-threaded KV storage server written in Rust — built from scratch for systems programming practice.
 
@@ -27,7 +27,7 @@ flowchart TB
     subgraph NetLayer ["🔌 Network & Concurrency"]
         direction LR
         Listener(("TcpListener (Port 6380)"))
-        WorkerThread[["Worker Thread (thread::spawn)"]]
+        WorkerThread[["Tokio Task (tokio::spawn)"]]
 
         Listener -->|"accept connection"| WorkerThread
     end
@@ -106,6 +106,7 @@ redis-cli -p 6380
 | `--addr HOST:PORT` | `127.0.0.1:6380` | Listening address |
 | `--aof-path PATH` | *(disabled)* | Enables AOF persistence at the given path |
 | `--appendfsync POLICY` | `everysec` | Fsync policy when AOF is enabled (`always` / `everysec` / `no`) |
+| `--io-threads N` | `0` (= CPU count) | Tokio worker thread pool size |
 
 ## Supported Commands
 
@@ -176,7 +177,7 @@ The GitHub Actions pipeline runs `cargo fmt --check`, `cargo clippy -- -D warnin
 - [x] Key expiration: `EXPIRE` / `PEXPIRE` / `PEXPIREAT` / `PERSIST` / `TTL` / `PTTL` with lazy + active scanning
 - [x] Memory cap + sampled eviction: `noeviction` / `allkeys-lru` / `allkeys-lfu` / `allkeys-random` / `allkeys-ahe` / `volatile-lru` / `volatile-lfu` / `volatile-random` / `volatile-ttl` / `volatile-ahe`
 - [x] Observability: `MEMORY USAGE`, `INFO memory` (incl. `ahe_alpha`), `INFO stats` (`keyspace_hits` / `keyspace_misses`)
-- [ ] Async I/O (Tokio)
+- [x] Async I/O runtime on Tokio (`--io-threads`, 500-client concurrency smoke test)
 
 ## License
 
