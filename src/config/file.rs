@@ -17,6 +17,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::persistence::config::FsyncPolicy;
+use crate::storage::eviction::EvictionPolicy;
 
 /// Parsed configuration file contents.
 ///
@@ -35,6 +36,12 @@ pub struct FileConfig {
     pub appendfsync: Option<FsyncPolicy>,
     /// Log level string accepted by `env_logger` (e.g. `info`, `debug`).
     pub loglevel: Option<String>,
+    /// Memory ceiling in bytes. `0` disables enforcement.
+    pub max_memory: Option<u64>,
+    /// Eviction policy selected when `maxmemory` is reached.
+    pub max_memory_policy: Option<EvictionPolicy>,
+    /// Number of keys inspected per eviction round.
+    pub max_memory_samples: Option<usize>,
 }
 
 /// Error type for configuration file parsing.
@@ -156,6 +163,22 @@ fn apply_directive(cfg: &mut FileConfig, key: &str, value: &str) -> Result<(), S
             }
             cfg.loglevel = Some(normalised);
         }
+        "maxmemory" => {
+            cfg.max_memory = Some(parse_bytes(value, "maxmemory")?);
+        }
+        "maxmemory-policy" => {
+            let name = value.to_ascii_lowercase();
+            cfg.max_memory_policy = Some(EvictionPolicy::from_name(&name).ok_or_else(|| {
+                format!(
+                    "invalid maxmemory-policy '{value}' (expected one of noeviction, \
+                         allkeys-lru, volatile-lru, allkeys-random, volatile-random, \
+                         volatile-ttl)"
+                )
+            })?);
+        }
+        "maxmemory-samples" => {
+            cfg.max_memory_samples = Some(parse_usize(value, "maxmemory-samples")?);
+        }
         other => return Err(format!("unknown directive '{other}'")),
     }
     Ok(())
@@ -194,6 +217,36 @@ fn strip_quotes(raw: &str) -> &str {
     } else {
         raw
     }
+}
+
+/// Parses byte sizes in Redis-friendly form: a bare integer, or an integer
+/// followed by one of the suffixes `b`, `k`, `kb`, `m`, `mb`, `g`, `gb`
+/// (case-insensitive, no space between number and suffix).
+fn parse_bytes(raw: &str, name: &str) -> Result<u64, String> {
+    let lower = raw.trim().to_ascii_lowercase();
+    let (num, factor): (&str, u64) = if let Some(stripped) = lower.strip_suffix("gb") {
+        (stripped, 1024 * 1024 * 1024)
+    } else if let Some(stripped) = lower.strip_suffix("mb") {
+        (stripped, 1024 * 1024)
+    } else if let Some(stripped) = lower.strip_suffix("kb") {
+        (stripped, 1024)
+    } else if let Some(stripped) = lower.strip_suffix('g') {
+        (stripped, 1024 * 1024 * 1024)
+    } else if let Some(stripped) = lower.strip_suffix('m') {
+        (stripped, 1024 * 1024)
+    } else if let Some(stripped) = lower.strip_suffix('k') {
+        (stripped, 1024)
+    } else if let Some(stripped) = lower.strip_suffix('b') {
+        (stripped, 1)
+    } else {
+        (lower.as_str(), 1)
+    };
+    let num: u64 = num
+        .trim()
+        .parse()
+        .map_err(|_| format!("invalid {name}: '{raw}' is not a byte size"))?;
+    num.checked_mul(factor)
+        .ok_or_else(|| format!("invalid {name}: '{raw}' overflows u64"))
 }
 
 #[cfg(test)]
@@ -294,5 +347,45 @@ mod tests {
     fn key_is_case_insensitive() {
         let cfg = parse("PORT 12345\n").unwrap();
         assert_eq!(cfg.port, Some(12345));
+    }
+
+    #[test]
+    fn maxmemory_accepts_byte_and_suffix_forms() {
+        assert_eq!(parse("maxmemory 0\n").unwrap().max_memory, Some(0));
+        assert_eq!(parse("maxmemory 1024\n").unwrap().max_memory, Some(1024));
+        assert_eq!(parse("maxmemory 2k\n").unwrap().max_memory, Some(2 * 1024));
+        assert_eq!(
+            parse("maxmemory 100mb\n").unwrap().max_memory,
+            Some(100 * 1024 * 1024)
+        );
+        assert_eq!(
+            parse("maxmemory 1GB\n").unwrap().max_memory,
+            Some(1024 * 1024 * 1024)
+        );
+    }
+
+    #[test]
+    fn maxmemory_rejects_nonsense() {
+        assert!(parse("maxmemory abc\n").is_err());
+        assert!(parse("maxmemory 10tb\n").is_err());
+    }
+
+    #[test]
+    fn maxmemory_policy_is_parsed_and_validated() {
+        assert_eq!(
+            parse("maxmemory-policy allkeys-lru\n")
+                .unwrap()
+                .max_memory_policy,
+            Some(EvictionPolicy::AllKeysLru),
+        );
+        assert!(parse("maxmemory-policy bogus\n").is_err());
+    }
+
+    #[test]
+    fn maxmemory_samples_is_parsed() {
+        assert_eq!(
+            parse("maxmemory-samples 12\n").unwrap().max_memory_samples,
+            Some(12),
+        );
     }
 }
