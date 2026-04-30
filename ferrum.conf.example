@@ -32,3 +32,24 @@ loglevel info
 
 # fsync policy: always | everysec | no
 # appendfsync everysec
+
+# ---- Memory management --------------------------------------------
+# Soft memory ceiling for the live dataset. Accepts plain bytes or
+# SI-like suffixes: 512b, 64kb, 256mb, 1gb. 0 disables the cap.
+# maxmemory 0
+
+# Eviction policy applied when `maxmemory` is exceeded. One of:
+#   noeviction       — refuse writes (default)
+#   allkeys-lru      — approximate LRU over every key
+#   volatile-lru     — approximate LRU, keys with TTL only
+#   allkeys-lfu      — approximate LFU (Morris counter) over every key
+#   volatile-lfu     — approximate LFU, keys with TTL only
+#   allkeys-random   — random key
+#   volatile-random  — random key with TTL
+#   volatile-ttl     — key with the shortest remaining TTL
+#   allkeys-ahe      — Adaptive Hybrid Eviction (recency + frequency + TTL)
+#   volatile-ahe     — AHE restricted to keys with TTL
+# maxmemory-policy noeviction
+
+# How many random candidates to inspect per eviction round (Redis default: 5).
+# maxmemory-samples 5
