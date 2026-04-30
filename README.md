@@ -17,7 +17,7 @@ flowchart TB
     %% 2. External Clients
     subgraph ClientLayer ["🌐 External Input"]
         direction LR
-        Client[/"TCP Client (telnet/netcat)"/]
+        Client[/"redis-cli / any RESP2 client"/]
     end
 
     %% 3. Network & Concurrency
@@ -25,87 +25,132 @@ flowchart TB
         direction LR
         Listener(("TcpListener (Port 6380)"))
         WorkerThread[["Worker Thread (thread::spawn)"]]
-        
+
         Listener -->|"accept connection"| WorkerThread
     end
 
     %% 4. Command Processing Pipeline
     subgraph ProcessLayer ["⚙️ Processing Pipeline"]
         direction LR
-        Parser["Protocol Parser (Text)"]
-        Exec("Command Executor (SET/GET/DEL/PING/DBSIZE/FLUSHDB)")
-        Fmt["Response Formatter"]
-        
+        Parser["RESP2 Parser (Array of Bulk Strings)"]
+        Exec("Command Executor (SET/GET/DEL/EXISTS/PING/DBSIZE/FLUSHDB)")
+        Encoder["RESP2 Encoder (+OK / $n / :n / -ERR)"]
+
         Parser -->|"yield command"| Exec
-        Exec -->|"return result"| Fmt
+        Exec -->|"return result"| Encoder
     end
 
     %% 5. Storage Engine
     subgraph StoreLayer ["💾 Storage Layer"]
         direction LR
         Engine[("KvEngine")]
-        State{{"Shared State (Arc<RwLock<HashMap>>)"}}
-        
+        State{{"Shared State (Arc<RwLock<HashMap<Vec<u8>, Vec<u8>>>>)"}}
+
         Engine -->|"manages"| State
     end
 
-    %% 6. Cross-System Data Flow
+    %% 6. Persistence Layer
+    subgraph PersistLayer ["🗄️ Persistence (AOF)"]
+        direction LR
+        AofWriter["AofWriter (Mutex<File>)"]
+        AofFile[/"ferrum.aof (RESP2 on disk)"/]
+        Replay["Startup Replay"]
+
+        AofWriter -->|"append + fsync"| AofFile
+        AofFile -->|"restore on boot"| Replay
+    end
+
+    %% 7. Cross-System Data Flow
     ClientLayer == "TCP Stream" === NetLayer
     WorkerThread -.->|"delegates stream"| ProcessLayer
     ProcessLayer == "read & write data" === StoreLayer
-    Fmt -.->|"flush to socket"| Client
+    StoreLayer -.->|"log write ops"| PersistLayer
+    Replay -.->|"apply commands"| Engine
+    Encoder -.->|"flush to socket"| Client
 
-    %% 7. Apply Styles
-    class ClientLayer,NetLayer,ProcessLayer,StoreLayer runtime
+    %% 8. Apply Styles
+    class ClientLayer,NetLayer,ProcessLayer,StoreLayer,PersistLayer runtime
     class Client ext
     class Listener,WorkerThread engine
-    class Parser,Exec,Fmt entity
-    class Engine resource
-    class State config
+    class Parser,Exec,Encoder entity
+    class Engine,AofWriter,Replay resource
+    class State,AofFile config
 ```
 
 ## Quick Start
 
 ```bash
 # Build
-cargo build
+cargo build --release
 
-# Run server (listens on 127.0.0.1:6380)
-cargo run
+# Run without persistence (in-memory only)
+cargo run --release
 
-# Connect with telnet or netcat
-telnet 127.0.0.1 6380
+# Run with AOF persistence (survives restarts)
+cargo run --release -- --aof-path /tmp/ferrum.aof
+
+# Run with explicit fsync policy: always | everysec (default) | no
+cargo run --release -- --aof-path /tmp/ferrum.aof --appendfsync always
+
+# Connect with the official Redis CLI
+redis-cli -p 6380
 ```
+
+### CLI Flags
+
+| Flag | Default | Description |
+|---|---|---|
+| `--addr HOST:PORT` | `127.0.0.1:6380` | Listening address |
+| `--aof-path PATH` | *(disabled)* | Enables AOF persistence at the given path |
+| `--appendfsync POLICY` | `everysec` | Fsync policy when AOF is enabled (`always` / `everysec` / `no`) |
 
 ## Supported Commands
 
-| Command           | Description                  | Response          |
-|--------------------|------------------------------|-------------------|
-| `SET key value`   | Store a key-value pair       | `OK`              |
-| `GET key`         | Retrieve value by key        | value or `NULL`   |
-| `DEL key`         | Delete a key                 | `OK` or `NULL`    |
-| `PING`            | Health check                 | `PONG`            |
-| `DBSIZE`          | Return number of keys        | count             |
-| `FLUSHDB`         | Remove all keys              | `OK`              |
+All commands are spoken over **RESP2** (the same wire protocol as Redis), so any Redis client works out of the box.
 
-Commands are **case-insensitive**. Values can contain spaces (e.g. `SET msg hello world`).
+| Command              | Description                              | RESP2 Response                        |
+|----------------------|------------------------------------------|----------------------------------------|
+| `SET key value`      | Store a key-value pair                   | `+OK`                                  |
+| `GET key`            | Retrieve value by key                    | Bulk string, or nil (`$-1`)            |
+| `DEL key [key ...]`  | Delete one or more keys                  | `:N` — number of keys actually deleted |
+| `EXISTS key [key ...]` | Count how many of the given keys exist  | `:N`                                   |
+| `PING [message]`     | Health check (echoes `message` if given) | `+PONG` or bulk string                 |
+| `DBSIZE`             | Return number of keys                    | `:N`                                   |
+| `FLUSHDB`            | Remove all keys                          | `+OK`                                  |
+
+Command names are **case-insensitive**.
+
+### Binary Safety
+
+Keys and values are stored as raw `Vec<u8>`, so arbitrary bytes — including `NUL`, `\r\n`, and non‑UTF‑8 sequences — round-trip unchanged through both the network layer and the AOF file.
 
 ## Error Handling
 
-All operations return structured error responses instead of panicking:
+All operations return structured RESP2 errors (`-ERR ...`) instead of panicking:
 
-- Parse errors: `ERR wrong number of arguments for 'SET' command`
-- Unknown commands: `ERR unknown command: FOOBAR`
-- Internal errors: `ERR internal error: lock poisoned`
+- Parse errors: `-ERR wrong number of arguments for 'SET' command`
+- Unknown commands: `-ERR unknown command 'FOOBAR'`
+- Internal errors: `-ERR internal error: lock poisoned`
+
+## Persistence (AOF)
+
+When `--aof-path` is set, every write command (`SET` / `DEL` / `FLUSHDB`) is appended to the AOF file **in RESP2 format** — the exact same bytes a client would send over the wire. On startup, FerrumKV replays the file to rebuild state; a half-written tail record is safely truncated.
+
+Fsync policies follow Redis semantics:
+
+- `always` — fsync after every write (safest, slowest)
+- `everysec` — fsync once per second on a background tick (default)
+- `no` — let the OS decide (fastest, least durable)
 
 ## Roadmap
 
-- [x] Core KV engine (SET/GET/DEL/PING/DBSIZE/FLUSHDB)
-- [x] Unified error handling with Result propagation
-- [ ] AOF persistence
-- [ ] TTL (key expiration)
-- [ ] RESP protocol support
-- [ ] Async I/O (tokio)
+- [x] Core KV engine (`SET` / `GET` / `DEL` / `EXISTS` / `PING` / `DBSIZE` / `FLUSHDB`)
+- [x] Unified error handling with `Result` propagation
+- [x] RESP2 protocol (binary-safe, compatible with `redis-cli`)
+- [x] AOF persistence with configurable fsync + replay on startup
+- [ ] Graceful shutdown (SIGINT / SIGTERM) + structured logging
+- [ ] TTL (key expiration) & memory eviction (LRU / LFU / AHE)
+- [ ] Async I/O (Tokio)
 
 ## License
 
