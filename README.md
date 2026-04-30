@@ -173,7 +173,9 @@ The GitHub Actions pipeline runs `cargo fmt --check`, `cargo clippy -- -D warnin
 - [x] Graceful shutdown (SIGINT / SIGTERM), connection timeouts, max-connections cap
 - [x] Structured logging (`log` + `env_logger`) & Redis-style config file
 - [x] Unit / integration / concurrency tests + Criterion benchmarks + CI
-- [ ] TTL (key expiration) & memory eviction (LRU / LFU / AHE)
+- [x] Key expiration: `EXPIRE` / `PEXPIRE` / `PEXPIREAT` / `PERSIST` / `TTL` / `PTTL` with lazy + active scanning
+- [x] Memory cap + sampled eviction: `noeviction` / `allkeys_lru` / `allkeys_random` / `volatile_lru` / `volatile_random` / `volatile_ttl` (+ `MEMORY USAGE`, `INFO memory`)
+- [ ] LFU & adaptive hybrid eviction (AHE) — *Week 7, in progress*
 - [ ] Async I/O (Tokio)
 
 ## License
