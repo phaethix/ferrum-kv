@@ -3,6 +3,7 @@ use std::net::{TcpListener, TcpStream};
 use std::thread;
 
 use crate::error::FerrumError;
+use crate::network::shutdown::Shutdown;
 use crate::protocol::encoder;
 use crate::protocol::parser::{self, Command, FrameParse};
 use crate::storage::engine::KvEngine;
@@ -29,7 +30,11 @@ const READ_CHUNK: usize = 8 * 1024;
 /// its reply is written back using the RESP2 encoders. Partial frames remain
 /// in the buffer until the next `read` fills them in, so requests that span
 /// multiple packets are handled transparently.
-fn handle_client(mut stream: TcpStream, engine: KvEngine) -> Result<(), FerrumError> {
+fn handle_client(
+    mut stream: TcpStream,
+    engine: KvEngine,
+    shutdown: Shutdown,
+) -> Result<(), FerrumError> {
     let peer = stream.peer_addr()?;
     eprintln!("[INFO] Client connected: {peer}");
 
@@ -38,6 +43,9 @@ fn handle_client(mut stream: TcpStream, engine: KvEngine) -> Result<(), FerrumEr
     let mut outbuf: Vec<u8> = Vec::with_capacity(256);
 
     loop {
+        if shutdown.is_triggered() {
+            break;
+        }
         let n = match stream.read(&mut chunk) {
             Ok(0) => break, // Orderly EOF: client closed the connection.
             Ok(n) => n,
@@ -205,10 +213,11 @@ fn write_ferrum_error(out: &mut Vec<u8>, err: &FerrumError) {
 ///
 /// Each accepted connection is handled on a separate thread that shares the
 /// same [`KvEngine`] instance.
-pub fn start(addr: &str, engine: KvEngine) -> Result<(), FerrumError> {
+pub fn start(addr: &str, engine: KvEngine, shutdown: Shutdown) -> Result<(), FerrumError> {
     let listener = TcpListener::bind(addr)?;
-    eprintln!("[INFO] FerrumKV listening on {addr}");
-    run_listener(listener, engine)
+    let local = listener.local_addr()?;
+    eprintln!("[INFO] FerrumKV listening on {local}");
+    run_listener(listener, engine, shutdown)
 }
 
 /// Runs the accept loop on an already-bound [`TcpListener`].
@@ -216,13 +225,24 @@ pub fn start(addr: &str, engine: KvEngine) -> Result<(), FerrumError> {
 /// Split out from [`start`] so that tests (and future embeddings) can bind
 /// their own listener — for example to port `0` to obtain an OS-assigned
 /// ephemeral port — and drive the server from there.
-pub fn run_listener(listener: TcpListener, engine: KvEngine) -> Result<(), FerrumError> {
+pub fn run_listener(
+    listener: TcpListener,
+    engine: KvEngine,
+    shutdown: Shutdown,
+) -> Result<(), FerrumError> {
     for stream in listener.incoming() {
+        if shutdown.is_triggered() {
+            break;
+        }
         match stream {
             Ok(stream) => {
+                if shutdown.is_triggered() {
+                    break;
+                }
                 let engine = engine.clone();
+                let shutdown = shutdown.clone();
                 thread::spawn(move || {
-                    if let Err(e) = handle_client(stream, engine) {
+                    if let Err(e) = handle_client(stream, engine, shutdown) {
                         eprintln!("[ERROR] client handler error: {e}");
                     }
                 });
@@ -233,5 +253,6 @@ pub fn run_listener(listener: TcpListener, engine: KvEngine) -> Result<(), Ferru
         }
     }
 
+    eprintln!("[INFO] accept loop exiting");
     Ok(())
 }

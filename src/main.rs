@@ -1,7 +1,10 @@
 use std::env;
+use std::net::{SocketAddr, TcpListener};
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::thread;
 
+use ferrum_kv::network::shutdown::Shutdown;
 use ferrum_kv::persistence::AofWriter;
 use ferrum_kv::storage::engine::KvEngine;
 
@@ -28,11 +31,36 @@ fn main() -> ExitCode {
         Err(code) => return code,
     };
 
-    if let Err(e) = ferrum_kv::network::server::start(&args.addr, engine) {
+    // Bind the listener up front so that `--addr :0` is resolved before we
+    // install the signal handler that needs the concrete address.
+    let listener = match TcpListener::bind(&args.addr) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("[FATAL] failed to bind {}: {}", args.addr, e);
+            return ExitCode::FAILURE;
+        }
+    };
+    let local = match listener.local_addr() {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("[FATAL] local_addr failed: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    eprintln!("[INFO] FerrumKV listening on {local}");
+
+    let shutdown = Shutdown::new();
+    if let Err(e) = install_signal_handlers(shutdown.clone(), local) {
+        eprintln!("[FATAL] failed to install signal handlers: {e}");
+        return ExitCode::FAILURE;
+    }
+
+    if let Err(e) = ferrum_kv::network::server::run_listener(listener, engine, shutdown) {
         eprintln!("[FATAL] server error: {e}");
         return ExitCode::FAILURE;
     }
 
+    eprintln!("[INFO] shutdown complete");
     ExitCode::SUCCESS
 }
 
@@ -75,4 +103,31 @@ fn build_engine(args: &CliArgs) -> Result<KvEngine, ExitCode> {
             Err(ExitCode::FAILURE)
         }
     }
+}
+
+/// Installs SIGINT/SIGTERM handlers that flip the shared shutdown flag and
+/// self-connect to the listener so the blocked `accept` returns immediately.
+fn install_signal_handlers(shutdown: Shutdown, wake_addr: SocketAddr) -> std::io::Result<()> {
+    use signal_hook::consts::{SIGINT, SIGTERM};
+    use signal_hook::iterator::Signals;
+
+    let mut signals = Signals::new([SIGINT, SIGTERM])?;
+    thread::Builder::new()
+        .name("ferrum-signal".into())
+        .spawn(move || {
+            // Block until either SIGINT or SIGTERM arrives; once we have
+            // observed a signal we stop polling — one is enough to start the
+            // shutdown sequence.
+            if let Some(sig) = signals.forever().next() {
+                let name = match sig {
+                    SIGINT => "SIGINT",
+                    SIGTERM => "SIGTERM",
+                    _ => "signal",
+                };
+                eprintln!("[INFO] received {name}, initiating graceful shutdown");
+                shutdown.trigger();
+                Shutdown::wake_listener(wake_addr);
+            }
+        })?;
+    Ok(())
 }
