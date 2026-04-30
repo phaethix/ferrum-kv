@@ -16,7 +16,6 @@
 /// let bytes = encode_command(&["SET", "name", "ferrum"]);
 /// assert_eq!(bytes, b"*3\r\n$3\r\nSET\r\n$4\r\nname\r\n$6\r\nferrum\r\n");
 /// ```
-#[allow(dead_code)] // Consumed by AofWriter in the next commit.
 pub(crate) fn encode_command(parts: &[&str]) -> Vec<u8> {
     // Estimate capacity to avoid repeated reallocations for typical payloads.
     let payload_len: usize = parts.iter().map(|p| p.len()).sum();

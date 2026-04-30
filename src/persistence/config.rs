@@ -5,20 +5,15 @@ use std::path::{Path, PathBuf};
 /// Policy that controls how often AOF writes are flushed to disk.
 ///
 /// The variants mirror Redis' `appendfsync` configuration.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum FsyncPolicy {
     /// Call `fsync` after every write. Highest durability, lowest throughput.
     Always,
     /// Flush once per second from a background thread. This is the default.
+    #[default]
     EverySec,
     /// Never call `fsync` explicitly; rely on the operating system.
     No,
-}
-
-impl Default for FsyncPolicy {
-    fn default() -> Self {
-        Self::EverySec
-    }
 }
 
 impl FsyncPolicy {

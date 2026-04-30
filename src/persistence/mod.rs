@@ -6,5 +6,7 @@
 //! (in later commits) the writer and replay loader that drive the log.
 
 pub mod config;
-
 mod resp;
+mod writer;
+
+pub use writer::AofWriter;
