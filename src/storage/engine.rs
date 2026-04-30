@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use crate::error::FerrumError;
+use crate::persistence::AofWriter;
 
 /// Maximum allowed key size in bytes (64 KiB).
 pub const KEY_MAX_BYTES: usize = 64 * 1024;
@@ -15,11 +16,18 @@ pub const VALUE_MAX_BYTES: usize = 16 * 1024 * 1024;
 /// Multiple readers may access the map at the same time, while writers acquire
 /// exclusive access.
 ///
+/// Mutating commands (`SET`, `DEL`, `FLUSHDB`) are optionally forwarded to an
+/// [`AofWriter`] so changes survive a restart. The log is appended while the
+/// write lock is still held, which preserves the ordering invariant described
+/// in the whitepaper (§8.7): the in-memory state and the on-disk log always
+/// agree on the relative order of successful writes.
+///
 /// Public methods return [`Result`] so lock poisoning can be reported instead
 /// of causing a panic.
 #[derive(Clone)]
 pub struct KvEngine {
     store: Arc<RwLock<HashMap<String, String>>>,
+    aof: Option<Arc<AofWriter>>,
 }
 
 impl Default for KvEngine {
@@ -29,11 +37,21 @@ impl Default for KvEngine {
 }
 
 impl KvEngine {
-    /// Creates a new empty key-value engine.
+    /// Creates a new empty key-value engine without persistence.
     pub fn new() -> Self {
         Self {
             store: Arc::default(),
+            aof: None,
         }
+    }
+
+    /// Attaches an AOF writer so subsequent mutating commands are persisted.
+    ///
+    /// The writer is shared via [`Arc`], allowing the same instance to be used
+    /// across cloned engine handles.
+    pub fn with_aof(mut self, writer: Arc<AofWriter>) -> Self {
+        self.aof = Some(writer);
+        self
     }
 
     /// Sets a key-value pair and returns the previous value, if any.
@@ -43,8 +61,13 @@ impl KvEngine {
     pub fn set(&self, key: String, value: String) -> Result<Option<String>, FerrumError> {
         validate_key(&key)?;
         validate_value(&value)?;
+
         let mut store = self.store.write()?;
-        Ok(store.insert(key, value))
+        let previous = store.insert(key.clone(), value.clone());
+        if let Some(aof) = &self.aof {
+            log_aof_result("SET", aof.append_set(&key, &value));
+        }
+        Ok(previous)
     }
 
     /// Returns the value for `key`, or `None` if the key does not exist.
@@ -56,7 +79,11 @@ impl KvEngine {
     /// Deletes `key` and returns `true` if it existed.
     pub fn del(&self, key: &str) -> Result<bool, FerrumError> {
         let mut store = self.store.write()?;
-        Ok(store.remove(key).is_some())
+        let existed = store.remove(key).is_some();
+        if existed && let Some(aof) = &self.aof {
+            log_aof_result("DEL", aof.append_del(key));
+        }
+        Ok(existed)
     }
 
     /// Returns `true` if `key` exists.
@@ -75,6 +102,9 @@ impl KvEngine {
     pub fn flushdb(&self) -> Result<(), FerrumError> {
         let mut store = self.store.write()?;
         store.clear();
+        if let Some(aof) = &self.aof {
+            log_aof_result("FLUSHDB", aof.append_flushdb());
+        }
         Ok(())
     }
 }
@@ -106,9 +136,44 @@ fn validate_value(value: &str) -> Result<(), FerrumError> {
     Ok(())
 }
 
+/// Logs AOF append failures without failing the originating command.
+///
+/// The whitepaper (§7.2) specifies that persistence errors are best-effort:
+/// in-memory state is authoritative during runtime and a failed AOF append is
+/// reported but does not propagate to the client.
+fn log_aof_result(cmd: &str, result: Result<(), FerrumError>) {
+    if let Err(e) = result {
+        eprintln!("[WARN] aof append for {cmd} failed: {e}");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::persistence::AofWriter;
+    use crate::persistence::config::{AofConfig, FsyncPolicy};
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn tmp_aof_path(label: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        std::env::temp_dir().join(format!("ferrum-engine-{label}-{nanos}-{n}.aof"))
+    }
+
+    fn engine_with_aof(path: &PathBuf) -> (KvEngine, Arc<AofWriter>) {
+        let cfg = AofConfig::new(path, FsyncPolicy::Always);
+        let writer = Arc::new(AofWriter::open(&cfg).unwrap());
+        let engine = KvEngine::new().with_aof(Arc::clone(&writer));
+        (engine, writer)
+    }
 
     #[test]
     fn test_set_and_get() {
@@ -253,5 +318,56 @@ mod tests {
                 Some(format!("value{i}"))
             );
         }
+    }
+
+    #[test]
+    fn mutating_commands_are_appended_to_aof() {
+        let path = tmp_aof_path("mutating");
+        let (engine, writer) = engine_with_aof(&path);
+
+        engine.set("a".into(), "1".into()).unwrap();
+        engine.del("a").unwrap();
+        engine.flushdb().unwrap();
+        drop(engine);
+        drop(writer);
+
+        let bytes = fs::read(&path).unwrap();
+        let expected = concat!(
+            "*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\n1\r\n",
+            "*2\r\n$3\r\nDEL\r\n$1\r\na\r\n",
+            "*1\r\n$7\r\nFLUSHDB\r\n",
+        );
+        assert_eq!(bytes, expected.as_bytes());
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn read_only_commands_do_not_touch_aof() {
+        let path = tmp_aof_path("readonly");
+        let (engine, writer) = engine_with_aof(&path);
+
+        engine.get("missing").unwrap();
+        engine.exists("missing").unwrap();
+        engine.dbsize().unwrap();
+        drop(engine);
+        drop(writer);
+
+        let bytes = fs::read(&path).unwrap();
+        assert!(bytes.is_empty());
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn del_of_missing_key_is_not_logged() {
+        let path = tmp_aof_path("del-missing");
+        let (engine, writer) = engine_with_aof(&path);
+
+        assert!(!engine.del("missing").unwrap());
+        drop(engine);
+        drop(writer);
+
+        let bytes = fs::read(&path).unwrap();
+        assert!(bytes.is_empty());
+        let _ = fs::remove_file(&path);
     }
 }
