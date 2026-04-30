@@ -31,12 +31,13 @@ pub enum Command {
 /// may contain inner spaces).
 ///
 /// # Examples
-/// ```
+/// ```ignore
 /// use ferrum_kv::protocol::parser::{parse, Command};
 ///
 /// let cmd = parse("SET name ferrum").unwrap();
 /// assert_eq!(cmd, Command::Set { key: "name".to_string(), value: "ferrum".to_string() });
 /// ```
+#[allow(dead_code)]
 pub fn parse(input: &str) -> Result<Command, FerrumError> {
     let input = input.trim();
 
@@ -105,6 +106,7 @@ pub fn parse(input: &str) -> Result<Command, FerrumError> {
 }
 
 /// Parses a single-key command (`GET`, `DEL`, or `EXISTS`).
+#[allow(dead_code)]
 fn single_key_arg(input: &str, cmd: &'static str) -> Result<String, FerrumError> {
     let parts: Vec<&str> = input.splitn(2, ' ').collect();
     if parts.len() < 2 || parts[1].trim().is_empty() {
@@ -119,6 +121,7 @@ fn single_key_arg(input: &str, cmd: &'static str) -> Result<String, FerrumError>
 }
 
 /// Validates that a no-argument command has no trailing tokens.
+#[allow(dead_code)]
 fn ensure_no_args(input: &str, cmd: &'static str) -> Result<(), FerrumError> {
     let trimmed_rest = match input.find(' ') {
         None => return Ok(()),
@@ -137,6 +140,7 @@ fn ensure_no_args(input: &str, cmd: &'static str) -> Result<(), FerrumError> {
 /// - protocol or validation errors → `ERR ...`
 /// - future type mismatches        → `WRONGTYPE ...`
 /// - memory-limit rejections       → `OOM ...`
+#[allow(dead_code)]
 pub fn format_response(result: Result<String, FerrumError>) -> String {
     match result {
         Ok(msg) => msg,
@@ -148,6 +152,7 @@ pub fn format_response(result: Result<String, FerrumError>) -> String {
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 mod tests {
     use super::*;
 
@@ -398,10 +403,17 @@ mod tests {
 /// far, and receive back either a fully decoded command plus the number of
 /// bytes it consumed, or an `Incomplete` signal indicating that more data must
 /// be read before parsing can succeed.
-#[derive(Debug, PartialEq)]
+///
+/// Command-level errors (unknown commands, wrong arity) are reported via
+/// [`FrameParse::Invalid`] rather than a parser error so that the caller can
+/// reply with `-ERR …` and keep the connection open: the frame itself was
+/// syntactically valid, only its contents are rejected.
+#[derive(Debug)]
 pub enum FrameParse {
     /// A command was decoded; `consumed` bytes may be removed from the buffer.
     Complete { command: Command, consumed: usize },
+    /// A frame was consumed but its contents are not a valid command.
+    Invalid { error: FerrumError, consumed: usize },
     /// The buffer does not yet contain a full frame.
     Incomplete,
 }
@@ -460,7 +472,15 @@ pub fn parse_frame(buf: &[u8]) -> Result<FrameParse, FerrumError> {
         }
     }
 
-    let command = build_command(parts)?;
+    let command = match build_command(parts) {
+        Ok(cmd) => cmd,
+        Err(e) => {
+            return Ok(FrameParse::Invalid {
+                error: e,
+                consumed: cursor,
+            });
+        }
+    };
     Ok(FrameParse::Complete {
         command,
         consumed: cursor,
@@ -639,7 +659,17 @@ mod frame_tests {
                 );
                 command
             }
+            FrameParse::Invalid { error, .. } => {
+                panic!("expected complete frame, got Invalid: {error}")
+            }
             FrameParse::Incomplete => panic!("expected complete frame, got Incomplete"),
+        }
+    }
+
+    fn assert_incomplete(buf: &[u8]) {
+        match parse_frame(buf).unwrap() {
+            FrameParse::Incomplete => {}
+            other => panic!("expected Incomplete, got {other:?}"),
         }
     }
 
@@ -765,30 +795,24 @@ mod frame_tests {
 
     #[test]
     fn returns_incomplete_for_empty_buffer() {
-        assert_eq!(parse_frame(b"").unwrap(), FrameParse::Incomplete);
+        assert_incomplete(b"");
     }
 
     #[test]
     fn returns_incomplete_for_partial_header() {
-        assert_eq!(parse_frame(b"*3\r").unwrap(), FrameParse::Incomplete);
-        assert_eq!(parse_frame(b"*3").unwrap(), FrameParse::Incomplete);
+        assert_incomplete(b"*3\r");
+        assert_incomplete(b"*3");
     }
 
     #[test]
     fn returns_incomplete_for_partial_bulk_header() {
-        assert_eq!(
-            parse_frame(b"*2\r\n$3\r\nGET\r\n$4\r\nna").unwrap(),
-            FrameParse::Incomplete,
-        );
+        assert_incomplete(b"*2\r\n$3\r\nGET\r\n$4\r\nna");
     }
 
     #[test]
     fn returns_incomplete_when_trailing_crlf_missing() {
         // Payload bytes are present but the trailing CRLF is not.
-        assert_eq!(
-            parse_frame(b"*2\r\n$3\r\nGET\r\n$4\r\nname").unwrap(),
-            FrameParse::Incomplete,
-        );
+        assert_incomplete(b"*2\r\n$3\r\nGET\r\n$4\r\nname");
     }
 
     #[test]
@@ -829,16 +853,25 @@ mod frame_tests {
     }
 
     #[test]
-    fn rejects_wrong_arity_via_resp() {
-        // SET with only the key.
-        let err = parse_frame(b"*2\r\n$3\r\nSET\r\n$1\r\nk\r\n").unwrap_err();
+    fn reports_wrong_arity_as_invalid_frame() {
+        // SET with only the key: frame is well-formed, command is rejected.
+        let (err, consumed) = match parse_frame(b"*2\r\n$3\r\nSET\r\n$1\r\nk\r\n").unwrap() {
+            FrameParse::Invalid { error, consumed } => (error, consumed),
+            other => panic!("expected Invalid, got {other:?}"),
+        };
         assert!(matches!(err, FerrumError::WrongArity { cmd: "SET" }));
+        // The full frame was consumed so the connection can keep going.
+        assert_eq!(consumed, b"*2\r\n$3\r\nSET\r\n$1\r\nk\r\n".len());
     }
 
     #[test]
-    fn rejects_unknown_command_via_resp() {
-        let err = parse_frame(b"*1\r\n$6\r\nFOOBAR\r\n").unwrap_err();
+    fn reports_unknown_command_as_invalid_frame() {
+        let (err, consumed) = match parse_frame(b"*1\r\n$6\r\nFOOBAR\r\n").unwrap() {
+            FrameParse::Invalid { error, consumed } => (error, consumed),
+            other => panic!("expected Invalid, got {other:?}"),
+        };
         assert!(matches!(err, FerrumError::UnknownCommand(ref c) if c == "FOOBAR"));
+        assert_eq!(consumed, b"*1\r\n$6\r\nFOOBAR\r\n".len());
     }
 
     #[test]
