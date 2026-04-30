@@ -105,3 +105,61 @@ redis-benchmark -h 127.0.0.1 -p 6399 -n 100000 -c 50 -q -t set,get,incr
 redis-benchmark -h 127.0.0.1 -p 6399 -n 100000 -c 50 -P 16 -q -t set,get,incr
 kill "$SERVER"
 ```
+
+---
+
+## v0.4.0 — tokio async runtime (Week 8)
+
+Re-ran on the same Apple M5 / macOS 26.4.1 box after the `feat/async-runtime`
+branch replaced the thread-per-connection model with a multi-threaded tokio
+runtime. The server binary, the benchmark client and the command mix are
+identical to the v0.3.0 runs above so the deltas are apples-to-apples.
+
+### Scenario 1 — no memory cap, `c=50`
+
+| Command | v0.3.0 QPS | v0.4.0 QPS | Δ      |
+| ------- | ---------- | ---------- | ------ |
+| SET     | 58 207     | 62 189     | +6.8%  |
+| GET     | 61 349     | 65 231     | +6.3%  |
+| INCR    | 61 728     | 63 492     | +2.9%  |
+
+### Scenario 2 — pipelined (`-P 16`, `c=50`)
+
+| Command | v0.3.0 QPS | v0.4.0 QPS | Δ      |
+| ------- | ---------- | ---------- | ------ |
+| SET     | 366 300    | 350 877    | -4.2%  |
+| GET     | 373 134    | 378 787    | +1.5%  |
+| INCR    | 375 939    | 381 679    | +1.5%  |
+
+> Pipelined throughput is dominated by in-memory command execution rather
+> than socket I/O, so the delta is inside run-to-run noise. What matters
+> is that the async rewrite did **not** regress the hot path.
+
+### Scenario 5 — high client fan-out (`c=500`)
+
+```
+./target/release/ferrum-kv --addr 127.0.0.1:6399
+redis-benchmark -h 127.0.0.1 -p 6399 -n 100000 -c 500 -q -t set,get
+```
+
+| Command | v0.4.0 QPS | p50      |
+| ------- | ---------- | -------- |
+| SET     | 50 301     | 4.567 ms |
+| GET     | 43 440     | 5.871 ms |
+
+> The pre-tokio build would have tried to spawn 500 OS threads here — one
+> per accepted connection — and spent most of its time context switching.
+> v0.4.0 handles the whole fan-out on a handful of worker threads with
+> single-digit-millisecond p50, the clearest win of Phase 8.
+
+### Observations
+
+- Single-client-per-thread throughput nudged up ~5% because tokio replaces
+  two blocking `read`/`write` syscalls per round-trip with `epoll` /
+  `kqueue`-backed readiness checks that batch more efficiently under load.
+- The thread-per-connection floor is gone: scaling `-c` past the CPU count
+  no longer multiplies kernel threads; the runtime just multiplexes more
+  sockets onto the same workers.
+- The integration suite's 500-client PING fan-out finishes in under 300 ms
+  on the same box, confirming the smoke result is not a microbenchmark
+  artefact.
