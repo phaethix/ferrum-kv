@@ -377,6 +377,19 @@ fn render_info(engine: &KvEngine, section: Option<&[u8]>) -> String {
         out.push_str(&format!("maxmemory:{}\r\n", cfg.max_memory));
         out.push_str(&format!("maxmemory_policy:{}\r\n", cfg.policy.name()));
         out.push_str(&format!("maxmemory_samples:{}\r\n", cfg.samples));
+        // Surface the AHE controller state so operators can see the
+        // self-tuning converge. Redis has no exact analogue; we keep the
+        // `ahe_` prefix so tooling can filter it out easily.
+        let ahe = engine.ahe_snapshot();
+        out.push_str(&format!("ahe_alpha:{:.3}\r\n", ahe.alpha));
+        out.push_str(&format!("ahe_last_hit_ratio:{:.3}\r\n", ahe.last_hit_ratio));
+        out.push_str("\r\n");
+    }
+    if wants("stats") {
+        let (hits, misses) = engine.keyspace_stats();
+        out.push_str("# Stats\r\n");
+        out.push_str(&format!("keyspace_hits:{hits}\r\n"));
+        out.push_str(&format!("keyspace_misses:{misses}\r\n"));
         out.push_str("\r\n");
     }
     if wants("keyspace") {

@@ -204,3 +204,85 @@ fn allkeys_lru_evicts_over_the_wire() {
     let reply_c = send(&mut stream, &build_request(&[b"EXISTS", b"c"]));
     assert_eq!(reply_c, b":1\r\n");
 }
+
+#[test]
+fn allkeys_lfu_evicts_cold_key_over_the_wire() {
+    let engine = KvEngine::new();
+    // Room for two small entries.
+    engine
+        .set_eviction_config(EvictionConfig {
+            max_memory: 2 * (1 + 1 + 48),
+            policy: EvictionPolicy::AllKeysLfu,
+            samples: 10,
+        })
+        .unwrap();
+    let guard = spawn_server_with_engine(engine);
+    let mut stream = connect(&guard.addr);
+
+    send(&mut stream, &build_request(&[b"SET", b"a", b"1"]));
+    send(&mut stream, &build_request(&[b"SET", b"b", b"2"]));
+    // Warm `a` with many reads so its LFU counter dwarfs `b`'s.
+    for _ in 0..64 {
+        send(&mut stream, &build_request(&[b"GET", b"a"]));
+    }
+    // Insert a third key so eviction has to pick between `a` and `b`.
+    send(&mut stream, &build_request(&[b"SET", b"c", b"3"]));
+
+    let reply_b = send(&mut stream, &build_request(&[b"EXISTS", b"b"]));
+    assert_eq!(reply_b, b":0\r\n", "cold key `b` should be evicted");
+    let reply_a = send(&mut stream, &build_request(&[b"EXISTS", b"a"]));
+    assert_eq!(reply_a, b":1\r\n", "hot key `a` must survive");
+    let reply_c = send(&mut stream, &build_request(&[b"EXISTS", b"c"]));
+    assert_eq!(reply_c, b":1\r\n");
+}
+
+#[test]
+fn allkeys_ahe_evicts_and_publishes_alpha_in_info() {
+    let engine = KvEngine::new();
+    engine
+        .set_eviction_config(EvictionConfig {
+            max_memory: 2 * (1 + 1 + 48),
+            policy: EvictionPolicy::AllKeysAhe,
+            samples: 10,
+        })
+        .unwrap();
+    let guard = spawn_server_with_engine(engine);
+    let mut stream = connect(&guard.addr);
+
+    // Fill + warm so AHE has both recency and frequency signal.
+    send(&mut stream, &build_request(&[b"SET", b"a", b"1"]));
+    send(&mut stream, &build_request(&[b"SET", b"b", b"2"]));
+    for _ in 0..32 {
+        send(&mut stream, &build_request(&[b"GET", b"a"]));
+    }
+    // Force at least one eviction pass.
+    send(&mut stream, &build_request(&[b"SET", b"c", b"3"]));
+
+    // Cold key must be gone; hot key must live.
+    let reply_b = send(&mut stream, &build_request(&[b"EXISTS", b"b"]));
+    assert_eq!(reply_b, b":0\r\n");
+    let reply_a = send(&mut stream, &build_request(&[b"EXISTS", b"a"]));
+    assert_eq!(reply_a, b":1\r\n");
+
+    let reply = send(&mut stream, &build_request(&[b"INFO", b"memory"]));
+    let text = String::from_utf8_lossy(&reply);
+    assert!(text.contains("maxmemory_policy:allkeys-ahe"));
+    assert!(text.contains("ahe_alpha:"));
+}
+
+#[test]
+fn info_stats_reports_keyspace_hits_and_misses() {
+    let engine = KvEngine::new();
+    let guard = spawn_server_with_engine(engine);
+    let mut stream = connect(&guard.addr);
+
+    send(&mut stream, &build_request(&[b"SET", b"k", b"v"]));
+    // One hit, one miss.
+    send(&mut stream, &build_request(&[b"GET", b"k"]));
+    send(&mut stream, &build_request(&[b"GET", b"absent"]));
+
+    let reply = send(&mut stream, &build_request(&[b"INFO", b"stats"]));
+    let text = String::from_utf8_lossy(&reply);
+    assert!(text.contains("keyspace_hits:1"), "reply: {text}");
+    assert!(text.contains("keyspace_misses:1"), "reply: {text}");
+}

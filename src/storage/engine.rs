@@ -1,13 +1,16 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use log::warn;
 
 use crate::error::FerrumError;
 use crate::persistence::AofWriter;
-use crate::storage::eviction::{self, Candidate, EvictionConfig, EvictionPolicy, EvictionScope};
+use crate::storage::eviction::{
+    self, AdaptiveHybridState, Candidate, EvictionConfig, EvictionPolicy, EvictionScope,
+    LFU_INIT_VAL,
+};
 
 /// Maximum allowed key size in bytes (64 KiB).
 pub const KEY_MAX_BYTES: usize = 64 * 1024;
@@ -32,19 +35,39 @@ pub const PER_ENTRY_OVERHEAD: u64 = 48;
 /// `last_access` tracks the most recent successful read or write and is
 /// maintained inside the store's write lock. Only the approximate LRU
 /// policies consult it, so keeping it current is best-effort.
+///
+/// `lfu_counter` is a Morris probabilistic counter (0..=255) read by the
+/// LFU / AHE policies. It is decayed lazily on access using
+/// `lfu_decay_minute`, so idle keys lose heat over time without the engine
+/// having to sweep every key periodically.
 #[derive(Clone)]
 struct ValueEntry {
     data: Vec<u8>,
     expire_at: Option<Instant>,
     last_access: Instant,
+    lfu_counter: u8,
+    lfu_decay_minute: u16,
 }
 
 impl ValueEntry {
+    /// Creates a fresh entry with default LFU metadata.
+    ///
+    /// The counter starts at [`LFU_INIT_VAL`] (mirroring Redis) so brand
+    /// new keys are not evicted before they have had a chance to be
+    /// re-accessed.
     fn new(data: Vec<u8>) -> Self {
+        Self::new_with(data, None)
+    }
+
+    /// Like [`Self::new`] but preserves an existing TTL, used by write
+    /// paths that overwrite a key while honouring `KEEPTTL` semantics.
+    fn new_with(data: Vec<u8>, expire_at: Option<Instant>) -> Self {
         Self {
             data,
-            expire_at: None,
+            expire_at,
             last_access: Instant::now(),
+            lfu_counter: LFU_INIT_VAL,
+            lfu_decay_minute: eviction::current_minute_stamp(),
         }
     }
 
@@ -52,10 +75,28 @@ impl ValueEntry {
         matches!(self.expire_at, Some(deadline) if deadline <= now)
     }
 
-    fn touch(&mut self) {
+    /// Marks the entry as freshly accessed.
+    ///
+    /// Updates both the LRU timestamp and the LFU counter. `rand01` must
+    /// be drawn from `[0.0, 1.0)` and is used to decide whether the Morris
+    /// counter actually advances this call.
+    fn touch(&mut self, rand01: f32) {
         self.last_access = Instant::now();
+        let now_minute = eviction::current_minute_stamp();
+        let decayed = eviction::decayed_counter(
+            self.lfu_counter,
+            self.lfu_decay_minute,
+            now_minute,
+            LFU_DECAY_MINUTES,
+        );
+        self.lfu_counter = eviction::probabilistic_increment(decayed, rand01);
+        self.lfu_decay_minute = now_minute;
     }
 }
+
+/// Minutes required for the Morris counter to lose one unit while the key
+/// sits idle. Matches Redis' default `lfu-decay-time` of 1 minute.
+const LFU_DECAY_MINUTES: u16 = 1;
 
 /// A thread-safe key-value storage engine backed by a [`HashMap`].
 ///
@@ -92,6 +133,21 @@ pub struct KvEngine {
     /// Wrapped in a lock so the server can mutate it at runtime (e.g. via
     /// a future `CONFIG SET` command) without cloning the whole engine.
     eviction: Arc<RwLock<EvictionConfig>>,
+    /// Cumulative number of keyspace hits (read commands that found a
+    /// live key). Exposed via `INFO stats` and consumed by the AHE
+    /// feedback loop.
+    hits: Arc<AtomicU64>,
+    /// Cumulative number of keyspace misses (read commands that found
+    /// nothing or an expired key).
+    misses: Arc<AtomicU64>,
+    /// Adaptive Hybrid Eviction controller. Shared state so every caller
+    /// sees the same `alpha`, regardless of which engine clone they hold.
+    ahe: Arc<Mutex<AdaptiveHybridState>>,
+    /// Seed for the per-call PRNG used to drive probabilistic LFU
+    /// increments and random-policy tie breaks. Xorshift32 is plenty for
+    /// sampling purposes and keeps the engine free of `rand` as a
+    /// runtime dependency.
+    rng: Arc<AtomicU32>,
 }
 
 impl Default for KvEngine {
@@ -108,6 +164,13 @@ impl KvEngine {
             aof: None,
             used_memory: Arc::new(AtomicU64::new(0)),
             eviction: Arc::new(RwLock::new(EvictionConfig::default())),
+            hits: Arc::new(AtomicU64::new(0)),
+            misses: Arc::new(AtomicU64::new(0)),
+            ahe: Arc::new(Mutex::new(AdaptiveHybridState::default())),
+            // Seed the PRNG from the system clock so two engines started
+            // in the same second don't share a sequence. The seed is
+            // never exposed, so predictability is not a concern.
+            rng: Arc::new(AtomicU32::new(rng_seed())),
         }
     }
 
@@ -224,14 +287,19 @@ impl KvEngine {
                 Some(entry) if entry.is_expired(now) => {
                     self.track_remove(&mut store, key.as_slice());
                     self.log_expire_drop(key);
+                    self.record_miss();
                     out.push(None);
                 }
                 Some(entry) => {
                     let data = entry.data.clone();
                     self.touch_access(&mut store, key.as_slice());
+                    self.record_hit();
                     out.push(Some(data));
                 }
-                None => out.push(None),
+                None => {
+                    self.record_miss();
+                    out.push(None);
+                }
             }
         }
         Ok(out)
@@ -290,11 +358,7 @@ impl KvEngine {
         self.track_insert(
             &mut store,
             key,
-            ValueEntry {
-                data: serialised,
-                expire_at: existing_deadline,
-                last_access: Instant::now(),
-            },
+            ValueEntry::new_with(serialised, existing_deadline),
         );
         Ok(new_value)
     }
@@ -307,14 +371,19 @@ impl KvEngine {
             Some(entry) if entry.is_expired(now) => {
                 self.track_remove(&mut store, key);
                 self.log_expire_drop(key);
+                self.record_miss();
                 Ok(None)
             }
             Some(entry) => {
                 let data = entry.data.clone();
                 self.touch_access(&mut store, key);
+                self.record_hit();
                 Ok(Some(data))
             }
-            None => Ok(None),
+            None => {
+                self.record_miss();
+                Ok(None)
+            }
         }
     }
 
@@ -370,10 +439,17 @@ impl KvEngine {
             Some(entry) if entry.is_expired(now) => {
                 self.track_remove(&mut store, key);
                 self.log_expire_drop(key);
+                self.record_miss();
                 Ok(false)
             }
-            Some(_) => Ok(true),
-            None => Ok(false),
+            Some(_) => {
+                self.record_hit();
+                Ok(true)
+            }
+            None => {
+                self.record_miss();
+                Ok(false)
+            }
         }
     }
 
@@ -428,11 +504,7 @@ impl KvEngine {
         self.track_insert(
             &mut store,
             key,
-            ValueEntry {
-                data: new_value,
-                expire_at: existing_deadline,
-                last_access: Instant::now(),
-            },
+            ValueEntry::new_with(new_value, existing_deadline),
         );
         Ok(new_len)
     }
@@ -693,27 +765,49 @@ impl KvEngine {
             return Ok(());
         }
         let fits = |used: u64| used.saturating_add(incoming) <= cfg.max_memory;
+        let mut evicted = 0u64;
         // Bounded loop so a pathological policy cannot spin forever.
         for _ in 0..store.len().max(1) + 16 {
             if fits(self.used_memory.load(Ordering::Relaxed)) {
-                return Ok(());
+                break;
             }
             if cfg.policy == EvictionPolicy::NoEviction {
                 return Err(FerrumError::OutOfMemory);
             }
 
             let candidates = sample_candidates(store, cfg.policy.scope(), cfg.samples);
-            let Some(victim) = eviction::pick_victim(cfg.policy, candidates) else {
+            let victim = match cfg.policy {
+                EvictionPolicy::AllKeysAhe | EvictionPolicy::VolatileAhe => {
+                    let alpha = self.ahe_alpha();
+                    eviction::pick_victim_ahe(alpha, candidates)
+                }
+                _ => eviction::pick_victim(cfg.policy, candidates),
+            };
+            let Some(victim) = victim else {
                 // For volatile policies on a dataset without TTL, Redis
                 // reports OOM; we do the same so the caller sees a clear
                 // failure instead of a silent accept.
                 return Err(FerrumError::OutOfMemory);
             };
             self.track_remove(store, &victim.key);
+            evicted += 1;
             if let Some(aof) = &self.aof {
                 log_aof_result("DEL", aof.append_del(&victim.key));
             }
         }
+
+        // Feed the AHE controller exactly once per sweep so it sees
+        // post-eviction hit ratios, not partial state.
+        if evicted > 0
+            && matches!(
+                cfg.policy,
+                EvictionPolicy::AllKeysAhe | EvictionPolicy::VolatileAhe
+            )
+        {
+            let (hits, misses) = self.keyspace_stats();
+            self.ahe_observe(hits, misses);
+        }
+
         if fits(self.used_memory.load(Ordering::Relaxed)) {
             Ok(())
         } else {
@@ -724,10 +818,12 @@ impl KvEngine {
     /// Updates the `last_access` stamp on `key` if it is still live.
     ///
     /// Used by read paths to give the LRU policy some accuracy without
-    /// forcing the caller to touch `ValueEntry` internals.
+    /// forcing the caller to touch `ValueEntry` internals. Also advances
+    /// the Morris LFU counter probabilistically.
     fn touch_access(&self, store: &mut HashMap<Vec<u8>, ValueEntry>, key: &[u8]) {
         if let Some(entry) = store.get_mut(key) {
-            entry.touch();
+            let r = self.next_rand01();
+            entry.touch(r);
         }
     }
 
@@ -827,6 +923,7 @@ fn sample_candidates(
             key: key.clone(),
             last_access: Some(entry.last_access),
             expire_at: entry.expire_at,
+            lfu_counter: entry.lfu_counter,
         });
     }
     out
@@ -930,6 +1027,91 @@ fn validate_value(value: &[u8]) -> Result<(), FerrumError> {
 fn log_aof_result(cmd: &str, result: Result<(), FerrumError>) {
     if let Err(e) = result {
         warn!("aof append for {cmd} failed: {e}");
+    }
+}
+
+/// Builds the initial xorshift32 seed. Mixes the low 32 bits of the wall
+/// clock with a constant offset so identical process start times still
+/// produce different sequences on repeat runs.
+fn rng_seed() -> u32 {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0x9E37_79B9_7F4A_7C15);
+    // xorshift requires a non-zero seed; the OR keeps us out of that hole.
+    ((secs as u32) ^ 0xDEAD_BEEF) | 1
+}
+
+/// Advances an xorshift32 state by one step and returns the new value.
+fn xorshift32(state: u32) -> u32 {
+    let mut x = state;
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    x
+}
+
+impl KvEngine {
+    /// Draws a uniform sample from `[0.0, 1.0)` using the engine's
+    /// shared xorshift32 state. Used for LFU probabilistic increments
+    /// and for any future tie-breaking that wants a cheap RNG.
+    fn next_rand01(&self) -> f32 {
+        let next = xorshift32(self.rng.load(Ordering::Relaxed));
+        self.rng.store(next, Ordering::Relaxed);
+        // Map the top 24 bits onto `[0, 1)`; enough precision for `f32`
+        // without worrying about the exponent corner cases of the full
+        // 32-bit range.
+        (next >> 8) as f32 / ((1u32 << 24) as f32)
+    }
+
+    /// Records a keyspace hit. Called by every read path that returns a
+    /// live value so the AHE feedback loop sees representative traffic.
+    pub(crate) fn record_hit(&self) {
+        self.hits.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records a keyspace miss (key absent or expired).
+    pub(crate) fn record_miss(&self) {
+        self.misses.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Snapshot of `(hits, misses)` used by `INFO stats`.
+    pub fn keyspace_stats(&self) -> (u64, u64) {
+        (
+            self.hits.load(Ordering::Relaxed),
+            self.misses.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Returns a copy of the live AHE controller state. Intended for
+    /// observability; callers must not rely on values being stable across
+    /// consecutive reads since the controller mutates during evictions.
+    pub fn ahe_snapshot(&self) -> AdaptiveHybridState {
+        match self.ahe.lock() {
+            Ok(g) => *g,
+            // Lock poisoning happens only if another thread panicked
+            // while holding it; return defaults rather than propagating
+            // so observability calls can't take the server down.
+            Err(p) => *p.into_inner(),
+        }
+    }
+
+    /// Returns the current AHE blend weight, falling back to the default
+    /// if the controller lock is poisoned.
+    fn ahe_alpha(&self) -> f32 {
+        match self.ahe.lock() {
+            Ok(g) => g.alpha,
+            Err(p) => p.into_inner().alpha,
+        }
+    }
+
+    /// Feeds a `(hits, misses)` sample into the AHE controller. Silently
+    /// ignored on lock poisoning so an observability mishap cannot abort
+    /// the eviction sweep.
+    fn ahe_observe(&self, hits: u64, misses: u64) {
+        if let Ok(mut g) = self.ahe.lock() {
+            g.observe(hits, misses);
+        }
     }
 }
 

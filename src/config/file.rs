@@ -171,8 +171,9 @@ fn apply_directive(cfg: &mut FileConfig, key: &str, value: &str) -> Result<(), S
             cfg.max_memory_policy = Some(EvictionPolicy::from_name(&name).ok_or_else(|| {
                 format!(
                     "invalid maxmemory-policy '{value}' (expected one of noeviction, \
-                         allkeys-lru, volatile-lru, allkeys-random, volatile-random, \
-                         volatile-ttl)"
+                         allkeys-lru, volatile-lru, allkeys-lfu, volatile-lfu, \
+                         allkeys-random, volatile-random, volatile-ttl, \
+                         allkeys-ahe, volatile-ahe)"
                 )
             })?);
         }

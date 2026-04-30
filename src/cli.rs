@@ -198,8 +198,9 @@ fn scan_argv<I: IntoIterator<Item = String>>(args: I) -> Result<ScanOutcome, Str
                     Some(EvictionPolicy::from_name(&name).ok_or_else(|| {
                         format!(
                             "invalid --maxmemory-policy '{value}' (expected noeviction, \
-                             allkeys-lru, volatile-lru, allkeys-random, volatile-random, \
-                             volatile-ttl)"
+                             allkeys-lru, volatile-lru, allkeys-lfu, volatile-lfu, \
+                             allkeys-random, volatile-random, volatile-ttl, \
+                             allkeys-ahe, volatile-ahe)"
                         )
                     })?);
             }
