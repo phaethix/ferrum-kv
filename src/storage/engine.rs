@@ -7,6 +7,7 @@ use log::warn;
 
 use crate::error::FerrumError;
 use crate::persistence::AofWriter;
+use crate::storage::eviction::{self, Candidate, EvictionConfig, EvictionPolicy, EvictionScope};
 
 /// Maximum allowed key size in bytes (64 KiB).
 pub const KEY_MAX_BYTES: usize = 64 * 1024;
@@ -27,10 +28,15 @@ pub const PER_ENTRY_OVERHEAD: u64 = 48;
 /// `expire_at` is a monotonic deadline derived from [`Instant::now`] at the
 /// time the TTL was installed. A value whose deadline is `<= Instant::now()`
 /// is considered expired and must be treated as absent by every read path.
+///
+/// `last_access` tracks the most recent successful read or write and is
+/// maintained inside the store's write lock. Only the approximate LRU
+/// policies consult it, so keeping it current is best-effort.
 #[derive(Clone)]
 struct ValueEntry {
     data: Vec<u8>,
     expire_at: Option<Instant>,
+    last_access: Instant,
 }
 
 impl ValueEntry {
@@ -38,11 +44,16 @@ impl ValueEntry {
         Self {
             data,
             expire_at: None,
+            last_access: Instant::now(),
         }
     }
 
     fn is_expired(&self, now: Instant) -> bool {
         matches!(self.expire_at, Some(deadline) if deadline <= now)
+    }
+
+    fn touch(&mut self) {
+        self.last_access = Instant::now();
     }
 }
 
@@ -76,6 +87,11 @@ pub struct KvEngine {
     /// consistent with the `HashMap` it describes. Readers can load it
     /// without holding any engine lock, which keeps `INFO memory` cheap.
     used_memory: Arc<AtomicU64>,
+    /// Live eviction configuration.
+    ///
+    /// Wrapped in a lock so the server can mutate it at runtime (e.g. via
+    /// a future `CONFIG SET` command) without cloning the whole engine.
+    eviction: Arc<RwLock<EvictionConfig>>,
 }
 
 impl Default for KvEngine {
@@ -91,6 +107,7 @@ impl KvEngine {
             store: Arc::default(),
             aof: None,
             used_memory: Arc::new(AtomicU64::new(0)),
+            eviction: Arc::new(RwLock::new(EvictionConfig::default())),
         }
     }
 
@@ -101,6 +118,21 @@ impl KvEngine {
     pub fn with_aof(mut self, writer: Arc<AofWriter>) -> Self {
         self.aof = Some(writer);
         self
+    }
+
+    /// Replaces the live eviction configuration.
+    ///
+    /// Takes effect for all subsequent writes; already-stored keys are
+    /// eligible under the new policy immediately.
+    pub fn set_eviction_config(&self, cfg: EvictionConfig) -> Result<(), FerrumError> {
+        let mut guard = self.eviction.write()?;
+        *guard = cfg;
+        Ok(())
+    }
+
+    /// Returns a copy of the current eviction configuration.
+    pub fn eviction_config(&self) -> Result<EvictionConfig, FerrumError> {
+        Ok(*self.eviction.read()?)
     }
 
     /// Sets a key-value pair and returns the previous value, if any.
@@ -116,6 +148,7 @@ impl KvEngine {
         validate_value(&value)?;
 
         let mut store = self.store.write()?;
+        self.enforce_for_write(&mut store, &key, value.len())?;
         if let Some(aof) = &self.aof {
             log_aof_result("SET", aof.append_set(&key, &value));
         }
@@ -144,6 +177,7 @@ impl KvEngine {
             // anyway and skipping the DEL keeps the log shorter.
             self.track_remove(&mut store, key.as_slice());
         }
+        self.enforce_for_write(&mut store, &key, value.len())?;
         if let Some(aof) = &self.aof {
             log_aof_result("SETNX", aof.append_set(&key, &value));
         }
@@ -164,6 +198,9 @@ impl KvEngine {
         }
 
         let mut store = self.store.write()?;
+        for (k, v) in &pairs {
+            self.enforce_for_write(&mut store, k, v.len())?;
+        }
         if let Some(aof) = &self.aof {
             log_aof_result("MSET", aof.append_set_many(&pairs));
         }
@@ -189,7 +226,11 @@ impl KvEngine {
                     self.log_expire_drop(key);
                     out.push(None);
                 }
-                Some(entry) => out.push(Some(entry.data.clone())),
+                Some(entry) => {
+                    let data = entry.data.clone();
+                    self.touch_access(&mut store, key.as_slice());
+                    out.push(Some(data));
+                }
                 None => out.push(None),
             }
         }
@@ -235,6 +276,7 @@ impl KvEngine {
         })?;
         let serialised = new_value.to_string().into_bytes();
 
+        self.enforce_for_write(&mut store, &key, serialised.len())?;
         if let Some(aof) = &self.aof {
             log_aof_result("INCRBY", aof.append_set(&key, &serialised));
             // INCR preserves TTL: re-emit the existing deadline so replay
@@ -251,6 +293,7 @@ impl KvEngine {
             ValueEntry {
                 data: serialised,
                 expire_at: existing_deadline,
+                last_access: Instant::now(),
             },
         );
         Ok(new_value)
@@ -266,7 +309,11 @@ impl KvEngine {
                 self.log_expire_drop(key);
                 Ok(None)
             }
-            Some(entry) => Ok(Some(entry.data.clone())),
+            Some(entry) => {
+                let data = entry.data.clone();
+                self.touch_access(&mut store, key);
+                Ok(Some(data))
+            }
             None => Ok(None),
         }
     }
@@ -368,6 +415,7 @@ impl KvEngine {
         };
         validate_value(&new_value)?;
 
+        self.enforce_for_write(&mut store, &key, new_value.len())?;
         if let Some(aof) = &self.aof {
             log_aof_result("APPEND", aof.append_set(&key, &new_value));
             if let Some(deadline) = existing_deadline
@@ -383,6 +431,7 @@ impl KvEngine {
             ValueEntry {
                 data: new_value,
                 expire_at: existing_deadline,
+                last_access: Instant::now(),
             },
         );
         Ok(new_len)
@@ -618,6 +667,84 @@ impl KvEngine {
         previous
     }
 
+    /// Evicts keys until `used_memory + incoming <= max_memory`, honouring
+    /// the active [`EvictionPolicy`].
+    ///
+    /// `incoming` is the approximate byte cost of the entry that is about
+    /// to be written. Passing it up front lets the sweep leave enough
+    /// headroom for a single write so the caller never overshoots the
+    /// ceiling by a full entry. Callers that only want the current
+    /// counter to fit (for example, retroactive enforcement after a
+    /// `maxmemory` shrink) can pass `0`.
+    ///
+    /// Returns `Err(FerrumError::OutOfMemory)` when the policy is
+    /// `noeviction`, when no policy-eligible key exists, or when the best
+    /// effort eviction still cannot free enough space. Successful evictions
+    /// are logged to the AOF so replay converges on the post-eviction state.
+    ///
+    /// The caller must already hold the write lock on `store`.
+    fn enforce_memory_limit(
+        &self,
+        store: &mut HashMap<Vec<u8>, ValueEntry>,
+        incoming: u64,
+    ) -> Result<(), FerrumError> {
+        let cfg = *self.eviction.read()?;
+        if cfg.max_memory == 0 {
+            return Ok(());
+        }
+        let fits = |used: u64| used.saturating_add(incoming) <= cfg.max_memory;
+        // Bounded loop so a pathological policy cannot spin forever.
+        for _ in 0..store.len().max(1) + 16 {
+            if fits(self.used_memory.load(Ordering::Relaxed)) {
+                return Ok(());
+            }
+            if cfg.policy == EvictionPolicy::NoEviction {
+                return Err(FerrumError::OutOfMemory);
+            }
+
+            let candidates = sample_candidates(store, cfg.policy.scope(), cfg.samples);
+            let Some(victim) = eviction::pick_victim(cfg.policy, candidates) else {
+                // For volatile policies on a dataset without TTL, Redis
+                // reports OOM; we do the same so the caller sees a clear
+                // failure instead of a silent accept.
+                return Err(FerrumError::OutOfMemory);
+            };
+            self.track_remove(store, &victim.key);
+            if let Some(aof) = &self.aof {
+                log_aof_result("DEL", aof.append_del(&victim.key));
+            }
+        }
+        if fits(self.used_memory.load(Ordering::Relaxed)) {
+            Ok(())
+        } else {
+            Err(FerrumError::OutOfMemory)
+        }
+    }
+
+    /// Updates the `last_access` stamp on `key` if it is still live.
+    ///
+    /// Used by read paths to give the LRU policy some accuracy without
+    /// forcing the caller to touch `ValueEntry` internals.
+    fn touch_access(&self, store: &mut HashMap<Vec<u8>, ValueEntry>, key: &[u8]) {
+        if let Some(entry) = store.get_mut(key) {
+            entry.touch();
+        }
+    }
+
+    /// Convenience wrapper: computes the net byte increase that writing
+    /// `(key, value_len)` would introduce and forwards it to
+    /// [`Self::enforce_memory_limit`].
+    fn enforce_for_write(
+        &self,
+        store: &mut HashMap<Vec<u8>, ValueEntry>,
+        key: &[u8],
+        value_len: usize,
+    ) -> Result<(), FerrumError> {
+        let incoming = key.len() as u64 + value_len as u64 + PER_ENTRY_OVERHEAD;
+        let net = incoming.saturating_sub(store.get(key).map(|e| entry_bytes(key, e)).unwrap_or(0));
+        self.enforce_memory_limit(store, net)
+    }
+
     /// Removes `key` from `store`, updates the memory counter, and
     /// returns the evicted entry. A no-op when the key is absent.
     fn track_remove(
@@ -675,6 +802,34 @@ impl KvEngine {
 /// Approximate byte cost of a single live entry.
 fn entry_bytes(key: &[u8], entry: &ValueEntry) -> u64 {
     key.len() as u64 + entry.data.len() as u64 + PER_ENTRY_OVERHEAD
+}
+
+/// Samples up to `sample` candidates from `store` under the given scope.
+///
+/// `HashMap`'s iteration order is already randomised by its hasher, so we
+/// rely on that for "pick at random" without introducing an extra RNG
+/// dependency. For `EvictionScope::Volatile` we skip keys without a TTL and
+/// keep walking until the cap is reached or the store is exhausted.
+fn sample_candidates(
+    store: &HashMap<Vec<u8>, ValueEntry>,
+    scope: EvictionScope,
+    sample: usize,
+) -> Vec<Candidate> {
+    let mut out = Vec::with_capacity(sample);
+    for (key, entry) in store.iter() {
+        if out.len() >= sample {
+            break;
+        }
+        if matches!(scope, EvictionScope::Volatile) && entry.expire_at.is_none() {
+            continue;
+        }
+        out.push(Candidate {
+            key: key.clone(),
+            last_access: Some(entry.last_access),
+            expire_at: entry.expire_at,
+        });
+    }
+    out
 }
 
 /// Outcome of a single call to [`KvEngine::sweep_expired`].
@@ -1523,5 +1678,130 @@ mod tests {
             .unwrap();
         assert_eq!(removed, 2);
         assert_eq!(engine.used_memory(), 0);
+    }
+
+    #[test]
+    fn noeviction_refuses_writes_past_max_memory() {
+        let engine = KvEngine::new();
+        engine
+            .set_eviction_config(EvictionConfig {
+                max_memory: PER_ENTRY_OVERHEAD + 8,
+                policy: EvictionPolicy::NoEviction,
+                samples: 5,
+            })
+            .unwrap();
+        engine.set(b"k".to_vec(), b"12345".to_vec()).unwrap();
+        // Writing anything now overshoots: expect OOM without touching the
+        // existing key.
+        let err = engine.set(b"x".to_vec(), b"y".to_vec()).unwrap_err();
+        assert!(matches!(err, FerrumError::OutOfMemory));
+        assert_eq!(engine.get(b"k").unwrap(), Some(b"12345".to_vec()));
+    }
+
+    #[test]
+    fn allkeys_lru_evicts_least_recently_used_key() {
+        let engine = KvEngine::new();
+        // Room for exactly two entries.
+        let max = 2 * (1 + 3 + PER_ENTRY_OVERHEAD);
+        engine
+            .set_eviction_config(EvictionConfig {
+                max_memory: max,
+                policy: EvictionPolicy::AllKeysLru,
+                samples: 10,
+            })
+            .unwrap();
+
+        engine.set(b"a".to_vec(), b"AAA".to_vec()).unwrap();
+        std::thread::sleep(Duration::from_millis(5));
+        engine.set(b"b".to_vec(), b"BBB".to_vec()).unwrap();
+        std::thread::sleep(Duration::from_millis(5));
+
+        // Touch `a` so it becomes the newest.
+        engine.get(b"a").unwrap();
+        std::thread::sleep(Duration::from_millis(5));
+
+        // Third insert must evict: `b` is now the least recently used.
+        engine.set(b"c".to_vec(), b"CCC".to_vec()).unwrap();
+        assert_eq!(
+            engine.get(b"b").unwrap(),
+            None,
+            "b should have been evicted"
+        );
+        assert!(engine.exists(b"a").unwrap());
+        assert!(engine.exists(b"c").unwrap());
+    }
+
+    #[test]
+    fn volatile_lru_falls_back_to_oom_without_volatile_keys() {
+        let engine = KvEngine::new();
+        engine
+            .set_eviction_config(EvictionConfig {
+                max_memory: PER_ENTRY_OVERHEAD + 2,
+                policy: EvictionPolicy::VolatileLru,
+                samples: 5,
+            })
+            .unwrap();
+        engine.set(b"k".to_vec(), b"v".to_vec()).unwrap();
+        let err = engine.set(b"x".to_vec(), b"y".to_vec()).unwrap_err();
+        assert!(matches!(err, FerrumError::OutOfMemory));
+    }
+
+    #[test]
+    fn volatile_ttl_evicts_soonest_expiring() {
+        let engine = KvEngine::new();
+        let max = 2 * (1 + 1 + PER_ENTRY_OVERHEAD);
+        engine
+            .set_eviction_config(EvictionConfig {
+                max_memory: max,
+                policy: EvictionPolicy::VolatileTtl,
+                samples: 10,
+            })
+            .unwrap();
+        engine.set(b"a".to_vec(), b"1".to_vec()).unwrap();
+        engine.set(b"b".to_vec(), b"2".to_vec()).unwrap();
+        let now = current_epoch_ms();
+        engine.expire_at_ms(b"a", now + 10_000).unwrap();
+        engine.expire_at_ms(b"b", now + 60_000).unwrap();
+
+        engine.set(b"c".to_vec(), b"3".to_vec()).unwrap();
+        assert_eq!(
+            engine.get(b"a").unwrap(),
+            None,
+            "shortest-TTL key should evict"
+        );
+        assert!(engine.exists(b"b").unwrap());
+        assert!(engine.exists(b"c").unwrap());
+    }
+
+    #[test]
+    fn allkeys_random_picks_some_victim_under_pressure() {
+        let engine = KvEngine::new();
+        let max = 2 * (1 + 1 + PER_ENTRY_OVERHEAD);
+        engine
+            .set_eviction_config(EvictionConfig {
+                max_memory: max,
+                policy: EvictionPolicy::AllKeysRandom,
+                samples: 5,
+            })
+            .unwrap();
+        engine.set(b"a".to_vec(), b"1".to_vec()).unwrap();
+        engine.set(b"b".to_vec(), b"2".to_vec()).unwrap();
+        engine.set(b"c".to_vec(), b"3".to_vec()).unwrap();
+        // One of the three must have been evicted.
+        let survivors = [b"a", b"b", b"c"]
+            .iter()
+            .filter(|k| engine.exists(k.as_slice()).unwrap())
+            .count();
+        assert_eq!(survivors, 2);
+    }
+
+    #[test]
+    fn zero_max_memory_disables_enforcement() {
+        let engine = KvEngine::new();
+        for i in 0..100 {
+            let k = format!("k{i}");
+            engine.set(k.into_bytes(), vec![b'x'; 128]).unwrap();
+        }
+        assert_eq!(engine.dbsize().unwrap(), 100);
     }
 }
