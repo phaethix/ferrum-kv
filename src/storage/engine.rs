@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -12,6 +13,14 @@ pub const KEY_MAX_BYTES: usize = 64 * 1024;
 
 /// Maximum allowed value size in bytes (16 MiB).
 pub const VALUE_MAX_BYTES: usize = 16 * 1024 * 1024;
+
+/// Approximate per-entry overhead charged on top of `key.len() + value.len()`.
+///
+/// Covers the `HashMap` bucket, the `ValueEntry` metadata, and the per-key
+/// allocations that `Vec<u8>` carries. Chosen as a conservative constant so
+/// the reported `used_memory` stays a useful safety bound without pretending
+/// to match the allocator to the byte.
+pub const PER_ENTRY_OVERHEAD: u64 = 48;
 
 /// A value stored in the engine, together with its optional expiration.
 ///
@@ -61,6 +70,12 @@ impl ValueEntry {
 pub struct KvEngine {
     store: Arc<RwLock<HashMap<Vec<u8>, ValueEntry>>>,
     aof: Option<Arc<AofWriter>>,
+    /// Approximate memory footprint of the live dataset, in bytes.
+    ///
+    /// The counter is updated inside the store's write lock so it stays
+    /// consistent with the `HashMap` it describes. Readers can load it
+    /// without holding any engine lock, which keeps `INFO memory` cheap.
+    used_memory: Arc<AtomicU64>,
 }
 
 impl Default for KvEngine {
@@ -75,6 +90,7 @@ impl KvEngine {
         Self {
             store: Arc::default(),
             aof: None,
+            used_memory: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -103,7 +119,7 @@ impl KvEngine {
         if let Some(aof) = &self.aof {
             log_aof_result("SET", aof.append_set(&key, &value));
         }
-        let previous = store.insert(key, ValueEntry::new(value));
+        let previous = self.track_insert(&mut store, key, ValueEntry::new(value));
         Ok(previous.and_then(live_payload))
     }
 
@@ -126,12 +142,12 @@ impl KvEngine {
             // the key were absent. We intentionally do not log a DEL because
             // the subsequent SET, once replayed, overwrites the stale entry
             // anyway and skipping the DEL keeps the log shorter.
-            store.remove(key.as_slice());
+            self.track_remove(&mut store, key.as_slice());
         }
         if let Some(aof) = &self.aof {
             log_aof_result("SETNX", aof.append_set(&key, &value));
         }
-        store.insert(key, ValueEntry::new(value));
+        self.track_insert(&mut store, key, ValueEntry::new(value));
         Ok(true)
     }
 
@@ -152,7 +168,7 @@ impl KvEngine {
             log_aof_result("MSET", aof.append_set_many(&pairs));
         }
         for (k, v) in pairs {
-            store.insert(k, ValueEntry::new(v));
+            self.track_insert(&mut store, k, ValueEntry::new(v));
         }
         Ok(())
     }
@@ -169,7 +185,7 @@ impl KvEngine {
         for key in keys {
             match store.get(key.as_slice()) {
                 Some(entry) if entry.is_expired(now) => {
-                    store.remove(key.as_slice());
+                    self.track_remove(&mut store, key.as_slice());
                     self.log_expire_drop(key);
                     out.push(None);
                 }
@@ -198,7 +214,7 @@ impl KvEngine {
         let now = Instant::now();
         let (current, existing_deadline) = match store.get(key.as_slice()) {
             Some(entry) if entry.is_expired(now) => {
-                store.remove(key.as_slice());
+                self.track_remove(&mut store, key.as_slice());
                 self.log_expire_drop(&key);
                 (0i64, None)
             }
@@ -229,7 +245,8 @@ impl KvEngine {
                 log_aof_result("PEXPIREAT", aof.append_pexpireat(&key, abs_ms));
             }
         }
-        store.insert(
+        self.track_insert(
+            &mut store,
             key,
             ValueEntry {
                 data: serialised,
@@ -245,7 +262,7 @@ impl KvEngine {
         let now = Instant::now();
         match store.get(key) {
             Some(entry) if entry.is_expired(now) => {
-                store.remove(key);
+                self.track_remove(&mut store, key);
                 self.log_expire_drop(key);
                 Ok(None)
             }
@@ -258,7 +275,7 @@ impl KvEngine {
     pub fn del(&self, key: &[u8]) -> Result<bool, FerrumError> {
         let mut store = self.store.write()?;
         let now = Instant::now();
-        let existed = match store.remove(key) {
+        let existed = match self.track_remove(&mut store, key) {
             Some(entry) => !entry.is_expired(now),
             None => false,
         };
@@ -284,7 +301,7 @@ impl KvEngine {
         let now = Instant::now();
         let mut removed: Vec<&[u8]> = Vec::with_capacity(keys.len());
         for key in keys {
-            if let Some(entry) = store.remove(key.as_slice())
+            if let Some(entry) = self.track_remove(&mut store, key.as_slice())
                 && !entry.is_expired(now)
             {
                 removed.push(key.as_slice());
@@ -304,7 +321,7 @@ impl KvEngine {
         let now = Instant::now();
         match store.get(key) {
             Some(entry) if entry.is_expired(now) => {
-                store.remove(key);
+                self.track_remove(&mut store, key);
                 self.log_expire_drop(key);
                 Ok(false)
             }
@@ -337,7 +354,7 @@ impl KvEngine {
         let now = Instant::now();
         let (new_value, existing_deadline) = match store.get(key.as_slice()) {
             Some(entry) if entry.is_expired(now) => {
-                store.remove(key.as_slice());
+                self.track_remove(&mut store, key.as_slice());
                 self.log_expire_drop(&key);
                 (suffix, None)
             }
@@ -360,7 +377,8 @@ impl KvEngine {
             }
         }
         let new_len = new_value.len();
-        store.insert(
+        self.track_insert(
+            &mut store,
             key,
             ValueEntry {
                 data: new_value,
@@ -376,7 +394,7 @@ impl KvEngine {
         let now = Instant::now();
         match store.get(key) {
             Some(entry) if entry.is_expired(now) => {
-                store.remove(key);
+                self.track_remove(&mut store, key);
                 self.log_expire_drop(key);
                 Ok(0)
             }
@@ -388,7 +406,7 @@ impl KvEngine {
     /// Removes all keys from the store.
     pub fn flushdb(&self) -> Result<(), FerrumError> {
         let mut store = self.store.write()?;
-        store.clear();
+        self.track_clear(&mut store);
         if let Some(aof) = &self.aof {
             log_aof_result("FLUSHDB", aof.append_flushdb());
         }
@@ -414,7 +432,7 @@ impl KvEngine {
         if let Some(entry) = store.get(key)
             && entry.is_expired(now_instant)
         {
-            store.remove(key);
+            self.track_remove(&mut store, key);
             self.log_expire_drop(key);
         }
 
@@ -423,7 +441,7 @@ impl KvEngine {
         }
 
         if abs_epoch_ms <= now_ms {
-            store.remove(key);
+            self.track_remove(&mut store, key);
             if let Some(aof) = &self.aof {
                 log_aof_result("DEL", aof.append_del(key));
             }
@@ -452,7 +470,7 @@ impl KvEngine {
         if let Some(entry) = store.get(key)
             && entry.is_expired(now)
         {
-            store.remove(key);
+            self.track_remove(&mut store, key);
             self.log_expire_drop(key);
             return Ok(false);
         }
@@ -481,7 +499,7 @@ impl KvEngine {
         match store.get(key) {
             None => Ok(TtlStatus::Missing),
             Some(entry) if entry.is_expired(now) => {
-                store.remove(key);
+                self.track_remove(&mut store, key);
                 self.log_expire_drop(key);
                 Ok(TtlStatus::Missing)
             }
@@ -529,7 +547,7 @@ impl KvEngine {
 
         let evicted = victims.len();
         for key in &victims {
-            store.remove(key.as_slice());
+            self.track_remove(&mut store, key.as_slice());
             if let Some(aof) = &self.aof {
                 log_aof_result("DEL", aof.append_del(key));
             }
@@ -547,6 +565,116 @@ impl KvEngine {
             log_aof_result("DEL", aof.append_del(key));
         }
     }
+
+    /// Returns the current approximate memory footprint, in bytes.
+    ///
+    /// Includes key bytes, value bytes, and a fixed per-entry overhead
+    /// (see [`PER_ENTRY_OVERHEAD`]). The value is eventually consistent
+    /// with the store: it is updated inside the write lock that guards
+    /// every mutation, so callers observing it after a successful command
+    /// always see the post-mutation total.
+    pub fn used_memory(&self) -> u64 {
+        self.used_memory.load(Ordering::Relaxed)
+    }
+
+    /// Returns the approximate per-entry cost of `key`, in bytes, or
+    /// `None` if the key is absent or already expired.
+    ///
+    /// Matches the `MEMORY USAGE` command's contract of reporting the
+    /// single-entry contribution that `used_memory()` would shed if the
+    /// key were removed.
+    pub fn memory_usage(&self, key: &[u8]) -> Result<Option<u64>, FerrumError> {
+        let mut store = self.store.write()?;
+        let now = Instant::now();
+        match store.get(key) {
+            Some(entry) if entry.is_expired(now) => {
+                // Surface the expiration through the normal lazy path so
+                // both MEMORY USAGE and GET agree on the key being gone.
+                let removed = store.remove(key);
+                if let Some(entry) = removed {
+                    self.untrack(key, &entry);
+                }
+                self.log_expire_drop(key);
+                Ok(None)
+            }
+            Some(entry) => Ok(Some(entry_bytes(key, entry))),
+            None => Ok(None),
+        }
+    }
+
+    /// Inserts `entry` into `store` and updates the memory counter,
+    /// returning the old entry (if any) so callers can reason about
+    /// overwrite semantics.
+    fn track_insert(
+        &self,
+        store: &mut HashMap<Vec<u8>, ValueEntry>,
+        key: Vec<u8>,
+        entry: ValueEntry,
+    ) -> Option<ValueEntry> {
+        let incoming = entry_bytes(&key, &entry);
+        let previous = store.insert(key.clone(), entry);
+        let outgoing = previous.as_ref().map(|p| entry_bytes(&key, p)).unwrap_or(0);
+        self.apply_delta(incoming as i64 - outgoing as i64);
+        previous
+    }
+
+    /// Removes `key` from `store`, updates the memory counter, and
+    /// returns the evicted entry. A no-op when the key is absent.
+    fn track_remove(
+        &self,
+        store: &mut HashMap<Vec<u8>, ValueEntry>,
+        key: &[u8],
+    ) -> Option<ValueEntry> {
+        let removed = store.remove(key);
+        if let Some(entry) = &removed {
+            self.apply_delta(-(entry_bytes(key, entry) as i64));
+        }
+        removed
+    }
+
+    /// Clears every entry, resetting the memory counter to zero.
+    fn track_clear(&self, store: &mut HashMap<Vec<u8>, ValueEntry>) {
+        store.clear();
+        self.used_memory.store(0, Ordering::Relaxed);
+    }
+
+    /// Untracks an entry that was already removed by some other path
+    /// (e.g. a caller that held onto the returned `Option<ValueEntry>`).
+    fn untrack(&self, key: &[u8], entry: &ValueEntry) {
+        self.apply_delta(-(entry_bytes(key, entry) as i64));
+    }
+
+    fn apply_delta(&self, delta: i64) {
+        if delta == 0 {
+            return;
+        }
+        if delta > 0 {
+            self.used_memory.fetch_add(delta as u64, Ordering::Relaxed);
+        } else {
+            let mag = (-delta) as u64;
+            // Saturating sub: the counter is an approximation, and any
+            // underflow would only happen if the invariants slipped, which
+            // we'd rather clamp than panic on in release builds.
+            let mut cur = self.used_memory.load(Ordering::Relaxed);
+            loop {
+                let next = cur.saturating_sub(mag);
+                match self.used_memory.compare_exchange_weak(
+                    cur,
+                    next,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => break,
+                    Err(obs) => cur = obs,
+                }
+            }
+        }
+    }
+}
+
+/// Approximate byte cost of a single live entry.
+fn entry_bytes(key: &[u8], entry: &ValueEntry) -> u64 {
+    key.len() as u64 + entry.data.len() as u64 + PER_ENTRY_OVERHEAD
 }
 
 /// Outcome of a single call to [`KvEngine::sweep_expired`].
@@ -1320,5 +1448,80 @@ mod tests {
         let stats = engine.sweep_expired(0).unwrap();
         assert_eq!(stats.examined, 0);
         assert_eq!(stats.evicted, 0);
+    }
+
+    #[test]
+    fn used_memory_starts_at_zero_and_grows_on_set() {
+        let engine = KvEngine::new();
+        assert_eq!(engine.used_memory(), 0);
+        engine.set(b"k".to_vec(), b"v".to_vec()).unwrap();
+        let after_set = engine.used_memory();
+        assert!(after_set >= 2 + PER_ENTRY_OVERHEAD);
+    }
+
+    #[test]
+    fn used_memory_adjusts_on_overwrite_and_delete() {
+        let engine = KvEngine::new();
+        engine.set(b"k".to_vec(), b"short".to_vec()).unwrap();
+        let a = engine.used_memory();
+        engine.set(b"k".to_vec(), vec![b'x'; 100]).unwrap();
+        let b = engine.used_memory();
+        assert!(b > a, "grow overwrite should increase used_memory");
+
+        engine.del(b"k").unwrap();
+        assert_eq!(engine.used_memory(), 0);
+    }
+
+    #[test]
+    fn flushdb_resets_used_memory() {
+        let engine = KvEngine::new();
+        engine.set(b"a".to_vec(), b"1".to_vec()).unwrap();
+        engine.set(b"b".to_vec(), b"2".to_vec()).unwrap();
+        assert!(engine.used_memory() > 0);
+        engine.flushdb().unwrap();
+        assert_eq!(engine.used_memory(), 0);
+    }
+
+    #[test]
+    fn memory_usage_returns_per_entry_bytes_or_none() {
+        let engine = KvEngine::new();
+        assert_eq!(engine.memory_usage(b"absent").unwrap(), None);
+        engine.set(b"k".to_vec(), b"value".to_vec()).unwrap();
+        let reported = engine.memory_usage(b"k").unwrap().unwrap();
+        assert_eq!(reported, 1 + 5 + PER_ENTRY_OVERHEAD);
+    }
+
+    #[test]
+    fn memory_usage_expires_key_lazily() {
+        let engine = KvEngine::new();
+        engine.set(b"k".to_vec(), b"v".to_vec()).unwrap();
+        {
+            let mut store = engine.store.write().unwrap();
+            if let Some(entry) = store.get_mut(b"k".as_slice()) {
+                entry.expire_at = Some(Instant::now() - Duration::from_millis(1));
+            }
+        }
+        assert_eq!(engine.memory_usage(b"k").unwrap(), None);
+        assert_eq!(engine.used_memory(), 0);
+    }
+
+    #[test]
+    fn used_memory_tracks_mset_and_del_many() {
+        let engine = KvEngine::new();
+        engine
+            .mset(vec![
+                (b"a".to_vec(), b"1".to_vec()),
+                (b"bb".to_vec(), b"22".to_vec()),
+            ])
+            .unwrap();
+        assert_eq!(
+            engine.used_memory(),
+            (1 + 1 + PER_ENTRY_OVERHEAD) + (2 + 2 + PER_ENTRY_OVERHEAD),
+        );
+        let removed = engine
+            .del_many(&[b"a".to_vec(), b"bb".to_vec(), b"missing".to_vec()])
+            .unwrap();
+        assert_eq!(removed, 2);
+        assert_eq!(engine.used_memory(), 0);
     }
 }
