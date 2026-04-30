@@ -14,6 +14,9 @@ pub enum Command {
     MSet { pairs: Vec<(Vec<u8>, Vec<u8>)> },
     /// `MGET key [key ...]`
     MGet { keys: Vec<Vec<u8>> },
+    /// `INCR`, `DECR`, `INCRBY`, `DECRBY` — all share the same shape of
+    /// atomically adding a signed delta to the integer value at `key`.
+    IncrBy { key: Vec<u8>, delta: i64 },
     /// `GET key`
     Get { key: Vec<u8> },
     /// `DEL key [key ...]`
@@ -243,7 +246,7 @@ fn build_command(parts: Vec<Vec<u8>>) -> Result<Command, FerrumError> {
             })
         }
         b"MSET" => {
-            if args.is_empty() || args.len() % 2 != 0 {
+            if args.is_empty() || !args.len().is_multiple_of(2) {
                 return Err(FerrumError::WrongArity { cmd: "MSET" });
             }
             let mut pairs = Vec::with_capacity(args.len() / 2);
@@ -259,6 +262,45 @@ fn build_command(parts: Vec<Vec<u8>>) -> Result<Command, FerrumError> {
                 return Err(FerrumError::WrongArity { cmd: "MGET" });
             }
             Ok(Command::MGet { keys: args })
+        }
+        b"INCR" => {
+            if args.len() != 1 {
+                return Err(FerrumError::WrongArity { cmd: "INCR" });
+            }
+            Ok(Command::IncrBy {
+                key: args.into_iter().next().unwrap(),
+                delta: 1,
+            })
+        }
+        b"DECR" => {
+            if args.len() != 1 {
+                return Err(FerrumError::WrongArity { cmd: "DECR" });
+            }
+            Ok(Command::IncrBy {
+                key: args.into_iter().next().unwrap(),
+                delta: -1,
+            })
+        }
+        b"INCRBY" => {
+            if args.len() != 2 {
+                return Err(FerrumError::WrongArity { cmd: "INCRBY" });
+            }
+            let mut it = args.into_iter();
+            let key = it.next().unwrap();
+            let delta = parse_integer_argument(&it.next().unwrap(), "INCRBY")?;
+            Ok(Command::IncrBy { key, delta })
+        }
+        b"DECRBY" => {
+            if args.len() != 2 {
+                return Err(FerrumError::WrongArity { cmd: "DECRBY" });
+            }
+            let mut it = args.into_iter();
+            let key = it.next().unwrap();
+            let raw = parse_integer_argument(&it.next().unwrap(), "DECRBY")?;
+            let delta = raw.checked_neg().ok_or(FerrumError::ParseError(
+                "value is not an integer or out of range".into(),
+            ))?;
+            Ok(Command::IncrBy { key, delta })
         }
         b"GET" => {
             if args.len() != 1 {
@@ -328,6 +370,19 @@ fn build_command(parts: Vec<Vec<u8>>) -> Result<Command, FerrumError> {
 /// Returns the ASCII-uppercased copy of `bytes`; non-ASCII bytes are preserved.
 fn ascii_uppercase(bytes: &[u8]) -> Vec<u8> {
     bytes.iter().map(|b| b.to_ascii_uppercase()).collect()
+}
+
+/// Parses a RESP bulk string argument as a signed 64-bit integer.
+///
+/// Used by commands such as `INCRBY` / `DECRBY` whose delta is supplied on
+/// the wire as a decimal ASCII number. Non-numeric payloads and values that
+/// do not fit into an [`i64`] map to the Redis-standard error message so
+/// clients get a stable response regardless of the specific failure cause.
+fn parse_integer_argument(bytes: &[u8], _cmd: &'static str) -> Result<i64, FerrumError> {
+    let text = std::str::from_utf8(bytes)
+        .map_err(|_| FerrumError::ParseError("value is not an integer or out of range".into()))?;
+    text.parse::<i64>()
+        .map_err(|_| FerrumError::ParseError("value is not an integer or out of range".into()))
 }
 
 #[cfg(test)]
@@ -489,6 +544,54 @@ mod frame_tests {
                 keys: vec![b"a".to_vec(), b"b".to_vec()],
             }
         );
+    }
+
+    #[test]
+    fn parses_incr_and_decr_as_delta_plus_minus_one() {
+        assert_eq!(
+            parse_exact(b"*2\r\n$4\r\nINCR\r\n$1\r\nk\r\n"),
+            Command::IncrBy {
+                key: b"k".to_vec(),
+                delta: 1,
+            }
+        );
+        assert_eq!(
+            parse_exact(b"*2\r\n$4\r\nDECR\r\n$1\r\nk\r\n"),
+            Command::IncrBy {
+                key: b"k".to_vec(),
+                delta: -1,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_incrby_and_decrby_with_signed_delta() {
+        assert_eq!(
+            parse_exact(b"*3\r\n$6\r\nINCRBY\r\n$1\r\nk\r\n$2\r\n10\r\n"),
+            Command::IncrBy {
+                key: b"k".to_vec(),
+                delta: 10,
+            }
+        );
+        // DECRBY is implemented as `INCRBY -delta`, and the parser must
+        // reject a delta of `i64::MIN` because its negation overflows.
+        assert_eq!(
+            parse_exact(b"*3\r\n$6\r\nDECRBY\r\n$1\r\nk\r\n$1\r\n7\r\n"),
+            Command::IncrBy {
+                key: b"k".to_vec(),
+                delta: -7,
+            }
+        );
+    }
+
+    #[test]
+    fn incrby_with_non_integer_argument_is_invalid_frame() {
+        let (err, _) = match parse_frame(b"*3\r\n$6\r\nINCRBY\r\n$1\r\nk\r\n$3\r\nabc\r\n").unwrap()
+        {
+            FrameParse::Invalid { error, consumed } => (error, consumed),
+            other => panic!("expected Invalid, got {other:?}"),
+        };
+        assert!(matches!(err, FerrumError::ParseError(ref m) if m.contains("integer")));
     }
 
     #[test]

@@ -219,6 +219,50 @@ fn mset_then_mget_returns_array_with_order_preserved() {
 }
 
 #[test]
+fn incr_and_decr_round_trip_on_integer_keys() {
+    let server = spawn_server();
+    let mut s = connect(&server.addr);
+
+    round_trip(&mut s, &build_request(&[b"INCR", b"counter"]), b":1\r\n");
+    round_trip(&mut s, &build_request(&[b"INCR", b"counter"]), b":2\r\n");
+    round_trip(
+        &mut s,
+        &build_request(&[b"INCRBY", b"counter", b"8"]),
+        b":10\r\n",
+    );
+    round_trip(
+        &mut s,
+        &build_request(&[b"DECRBY", b"counter", b"3"]),
+        b":7\r\n",
+    );
+    round_trip(&mut s, &build_request(&[b"DECR", b"counter"]), b":6\r\n");
+    round_trip(
+        &mut s,
+        &build_request(&[b"GET", b"counter"]),
+        b"$1\r\n6\r\n",
+    );
+}
+
+#[test]
+fn incr_on_non_integer_value_returns_err_and_keeps_connection() {
+    let server = spawn_server();
+    let mut s = connect(&server.addr);
+
+    round_trip(
+        &mut s,
+        &build_request(&[b"SET", b"k", b"hello"]),
+        b"+OK\r\n",
+    );
+    round_trip(
+        &mut s,
+        &build_request(&[b"INCR", b"k"]),
+        b"-ERR value is not an integer or out of range\r\n",
+    );
+    // Connection must still be usable after a command-level error.
+    round_trip(&mut s, &build_request(&[b"PING"]), b"+PONG\r\n");
+}
+
+#[test]
 fn get_missing_key_returns_null_bulk() {
     let server = spawn_server();
     let mut s = connect(&server.addr);

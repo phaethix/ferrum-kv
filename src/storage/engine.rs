@@ -125,6 +125,43 @@ impl KvEngine {
             .collect())
     }
 
+    /// Atomically adds `delta` to the integer value at `key` and returns
+    /// the new value.
+    ///
+    /// A missing key is treated as starting from zero, matching Redis'
+    /// `INCR` semantics. The existing value, if any, must be a decimal
+    /// ASCII integer that fits into an [`i64`]; values outside that range
+    /// or that fail to parse produce the Redis-standard
+    /// `-ERR value is not an integer or out of range` reply. Overflow of
+    /// the addition itself is treated the same way.
+    pub fn incr_by(&self, key: Vec<u8>, delta: i64) -> Result<i64, FerrumError> {
+        validate_key(&key)?;
+
+        let mut store = self.store.write()?;
+        let current = match store.get(key.as_slice()) {
+            Some(bytes) => {
+                let text = std::str::from_utf8(bytes).map_err(|_| {
+                    FerrumError::ParseError("value is not an integer or out of range".into())
+                })?;
+                text.parse::<i64>().map_err(|_| {
+                    FerrumError::ParseError("value is not an integer or out of range".into())
+                })?
+            }
+            None => 0,
+        };
+
+        let new_value = current.checked_add(delta).ok_or_else(|| {
+            FerrumError::ParseError("value is not an integer or out of range".into())
+        })?;
+        let serialised = new_value.to_string().into_bytes();
+
+        if let Some(aof) = &self.aof {
+            log_aof_result("INCRBY", aof.append_set(&key, &serialised));
+        }
+        store.insert(key, serialised);
+        Ok(new_value)
+    }
+
     /// Returns the value for `key`, or `None` if the key does not exist.
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, FerrumError> {
         let store = self.store.read()?;
@@ -525,6 +562,58 @@ mod tests {
             .mget(&[b"a".to_vec(), b"missing".to_vec(), b"c".to_vec()])
             .unwrap();
         assert_eq!(values, vec![Some(b"1".to_vec()), None, Some(b"3".to_vec())]);
+    }
+
+    #[test]
+    fn incr_by_initialises_missing_key_from_zero() {
+        let engine = KvEngine::new();
+        assert_eq!(engine.incr_by(b"counter".to_vec(), 1).unwrap(), 1);
+        assert_eq!(engine.incr_by(b"counter".to_vec(), 4).unwrap(), 5);
+        assert_eq!(engine.get(b"counter").unwrap(), Some(b"5".to_vec()));
+    }
+
+    #[test]
+    fn incr_by_supports_negative_delta() {
+        let engine = KvEngine::new();
+        engine.set(b"k".to_vec(), b"10".to_vec()).unwrap();
+        assert_eq!(engine.incr_by(b"k".to_vec(), -3).unwrap(), 7);
+    }
+
+    #[test]
+    fn incr_by_rejects_non_integer_value() {
+        let engine = KvEngine::new();
+        engine.set(b"k".to_vec(), b"not a number".to_vec()).unwrap();
+        let err = engine.incr_by(b"k".to_vec(), 1).unwrap_err();
+        assert!(matches!(err, FerrumError::ParseError(ref m) if m.contains("integer")));
+    }
+
+    #[test]
+    fn incr_by_reports_overflow_as_parse_error() {
+        let engine = KvEngine::new();
+        engine
+            .set(b"k".to_vec(), i64::MAX.to_string().into_bytes())
+            .unwrap();
+        let err = engine.incr_by(b"k".to_vec(), 1).unwrap_err();
+        assert!(matches!(err, FerrumError::ParseError(ref m) if m.contains("integer")));
+    }
+
+    #[test]
+    fn incr_by_persists_new_integer_to_aof() {
+        let path = tmp_aof_path("incrby");
+        let (engine, writer) = engine_with_aof(&path);
+
+        engine.incr_by(b"counter".to_vec(), 5).unwrap();
+        engine.incr_by(b"counter".to_vec(), -2).unwrap();
+        drop(engine);
+        drop(writer);
+
+        let bytes = fs::read(&path).unwrap();
+        let expected = concat!(
+            "*3\r\n$3\r\nSET\r\n$7\r\ncounter\r\n$1\r\n5\r\n",
+            "*3\r\n$3\r\nSET\r\n$7\r\ncounter\r\n$1\r\n3\r\n",
+        );
+        assert_eq!(bytes, expected.as_bytes());
+        let _ = fs::remove_file(&path);
     }
 
     #[test]
