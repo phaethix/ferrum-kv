@@ -71,6 +71,26 @@ impl KvEngine {
         Ok(previous)
     }
 
+    /// Sets `key` to `value` only if the key is not already present.
+    ///
+    /// Returns `true` when the insert happened and `false` when the key was
+    /// already set. The AOF records a `SET` only on a successful insert,
+    /// mirroring the Redis semantics of `SETNX`.
+    pub fn set_nx(&self, key: Vec<u8>, value: Vec<u8>) -> Result<bool, FerrumError> {
+        validate_key(&key)?;
+        validate_value(&value)?;
+
+        let mut store = self.store.write()?;
+        if store.contains_key(key.as_slice()) {
+            return Ok(false);
+        }
+        if let Some(aof) = &self.aof {
+            log_aof_result("SETNX", aof.append_set(&key, &value));
+        }
+        store.insert(key, value);
+        Ok(true)
+    }
+
     /// Returns the value for `key`, or `None` if the key does not exist.
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, FerrumError> {
         let store = self.store.read()?;
@@ -373,6 +393,36 @@ mod tests {
             .set(b"k".to_vec(), vec![0x00, 0xff, b'a', b'b'])
             .unwrap();
         assert_eq!(engine.strlen(b"k").unwrap(), 4);
+    }
+
+    #[test]
+    fn set_nx_inserts_when_key_is_absent() {
+        let engine = KvEngine::new();
+        assert!(engine.set_nx(b"k".to_vec(), b"v1".to_vec()).unwrap());
+        assert_eq!(engine.get(b"k").unwrap(), Some(b"v1".to_vec()));
+    }
+
+    #[test]
+    fn set_nx_is_noop_when_key_exists() {
+        let engine = KvEngine::new();
+        engine.set(b"k".to_vec(), b"original".to_vec()).unwrap();
+        assert!(!engine.set_nx(b"k".to_vec(), b"other".to_vec()).unwrap());
+        assert_eq!(engine.get(b"k").unwrap(), Some(b"original".to_vec()));
+    }
+
+    #[test]
+    fn set_nx_only_logs_successful_inserts_to_aof() {
+        let path = tmp_aof_path("setnx");
+        let (engine, writer) = engine_with_aof(&path);
+
+        assert!(engine.set_nx(b"k".to_vec(), b"v".to_vec()).unwrap());
+        assert!(!engine.set_nx(b"k".to_vec(), b"other".to_vec()).unwrap());
+        drop(engine);
+        drop(writer);
+
+        let bytes = fs::read(&path).unwrap();
+        assert_eq!(bytes, b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n");
+        let _ = fs::remove_file(&path);
     }
 
     #[test]

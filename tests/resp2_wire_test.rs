@@ -178,6 +178,27 @@ fn strlen_returns_value_byte_length() {
 }
 
 #[test]
+fn setnx_inserts_only_when_key_is_absent() {
+    let server = spawn_server();
+    let mut s = connect(&server.addr);
+
+    // First SETNX succeeds: key did not exist, reply is :1.
+    round_trip(
+        &mut s,
+        &build_request(&[b"SETNX", b"k", b"first"]),
+        b":1\r\n",
+    );
+    // Second SETNX on the same key is a no-op: reply is :0 and the
+    // original value must survive unchanged.
+    round_trip(
+        &mut s,
+        &build_request(&[b"SETNX", b"k", b"second"]),
+        b":0\r\n",
+    );
+    round_trip(&mut s, &build_request(&[b"GET", b"k"]), b"$5\r\nfirst\r\n");
+}
+
+#[test]
 fn get_missing_key_returns_null_bulk() {
     let server = spawn_server();
     let mut s = connect(&server.addr);

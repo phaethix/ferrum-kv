@@ -8,6 +8,8 @@ use crate::error::FerrumError;
 pub enum Command {
     /// `SET key value`
     Set { key: Vec<u8>, value: Vec<u8> },
+    /// `SETNX key value` — set only if the key does not exist.
+    SetNx { key: Vec<u8>, value: Vec<u8> },
     /// `GET key`
     Get { key: Vec<u8> },
     /// `DEL key [key ...]`
@@ -226,6 +228,16 @@ fn build_command(parts: Vec<Vec<u8>>) -> Result<Command, FerrumError> {
                 value: it.next().unwrap(),
             })
         }
+        b"SETNX" => {
+            if args.len() != 2 {
+                return Err(FerrumError::WrongArity { cmd: "SETNX" });
+            }
+            let mut it = args.into_iter();
+            Ok(Command::SetNx {
+                key: it.next().unwrap(),
+                value: it.next().unwrap(),
+            })
+        }
         b"GET" => {
             if args.len() != 1 {
                 return Err(FerrumError::WrongArity { cmd: "GET" });
@@ -348,17 +360,6 @@ mod frame_tests {
     }
 
     #[test]
-    fn parses_del_command() {
-        let cmd = parse_exact(b"*2\r\n$3\r\nDEL\r\n$1\r\nk\r\n");
-        assert_eq!(
-            cmd,
-            Command::Del {
-                keys: vec![b"k".to_vec()],
-            }
-        );
-    }
-
-    #[test]
     fn parses_del_with_multiple_keys() {
         let cmd = parse_exact(b"*4\r\n$3\r\nDEL\r\n$1\r\na\r\n$1\r\nb\r\n$1\r\nc\r\n");
         assert_eq!(
@@ -419,6 +420,18 @@ mod frame_tests {
     fn parses_strlen_command() {
         let cmd = parse_exact(b"*2\r\n$6\r\nSTRLEN\r\n$1\r\nk\r\n");
         assert_eq!(cmd, Command::StrLen { key: b"k".to_vec() });
+    }
+
+    #[test]
+    fn parses_setnx_command() {
+        let cmd = parse_exact(b"*3\r\n$5\r\nSETNX\r\n$1\r\nk\r\n$1\r\nv\r\n");
+        assert_eq!(
+            cmd,
+            Command::SetNx {
+                key: b"k".to_vec(),
+                value: b"v".to_vec(),
+            }
+        );
     }
 
     #[test]

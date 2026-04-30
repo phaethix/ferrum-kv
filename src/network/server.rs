@@ -116,6 +116,11 @@ pub fn execute_command(cmd: Command, engine: &KvEngine, out: &mut Vec<u8>) {
             Ok(_) => encoder::encode_simple_string(out, "OK"),
             Err(e) => write_ferrum_error(out, &e),
         },
+        Command::SetNx { key, value } => match engine.set_nx(key, value) {
+            Ok(true) => encoder::encode_integer(out, 1),
+            Ok(false) => encoder::encode_integer(out, 0),
+            Err(e) => write_ferrum_error(out, &e),
+        },
         Command::Get { key } => match engine.get(&key) {
             Ok(Some(v)) => encoder::encode_bulk_string(out, &v),
             Ok(None) => encoder::encode_null_bulk(out),
