@@ -14,7 +14,7 @@ pub const DEFAULT_ADDR: &str = "127.0.0.1:6380";
 pub const USAGE: &str = concat!(
     "usage: ferrum-kv [--addr HOST:PORT] [--aof-path PATH]\n",
     "                 [--appendfsync always|everysec|no]\n",
-    "                 [--client-timeout SECONDS]"
+    "                 [--client-timeout SECONDS] [--maxclients N]"
 );
 
 /// Outcome of parsing `argv`.
@@ -36,6 +36,9 @@ pub struct CliArgs {
     /// Per-connection idle timeout. `None` (CLI value `0`) disables the
     /// timeout entirely, matching Redis' `timeout 0`.
     client_timeout: Option<Duration>,
+    /// Concurrent client connection cap. `None` means "take the default";
+    /// the value `0` explicitly disables the limit.
+    max_clients: Option<usize>,
 }
 
 impl CliArgs {
@@ -46,6 +49,7 @@ impl CliArgs {
         let mut aof_path: Option<PathBuf> = None;
         let mut appendfsync: Option<FsyncPolicy> = None;
         let mut client_timeout: Option<Duration> = None;
+        let mut max_clients: Option<usize> = None;
 
         while let Some(arg) = iter.next() {
             match arg.as_str() {
@@ -75,6 +79,14 @@ impl CliArgs {
                         .ok_or_else(|| "--client-timeout requires a value".to_string())?;
                     client_timeout = parse_timeout_seconds(&value)?;
                 }
+                "--maxclients" => {
+                    let value = iter
+                        .next()
+                        .ok_or_else(|| "--maxclients requires a value".to_string())?;
+                    max_clients = Some(value.parse().map_err(|_| {
+                        format!("invalid --maxclients: '{value}' is not a non-negative integer")
+                    })?);
+                }
                 "-h" | "--help" => return Ok(Invocation::Help),
                 other => return Err(format!("unrecognised argument: '{other}'")),
             }
@@ -89,6 +101,7 @@ impl CliArgs {
             aof_path,
             appendfsync,
             client_timeout,
+            max_clients,
         }))
     }
 
@@ -102,6 +115,11 @@ impl CliArgs {
     /// Returns the idle timeout applied to every accepted connection, if any.
     pub fn client_timeout(&self) -> Option<Duration> {
         self.client_timeout
+    }
+
+    /// Returns the `max_clients` override if the user supplied one.
+    pub fn max_clients(&self) -> Option<usize> {
+        self.max_clients
     }
 }
 
@@ -218,5 +236,26 @@ mod tests {
     fn client_timeout_rejects_negative() {
         let err = parse(&["--client-timeout", "-1"]).unwrap_err();
         assert!(err.contains("--client-timeout"));
+    }
+
+    #[test]
+    fn max_clients_defaults_to_none() {
+        assert!(parse_run(&[]).max_clients().is_none());
+    }
+
+    #[test]
+    fn max_clients_positive_is_parsed() {
+        assert_eq!(parse_run(&["--maxclients", "128"]).max_clients(), Some(128));
+    }
+
+    #[test]
+    fn max_clients_zero_means_unlimited() {
+        assert_eq!(parse_run(&["--maxclients", "0"]).max_clients(), Some(0));
+    }
+
+    #[test]
+    fn max_clients_rejects_non_integer() {
+        let err = parse(&["--maxclients", "many"]).unwrap_err();
+        assert!(err.contains("--maxclients"));
     }
 }

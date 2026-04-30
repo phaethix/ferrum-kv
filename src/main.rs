@@ -58,10 +58,18 @@ fn main() -> ExitCode {
 
     let server_config = ServerConfig {
         client_timeout: args.client_timeout(),
+        max_clients: args
+            .max_clients()
+            .unwrap_or_else(|| ServerConfig::default().max_clients),
     };
     match server_config.client_timeout {
         Some(d) => eprintln!("[INFO] client idle timeout: {}s", d.as_secs()),
         None => eprintln!("[INFO] client idle timeout: disabled"),
+    }
+    if server_config.max_clients == 0 {
+        eprintln!("[INFO] maxclients: unlimited");
+    } else {
+        eprintln!("[INFO] maxclients: {}", server_config.max_clients);
     }
 
     if let Err(e) =

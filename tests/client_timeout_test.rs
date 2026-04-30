@@ -22,6 +22,7 @@ fn idle_connection_is_closed_after_client_timeout() {
 
     let config = ServerConfig {
         client_timeout: Some(Duration::from_millis(300)),
+        ..ServerConfig::default()
     };
 
     let _server = thread::spawn(move || {

@@ -1,5 +1,7 @@
 use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -29,18 +31,90 @@ const READ_CHUNK: usize = 8 * 1024;
 /// Defaults are intentionally permissive so that unit tests and casual users
 /// do not need to supply a config at all. Production deployments override the
 /// fields they care about through CLI flags or the configuration file.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ServerConfig {
     /// Per-connection idle timeout. When `Some(d)`, a client that neither
     /// sends nor receives any bytes for `d` is closed. `None` disables the
     /// timeout, matching Redis' `timeout 0` semantics.
     pub client_timeout: Option<Duration>,
+    /// Maximum number of concurrently accepted client connections.
+    ///
+    /// `0` disables the limit entirely. Matches Redis' `maxclients` default.
+    pub max_clients: usize,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            client_timeout: None,
+            max_clients: 10_000,
+        }
+    }
 }
 
 impl ServerConfig {
     /// Convenience constructor used by tests that want explicit defaults.
     pub fn new() -> Self {
         Self::default()
+    }
+}
+
+/// RAII counter that tracks the number of in-flight client connections.
+///
+/// The accept loop calls [`ConnCounter::try_acquire`] for every newly accepted
+/// socket; on success it hands the returned guard to the worker thread. When
+/// the worker finishes (normally or via panic) the guard is dropped and the
+/// count is decremented — so even a panicking handler cannot leak a slot.
+#[derive(Clone, Default)]
+struct ConnCounter {
+    active: Arc<AtomicUsize>,
+}
+
+impl ConnCounter {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// Attempts to reserve a slot; returns `None` when `max_clients` would be
+    /// exceeded. `max == 0` disables the limit.
+    fn try_acquire(&self, max: usize) -> Option<ConnGuard> {
+        if max == 0 {
+            self.active.fetch_add(1, Ordering::SeqCst);
+            return Some(ConnGuard {
+                active: Arc::clone(&self.active),
+            });
+        }
+        // Compare-and-swap loop: only bump the counter when it stays within
+        // the cap, so a racing acceptor cannot push us over the limit.
+        let mut current = self.active.load(Ordering::SeqCst);
+        loop {
+            if current >= max {
+                return None;
+            }
+            match self.active.compare_exchange(
+                current,
+                current + 1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => {
+                    return Some(ConnGuard {
+                        active: Arc::clone(&self.active),
+                    });
+                }
+                Err(observed) => current = observed,
+            }
+        }
+    }
+}
+
+struct ConnGuard {
+    active: Arc<AtomicUsize>,
+}
+
+impl Drop for ConnGuard {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -283,15 +357,31 @@ pub fn run_listener(
     shutdown: Shutdown,
     config: ServerConfig,
 ) -> Result<(), FerrumError> {
+    let counter = ConnCounter::new();
+
     for stream in listener.incoming() {
         if shutdown.is_triggered() {
             break;
         }
         match stream {
-            Ok(stream) => {
+            Ok(mut stream) => {
                 if shutdown.is_triggered() {
                     break;
                 }
+                let Some(guard) = counter.try_acquire(config.max_clients) else {
+                    let peer = stream
+                        .peer_addr()
+                        .map(|a| a.to_string())
+                        .unwrap_or_else(|_| "<unknown>".into());
+                    eprintln!(
+                        "[WARN] rejecting {peer}: max_clients={} reached",
+                        config.max_clients
+                    );
+                    let mut out = Vec::with_capacity(64);
+                    encoder::encode_error(&mut out, "ERR max number of clients reached");
+                    let _ = stream.write_all(&out);
+                    continue;
+                };
                 let engine = engine.clone();
                 let shutdown = shutdown.clone();
                 let config = config.clone();
@@ -299,6 +389,7 @@ pub fn run_listener(
                     if let Err(e) = handle_client(stream, engine, shutdown, config) {
                         eprintln!("[ERROR] client handler error: {e}");
                     }
+                    drop(guard);
                 });
             }
             Err(e) => {
