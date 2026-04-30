@@ -1,8 +1,12 @@
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
+use std::time::Duration;
 
 use crate::error::FerrumError;
+use crate::network::shutdown::Shutdown;
 use crate::protocol::encoder;
 use crate::protocol::parser::{self, Command, FrameParse};
 use crate::storage::engine::KvEngine;
@@ -22,6 +26,98 @@ const READ_BUF_MAX: usize = 16 * 1024 * 1024;
 /// Size of each `read()` scratch buffer.
 const READ_CHUNK: usize = 8 * 1024;
 
+/// Tunable per-server runtime knobs.
+///
+/// Defaults are intentionally permissive so that unit tests and casual users
+/// do not need to supply a config at all. Production deployments override the
+/// fields they care about through CLI flags or the configuration file.
+#[derive(Debug, Clone)]
+pub struct ServerConfig {
+    /// Per-connection idle timeout. When `Some(d)`, a client that neither
+    /// sends nor receives any bytes for `d` is closed. `None` disables the
+    /// timeout, matching Redis' `timeout 0` semantics.
+    pub client_timeout: Option<Duration>,
+    /// Maximum number of concurrently accepted client connections.
+    ///
+    /// `0` disables the limit entirely. Matches Redis' `maxclients` default.
+    pub max_clients: usize,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            client_timeout: None,
+            max_clients: 10_000,
+        }
+    }
+}
+
+impl ServerConfig {
+    /// Convenience constructor used by tests that want explicit defaults.
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+/// RAII counter that tracks the number of in-flight client connections.
+///
+/// The accept loop calls [`ConnCounter::try_acquire`] for every newly accepted
+/// socket; on success it hands the returned guard to the worker thread. When
+/// the worker finishes (normally or via panic) the guard is dropped and the
+/// count is decremented — so even a panicking handler cannot leak a slot.
+#[derive(Clone, Default)]
+struct ConnCounter {
+    active: Arc<AtomicUsize>,
+}
+
+impl ConnCounter {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// Attempts to reserve a slot; returns `None` when `max_clients` would be
+    /// exceeded. `max == 0` disables the limit.
+    fn try_acquire(&self, max: usize) -> Option<ConnGuard> {
+        if max == 0 {
+            self.active.fetch_add(1, Ordering::SeqCst);
+            return Some(ConnGuard {
+                active: Arc::clone(&self.active),
+            });
+        }
+        // Compare-and-swap loop: only bump the counter when it stays within
+        // the cap, so a racing acceptor cannot push us over the limit.
+        let mut current = self.active.load(Ordering::SeqCst);
+        loop {
+            if current >= max {
+                return None;
+            }
+            match self.active.compare_exchange(
+                current,
+                current + 1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => {
+                    return Some(ConnGuard {
+                        active: Arc::clone(&self.active),
+                    });
+                }
+                Err(observed) => current = observed,
+            }
+        }
+    }
+}
+
+struct ConnGuard {
+    active: Arc<AtomicUsize>,
+}
+
+impl Drop for ConnGuard {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 /// Handles a single client connection using the RESP2 protocol.
 ///
 /// Bytes are read into a per-connection buffer and fed to [`parser::parse_frame`]
@@ -29,18 +125,41 @@ const READ_CHUNK: usize = 8 * 1024;
 /// its reply is written back using the RESP2 encoders. Partial frames remain
 /// in the buffer until the next `read` fills them in, so requests that span
 /// multiple packets are handled transparently.
-fn handle_client(mut stream: TcpStream, engine: KvEngine) -> Result<(), FerrumError> {
+fn handle_client(
+    mut stream: TcpStream,
+    engine: KvEngine,
+    shutdown: Shutdown,
+    config: ServerConfig,
+) -> Result<(), FerrumError> {
     let peer = stream.peer_addr()?;
     eprintln!("[INFO] Client connected: {peer}");
+
+    // Apply idle timeouts, if configured. A failure here is logged but not
+    // fatal: the connection can still function, just without the timeout.
+    if let Some(timeout) = config.client_timeout {
+        if let Err(e) = stream.set_read_timeout(Some(timeout)) {
+            eprintln!("[WARN] set_read_timeout failed for {peer}: {e}");
+        }
+        if let Err(e) = stream.set_write_timeout(Some(timeout)) {
+            eprintln!("[WARN] set_write_timeout failed for {peer}: {e}");
+        }
+    }
 
     let mut inbuf: Vec<u8> = Vec::with_capacity(READ_BUF_INITIAL);
     let mut chunk = [0u8; READ_CHUNK];
     let mut outbuf: Vec<u8> = Vec::with_capacity(256);
 
     loop {
+        if shutdown.is_triggered() {
+            break;
+        }
         let n = match stream.read(&mut chunk) {
             Ok(0) => break, // Orderly EOF: client closed the connection.
             Ok(n) => n,
+            Err(e) if is_timeout(&e) => {
+                eprintln!("[INFO] {peer} idle timeout, closing connection");
+                return Ok(());
+            }
             Err(e) => {
                 eprintln!("[ERROR] read failed for {peer}: {e}");
                 return Err(e.into());
@@ -96,6 +215,16 @@ fn handle_client(mut stream: TcpStream, engine: KvEngine) -> Result<(), FerrumEr
 
     eprintln!("[INFO] Client disconnected: {peer}");
     Ok(())
+}
+
+/// Returns `true` when a `read`/`write` I/O error is the kind produced by an
+/// expired [`TcpStream`] timeout.
+///
+/// Platforms disagree on which `ErrorKind` a blocking-socket timeout surfaces
+/// as: Linux reports `WouldBlock`, macOS and Windows prefer `TimedOut`. We
+/// treat both as the same signal so callers do not have to care.
+fn is_timeout(err: &std::io::Error) -> bool {
+    matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut)
 }
 
 /// Executes a parsed command against the engine and appends its RESP2 reply
@@ -205,10 +334,16 @@ fn write_ferrum_error(out: &mut Vec<u8>, err: &FerrumError) {
 ///
 /// Each accepted connection is handled on a separate thread that shares the
 /// same [`KvEngine`] instance.
-pub fn start(addr: &str, engine: KvEngine) -> Result<(), FerrumError> {
+pub fn start(
+    addr: &str,
+    engine: KvEngine,
+    shutdown: Shutdown,
+    config: ServerConfig,
+) -> Result<(), FerrumError> {
     let listener = TcpListener::bind(addr)?;
-    eprintln!("[INFO] FerrumKV listening on {addr}");
-    run_listener(listener, engine)
+    let local = listener.local_addr()?;
+    eprintln!("[INFO] FerrumKV listening on {local}");
+    run_listener(listener, engine, shutdown, config)
 }
 
 /// Runs the accept loop on an already-bound [`TcpListener`].
@@ -216,15 +351,45 @@ pub fn start(addr: &str, engine: KvEngine) -> Result<(), FerrumError> {
 /// Split out from [`start`] so that tests (and future embeddings) can bind
 /// their own listener — for example to port `0` to obtain an OS-assigned
 /// ephemeral port — and drive the server from there.
-pub fn run_listener(listener: TcpListener, engine: KvEngine) -> Result<(), FerrumError> {
+pub fn run_listener(
+    listener: TcpListener,
+    engine: KvEngine,
+    shutdown: Shutdown,
+    config: ServerConfig,
+) -> Result<(), FerrumError> {
+    let counter = ConnCounter::new();
+
     for stream in listener.incoming() {
+        if shutdown.is_triggered() {
+            break;
+        }
         match stream {
-            Ok(stream) => {
+            Ok(mut stream) => {
+                if shutdown.is_triggered() {
+                    break;
+                }
+                let Some(guard) = counter.try_acquire(config.max_clients) else {
+                    let peer = stream
+                        .peer_addr()
+                        .map(|a| a.to_string())
+                        .unwrap_or_else(|_| "<unknown>".into());
+                    eprintln!(
+                        "[WARN] rejecting {peer}: max_clients={} reached",
+                        config.max_clients
+                    );
+                    let mut out = Vec::with_capacity(64);
+                    encoder::encode_error(&mut out, "ERR max number of clients reached");
+                    let _ = stream.write_all(&out);
+                    continue;
+                };
                 let engine = engine.clone();
+                let shutdown = shutdown.clone();
+                let config = config.clone();
                 thread::spawn(move || {
-                    if let Err(e) = handle_client(stream, engine) {
+                    if let Err(e) = handle_client(stream, engine, shutdown, config) {
                         eprintln!("[ERROR] client handler error: {e}");
                     }
+                    drop(guard);
                 });
             }
             Err(e) => {
@@ -233,5 +398,6 @@ pub fn run_listener(listener: TcpListener, engine: KvEngine) -> Result<(), Ferru
         }
     }
 
+    eprintln!("[INFO] accept loop exiting");
     Ok(())
 }
