@@ -24,7 +24,7 @@ pub const USAGE: &str = concat!(
     "                 [--appendfsync always|everysec|no]\n",
     "                 [--client-timeout SECONDS] [--maxclients N]\n",
     "                 [--maxmemory BYTES] [--maxmemory-policy POLICY]\n",
-    "                 [--maxmemory-samples N]\n",
+    "                 [--maxmemory-samples N] [--io-threads N]\n",
     "                 [--loglevel off|error|warn|info|debug|trace]"
 );
 
@@ -60,6 +60,9 @@ pub struct CliArgs {
     max_memory_policy: Option<EvictionPolicy>,
     /// How many random candidates each eviction round considers.
     max_memory_samples: Option<usize>,
+    /// Number of tokio worker threads; `0` (unset) asks tokio for the
+    /// default (usually one per logical CPU).
+    io_threads: Option<usize>,
 }
 
 /// Raw, un-merged values taken verbatim from the command line.
@@ -81,6 +84,7 @@ struct RawFlags {
     max_memory: Option<u64>,
     max_memory_policy: Option<EvictionPolicy>,
     max_memory_samples: Option<usize>,
+    io_threads: Option<usize>,
     /// Whether AOF was explicitly enabled via the config file's `appendonly yes`.
     /// CLI `--aof-path` implies enabled; this field only carries the file's
     /// intent so that a later merge step can decide.
@@ -92,7 +96,7 @@ impl CliArgs {
     pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Invocation, String> {
         let raw = match scan_argv(args)? {
             ScanOutcome::Help => return Ok(Invocation::Help),
-            ScanOutcome::Flags(f) => f,
+            ScanOutcome::Flags(f) => *f,
         };
 
         let file_cfg = if let Some(path) = raw.config_path.as_deref() {
@@ -127,6 +131,12 @@ impl CliArgs {
         self.loglevel.as_deref()
     }
 
+    /// Returns the explicit tokio worker thread count. `None` means
+    /// "let tokio pick", which is what most deployments want.
+    pub fn io_threads(&self) -> Option<usize> {
+        self.io_threads
+    }
+
     /// Returns the resolved eviction configuration. Defaults (unlimited
     /// memory, `noeviction`, 5 samples) apply when neither CLI nor config
     /// file specifies a value.
@@ -142,7 +152,7 @@ impl CliArgs {
 
 enum ScanOutcome {
     Help,
-    Flags(RawFlags),
+    Flags(Box<RawFlags>),
 }
 
 /// First pass: walk `argv` and record every flag we recognise without
@@ -210,12 +220,18 @@ fn scan_argv<I: IntoIterator<Item = String>>(args: I) -> Result<ScanOutcome, Str
                     format!("invalid --maxmemory-samples: '{value}' is not a non-negative integer")
                 })?);
             }
+            "--io-threads" => {
+                let value = take_value(&mut iter, "--io-threads")?;
+                raw.io_threads = Some(value.parse().map_err(|_| {
+                    format!("invalid --io-threads: '{value}' is not a non-negative integer")
+                })?);
+            }
             "-h" | "--help" => return Ok(ScanOutcome::Help),
             other => return Err(format!("unrecognised argument: '{other}'")),
         }
     }
 
-    Ok(ScanOutcome::Flags(raw))
+    Ok(ScanOutcome::Flags(Box::new(raw)))
 }
 
 /// Merges `raw` flags with an optional [`FileConfig`], applying defaults for
@@ -278,6 +294,7 @@ fn merge(raw: RawFlags, file: Option<&FileConfig>) -> Result<CliArgs, String> {
     let max_memory_samples = raw
         .max_memory_samples
         .or_else(|| file.and_then(|f| f.max_memory_samples));
+    let io_threads = raw.io_threads.or_else(|| file.and_then(|f| f.io_threads));
 
     Ok(CliArgs {
         addr,
@@ -289,6 +306,7 @@ fn merge(raw: RawFlags, file: Option<&FileConfig>) -> Result<CliArgs, String> {
         max_memory,
         max_memory_policy,
         max_memory_samples,
+        io_threads,
     })
 }
 
@@ -648,5 +666,36 @@ mod tests {
         assert_eq!(cfg.max_memory, 2 * 1024 * 1024);
         assert_eq!(cfg.policy, EvictionPolicy::AllKeysLru);
         assert_eq!(cfg.samples, 3);
+    }
+
+    #[test]
+    fn io_threads_defaults_to_none() {
+        assert!(parse_run(&[]).io_threads().is_none());
+    }
+
+    #[test]
+    fn io_threads_flag_is_parsed() {
+        assert_eq!(parse_run(&["--io-threads", "4"]).io_threads(), Some(4));
+        assert_eq!(parse_run(&["--io-threads", "0"]).io_threads(), Some(0));
+    }
+
+    #[test]
+    fn io_threads_rejects_non_integer() {
+        let err = parse(&["--io-threads", "lots"]).unwrap_err();
+        assert!(err.contains("--io-threads"));
+    }
+
+    #[test]
+    fn io_threads_from_config_file() {
+        let conf = TempConf::new("io-threads", "io-threads 8\n");
+        let args = parse_run(&["--config", conf.path.to_str().unwrap()]);
+        assert_eq!(args.io_threads(), Some(8));
+    }
+
+    #[test]
+    fn cli_io_threads_overrides_config_file() {
+        let conf = TempConf::new("io-threads-override", "io-threads 8\n");
+        let args = parse_run(&["--config", conf.path.to_str().unwrap(), "--io-threads", "2"]);
+        assert_eq!(args.io_threads(), Some(2));
     }
 }

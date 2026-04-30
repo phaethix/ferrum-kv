@@ -89,7 +89,7 @@ fn main() -> ExitCode {
         max_clients: args
             .max_clients()
             .unwrap_or_else(|| ServerConfig::default().max_clients),
-        worker_threads: 0,
+        worker_threads: args.io_threads().unwrap_or(0),
     };
     match server_config.client_timeout {
         Some(d) => info!("client idle timeout: {}s", d.as_secs()),
@@ -99,6 +99,11 @@ fn main() -> ExitCode {
         info!("maxclients: unlimited");
     } else {
         info!("maxclients: {}", server_config.max_clients);
+    }
+    if server_config.worker_threads == 0 {
+        info!("io-threads: auto (one per logical CPU)");
+    } else {
+        info!("io-threads: {}", server_config.worker_threads);
     }
 
     let expire_handle = expire::spawn(engine.clone(), shutdown.clone());

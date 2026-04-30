@@ -53,3 +53,10 @@ loglevel info
 
 # How many random candidates to inspect per eviction round (Redis default: 5).
 # maxmemory-samples 5
+
+# ---- Runtime -------------------------------------------------------
+# Number of tokio worker threads driving accept/read/write loops.
+# 0 (or unset) means "one per logical CPU", which is the right default
+# for most deployments. Bump it higher only if you are pinning other
+# workloads to specific cores and want to cap FerrumKV's share.
+# io-threads 0

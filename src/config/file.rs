@@ -42,6 +42,9 @@ pub struct FileConfig {
     pub max_memory_policy: Option<EvictionPolicy>,
     /// Number of keys inspected per eviction round.
     pub max_memory_samples: Option<usize>,
+    /// Number of tokio worker threads. `0` (or unset) lets the runtime
+    /// pick a sensible default (usually the logical CPU count).
+    pub io_threads: Option<usize>,
 }
 
 /// Error type for configuration file parsing.
@@ -179,6 +182,9 @@ fn apply_directive(cfg: &mut FileConfig, key: &str, value: &str) -> Result<(), S
         }
         "maxmemory-samples" => {
             cfg.max_memory_samples = Some(parse_usize(value, "maxmemory-samples")?);
+        }
+        "io-threads" => {
+            cfg.io_threads = Some(parse_usize(value, "io-threads")?);
         }
         other => return Err(format!("unknown directive '{other}'")),
     }
@@ -388,5 +394,12 @@ mod tests {
             parse("maxmemory-samples 12\n").unwrap().max_memory_samples,
             Some(12),
         );
+    }
+
+    #[test]
+    fn io_threads_is_parsed() {
+        assert_eq!(parse("io-threads 4\n").unwrap().io_threads, Some(4));
+        assert_eq!(parse("io-threads 0\n").unwrap().io_threads, Some(0));
+        assert!(parse("io-threads nope\n").is_err());
     }
 }
