@@ -33,7 +33,7 @@ flowchart TB
     subgraph ProcessLayer ["⚙️ Processing Pipeline"]
         direction LR
         Parser["RESP2 Parser (Array of Bulk Strings)"]
-        Exec("Command Executor (SET/GET/DEL/EXISTS/PING/DBSIZE/FLUSHDB)")
+        Exec("Command Executor")
         Encoder["RESP2 Encoder (+OK / $n / :n / -ERR)"]
 
         Parser -->|"yield command"| Exec
@@ -108,17 +108,25 @@ redis-cli -p 6380
 
 All commands are spoken over **RESP2** (the same wire protocol as Redis), so any Redis client works out of the box.
 
-| Command              | Description                              | RESP2 Response                        |
-|----------------------|------------------------------------------|----------------------------------------|
-| `SET key value`      | Store a key-value pair                   | `+OK`                                  |
-| `GET key`            | Retrieve value by key                    | Bulk string, or nil (`$-1`)            |
-| `DEL key [key ...]`  | Delete one or more keys                  | `:N` — number of keys actually deleted |
-| `EXISTS key [key ...]` | Count how many of the given keys exist  | `:N`                                   |
-| `PING [message]`     | Health check (echoes `message` if given) | `+PONG` or bulk string                 |
-| `DBSIZE`             | Return number of keys                    | `:N`                                   |
-| `FLUSHDB`            | Remove all keys                          | `+OK`                                  |
+| Command                   | Description                                                  | RESP2 Response                            |
+|---------------------------|--------------------------------------------------------------|--------------------------------------------|
+| `SET key value`           | Store a key-value pair                                       | `+OK`                                      |
+| `SETNX key value`         | Store only if the key does not already exist                 | `:1` on insert, `:0` when the key exists   |
+| `GET key`                 | Retrieve value by key                                        | Bulk string, or nil (`$-1`)                |
+| `MSET k v [k v ...]`      | Atomically set every key-value pair                          | `+OK`                                      |
+| `MGET key [key ...]`      | Return every value in order; missing keys serialise as nil   | Array of bulk / nil                        |
+| `APPEND key value`        | Append bytes to the value at `key`, creating it if absent    | `:N` — new byte length                    |
+| `STRLEN key`              | Return the byte length of the value at `key` (0 if missing)  | `:N`                                       |
+| `INCR key` / `DECR key`   | Atomically add ±1 to the integer value at `key`              | `:N` — new value                           |
+| `INCRBY key delta`        | Atomically add a signed delta                                | `:N` — new value                           |
+| `DECRBY key delta`        | Atomically subtract a signed delta                           | `:N` — new value                           |
+| `DEL key [key ...]`       | Delete one or more keys                                      | `:N` — number of keys actually deleted    |
+| `EXISTS key`              | Check whether a key exists                                   | `:0` or `:1`                               |
+| `PING [message]`          | Health check (echoes `message` if given)                     | `+PONG` or bulk string                     |
+| `DBSIZE`                  | Return number of keys                                        | `:N`                                       |
+| `FLUSHDB`                 | Remove all keys                                              | `+OK`                                      |
 
-Command names are **case-insensitive**.
+Command names are **case-insensitive**. `INCR` / `DECR` / `INCRBY` / `DECRBY` treat a missing key as `0` and reply with `-ERR value is not an integer or out of range` if the stored value does not parse as a signed 64-bit integer.
 
 ### Binary Safety
 
@@ -148,6 +156,7 @@ Fsync policies follow Redis semantics:
 - [x] Unified error handling with `Result` propagation
 - [x] RESP2 protocol (binary-safe, compatible with `redis-cli`)
 - [x] AOF persistence with configurable fsync + replay on startup
+- [x] String-family commands (`MSET` / `MGET` / `APPEND` / `STRLEN` / `SETNX` / `INCR*` / `DECR*`)
 - [ ] Graceful shutdown (SIGINT / SIGTERM) + structured logging
 - [ ] TTL (key expiration) & memory eviction (LRU / LFU / AHE)
 - [ ] Async I/O (Tokio)

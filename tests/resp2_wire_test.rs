@@ -125,6 +125,144 @@ fn set_get_del_exists_roundtrip() {
 }
 
 #[test]
+fn del_with_multiple_keys_returns_removed_count() {
+    let server = spawn_server();
+    let mut s = connect(&server.addr);
+
+    round_trip(&mut s, &build_request(&[b"SET", b"a", b"1"]), b"+OK\r\n");
+    round_trip(&mut s, &build_request(&[b"SET", b"b", b"2"]), b"+OK\r\n");
+    // Two of the three keys exist, so DEL returns :2 and the missing key is
+    // ignored without affecting the tally.
+    round_trip(
+        &mut s,
+        &build_request(&[b"DEL", b"a", b"missing", b"b"]),
+        b":2\r\n",
+    );
+    round_trip(&mut s, &build_request(&[b"DBSIZE"]), b":0\r\n");
+}
+
+#[test]
+fn append_creates_and_extends_value() {
+    let server = spawn_server();
+    let mut s = connect(&server.addr);
+
+    round_trip(
+        &mut s,
+        &build_request(&[b"APPEND", b"k", b"hello "]),
+        b":6\r\n",
+    );
+    round_trip(
+        &mut s,
+        &build_request(&[b"APPEND", b"k", b"world"]),
+        b":11\r\n",
+    );
+    round_trip(
+        &mut s,
+        &build_request(&[b"GET", b"k"]),
+        b"$11\r\nhello world\r\n",
+    );
+}
+
+#[test]
+fn strlen_returns_value_byte_length() {
+    let server = spawn_server();
+    let mut s = connect(&server.addr);
+
+    round_trip(&mut s, &build_request(&[b"STRLEN", b"k"]), b":0\r\n");
+    round_trip(
+        &mut s,
+        &build_request(&[b"SET", b"k", b"hello"]),
+        b"+OK\r\n",
+    );
+    round_trip(&mut s, &build_request(&[b"STRLEN", b"k"]), b":5\r\n");
+}
+
+#[test]
+fn setnx_inserts_only_when_key_is_absent() {
+    let server = spawn_server();
+    let mut s = connect(&server.addr);
+
+    // First SETNX succeeds: key did not exist, reply is :1.
+    round_trip(
+        &mut s,
+        &build_request(&[b"SETNX", b"k", b"first"]),
+        b":1\r\n",
+    );
+    // Second SETNX on the same key is a no-op: reply is :0 and the
+    // original value must survive unchanged.
+    round_trip(
+        &mut s,
+        &build_request(&[b"SETNX", b"k", b"second"]),
+        b":0\r\n",
+    );
+    round_trip(&mut s, &build_request(&[b"GET", b"k"]), b"$5\r\nfirst\r\n");
+}
+
+#[test]
+fn mset_then_mget_returns_array_with_order_preserved() {
+    let server = spawn_server();
+    let mut s = connect(&server.addr);
+
+    round_trip(
+        &mut s,
+        &build_request(&[b"MSET", b"a", b"1", b"b", b"2"]),
+        b"+OK\r\n",
+    );
+    // MGET on two keys that exist and one that does not: the missing entry
+    // must serialise as a null bulk (`$-1`) while the others are ordinary
+    // bulks, preserving the request order.
+    round_trip(
+        &mut s,
+        &build_request(&[b"MGET", b"a", b"missing", b"b"]),
+        b"*3\r\n$1\r\n1\r\n$-1\r\n$1\r\n2\r\n",
+    );
+}
+
+#[test]
+fn incr_and_decr_round_trip_on_integer_keys() {
+    let server = spawn_server();
+    let mut s = connect(&server.addr);
+
+    round_trip(&mut s, &build_request(&[b"INCR", b"counter"]), b":1\r\n");
+    round_trip(&mut s, &build_request(&[b"INCR", b"counter"]), b":2\r\n");
+    round_trip(
+        &mut s,
+        &build_request(&[b"INCRBY", b"counter", b"8"]),
+        b":10\r\n",
+    );
+    round_trip(
+        &mut s,
+        &build_request(&[b"DECRBY", b"counter", b"3"]),
+        b":7\r\n",
+    );
+    round_trip(&mut s, &build_request(&[b"DECR", b"counter"]), b":6\r\n");
+    round_trip(
+        &mut s,
+        &build_request(&[b"GET", b"counter"]),
+        b"$1\r\n6\r\n",
+    );
+}
+
+#[test]
+fn incr_on_non_integer_value_returns_err_and_keeps_connection() {
+    let server = spawn_server();
+    let mut s = connect(&server.addr);
+
+    round_trip(
+        &mut s,
+        &build_request(&[b"SET", b"k", b"hello"]),
+        b"+OK\r\n",
+    );
+    round_trip(
+        &mut s,
+        &build_request(&[b"INCR", b"k"]),
+        b"-ERR value is not an integer or out of range\r\n",
+    );
+    // Connection must still be usable after a command-level error.
+    round_trip(&mut s, &build_request(&[b"PING"]), b"+PONG\r\n");
+}
+
+#[test]
 fn get_missing_key_returns_null_bulk() {
     let server = spawn_server();
     let mut s = connect(&server.addr);

@@ -71,6 +71,97 @@ impl KvEngine {
         Ok(previous)
     }
 
+    /// Sets `key` to `value` only if the key is not already present.
+    ///
+    /// Returns `true` when the insert happened and `false` when the key was
+    /// already set. The AOF records a `SET` only on a successful insert,
+    /// mirroring the Redis semantics of `SETNX`.
+    pub fn set_nx(&self, key: Vec<u8>, value: Vec<u8>) -> Result<bool, FerrumError> {
+        validate_key(&key)?;
+        validate_value(&value)?;
+
+        let mut store = self.store.write()?;
+        if store.contains_key(key.as_slice()) {
+            return Ok(false);
+        }
+        if let Some(aof) = &self.aof {
+            log_aof_result("SETNX", aof.append_set(&key, &value));
+        }
+        store.insert(key, value);
+        Ok(true)
+    }
+
+    /// Sets every `(key, value)` pair in `pairs` atomically.
+    ///
+    /// Each pair is validated before any mutation happens, so either the
+    /// whole batch is applied or none of it is. The AOF log records the
+    /// batch in a single write so concurrent appenders never observe a
+    /// half-committed MSET.
+    pub fn mset(&self, pairs: Vec<(Vec<u8>, Vec<u8>)>) -> Result<(), FerrumError> {
+        for (k, v) in &pairs {
+            validate_key(k)?;
+            validate_value(v)?;
+        }
+
+        let mut store = self.store.write()?;
+        if let Some(aof) = &self.aof {
+            log_aof_result("MSET", aof.append_set_many(&pairs));
+        }
+        for (k, v) in pairs {
+            store.insert(k, v);
+        }
+        Ok(())
+    }
+
+    /// Returns the stored value for every key in `keys`, preserving order.
+    ///
+    /// Missing keys map to `None` so the caller can serialise them as
+    /// null bulk strings without ambiguity.
+    pub fn mget(&self, keys: &[Vec<u8>]) -> Result<Vec<Option<Vec<u8>>>, FerrumError> {
+        let store = self.store.read()?;
+        Ok(keys
+            .iter()
+            .map(|k| store.get(k.as_slice()).cloned())
+            .collect())
+    }
+
+    /// Atomically adds `delta` to the integer value at `key` and returns
+    /// the new value.
+    ///
+    /// A missing key is treated as starting from zero, matching Redis'
+    /// `INCR` semantics. The existing value, if any, must be a decimal
+    /// ASCII integer that fits into an [`i64`]; values outside that range
+    /// or that fail to parse produce the Redis-standard
+    /// `-ERR value is not an integer or out of range` reply. Overflow of
+    /// the addition itself is treated the same way.
+    pub fn incr_by(&self, key: Vec<u8>, delta: i64) -> Result<i64, FerrumError> {
+        validate_key(&key)?;
+
+        let mut store = self.store.write()?;
+        let current = match store.get(key.as_slice()) {
+            Some(bytes) => {
+                let text = std::str::from_utf8(bytes).map_err(|_| {
+                    FerrumError::ParseError("value is not an integer or out of range".into())
+                })?;
+                text.parse::<i64>().map_err(|_| {
+                    FerrumError::ParseError("value is not an integer or out of range".into())
+                })?
+            }
+            None => 0,
+        };
+
+        let new_value = current.checked_add(delta).ok_or_else(|| {
+            FerrumError::ParseError("value is not an integer or out of range".into())
+        })?;
+        let serialised = new_value.to_string().into_bytes();
+
+        if let Some(aof) = &self.aof {
+            log_aof_result("INCRBY", aof.append_set(&key, &serialised));
+        }
+        store.insert(key, serialised);
+        Ok(new_value)
+    }
+
     /// Returns the value for `key`, or `None` if the key does not exist.
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, FerrumError> {
         let store = self.store.read()?;
@@ -87,6 +178,33 @@ impl KvEngine {
         Ok(existed)
     }
 
+    /// Deletes every key in `keys` and returns the count of keys that
+    /// actually existed.
+    ///
+    /// The write lock is held for the entire batch so the operation is
+    /// atomic from an observer's point of view: concurrent readers see
+    /// either all deletions or none of them. Persisted log records are
+    /// appended only for keys that were actually removed, mirroring
+    /// Redis' behaviour.
+    pub fn del_many(&self, keys: &[Vec<u8>]) -> Result<usize, FerrumError> {
+        if keys.is_empty() {
+            return Ok(0);
+        }
+        let mut store = self.store.write()?;
+        let mut removed: Vec<&[u8]> = Vec::with_capacity(keys.len());
+        for key in keys {
+            if store.remove(key.as_slice()).is_some() {
+                removed.push(key.as_slice());
+            }
+        }
+        if let Some(aof) = &self.aof {
+            for key in &removed {
+                log_aof_result("DEL", aof.append_del(key));
+            }
+        }
+        Ok(removed.len())
+    }
+
     /// Returns `true` if `key` exists.
     pub fn exists(&self, key: &[u8]) -> Result<bool, FerrumError> {
         let store = self.store.read()?;
@@ -97,6 +215,42 @@ impl KvEngine {
     pub fn dbsize(&self) -> Result<usize, FerrumError> {
         let store = self.store.read()?;
         Ok(store.len())
+    }
+
+    /// Appends `suffix` to the value at `key` and returns the new length.
+    ///
+    /// If `key` is absent, the command behaves like `SET` with an empty
+    /// initial value (the same contract as Redis). The resulting value is
+    /// subject to the usual size validation, and the AOF records the new
+    /// full value with a `SET` entry so that replay is guaranteed to
+    /// converge to the same state regardless of history.
+    pub fn append(&self, key: Vec<u8>, suffix: Vec<u8>) -> Result<usize, FerrumError> {
+        validate_key(&key)?;
+
+        let mut store = self.store.write()?;
+        let new_value = match store.get(key.as_slice()) {
+            Some(existing) => {
+                let mut buf = Vec::with_capacity(existing.len() + suffix.len());
+                buf.extend_from_slice(existing);
+                buf.extend_from_slice(&suffix);
+                buf
+            }
+            None => suffix,
+        };
+        validate_value(&new_value)?;
+
+        if let Some(aof) = &self.aof {
+            log_aof_result("APPEND", aof.append_set(&key, &new_value));
+        }
+        let new_len = new_value.len();
+        store.insert(key, new_value);
+        Ok(new_len)
+    }
+
+    /// Returns the byte length of the value at `key`, or `0` if absent.
+    pub fn strlen(&self, key: &[u8]) -> Result<usize, FerrumError> {
+        let store = self.store.read()?;
+        Ok(store.get(key).map(|v| v.len()).unwrap_or(0))
     }
 
     /// Removes all keys from the store.
@@ -208,6 +362,258 @@ mod tests {
     fn test_del_nonexistent() {
         let engine = KvEngine::new();
         assert!(!engine.del(b"missing").unwrap());
+    }
+
+    #[test]
+    fn del_many_counts_existing_keys_only() {
+        let engine = KvEngine::new();
+        engine.set(b"a".to_vec(), b"1".to_vec()).unwrap();
+        engine.set(b"b".to_vec(), b"2".to_vec()).unwrap();
+
+        let removed = engine
+            .del_many(&[b"a".to_vec(), b"missing".to_vec(), b"b".to_vec()])
+            .unwrap();
+        assert_eq!(removed, 2);
+        assert_eq!(engine.dbsize().unwrap(), 0);
+    }
+
+    #[test]
+    fn del_many_with_empty_input_returns_zero() {
+        let engine = KvEngine::new();
+        assert_eq!(engine.del_many(&[]).unwrap(), 0);
+    }
+
+    #[test]
+    fn del_many_logs_only_existing_keys_to_aof() {
+        let path = tmp_aof_path("del-many");
+        let (engine, writer) = engine_with_aof(&path);
+
+        engine.set(b"a".to_vec(), b"1".to_vec()).unwrap();
+        engine
+            .del_many(&[b"a".to_vec(), b"missing".to_vec()])
+            .unwrap();
+        drop(engine);
+        drop(writer);
+
+        let bytes = fs::read(&path).unwrap();
+        let expected = concat!(
+            "*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\n1\r\n",
+            "*2\r\n$3\r\nDEL\r\n$1\r\na\r\n",
+        );
+        assert_eq!(bytes, expected.as_bytes());
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn append_to_missing_key_creates_it() {
+        let engine = KvEngine::new();
+        let len = engine.append(b"k".to_vec(), b"hello".to_vec()).unwrap();
+        assert_eq!(len, 5);
+        assert_eq!(engine.get(b"k").unwrap(), Some(b"hello".to_vec()));
+    }
+
+    #[test]
+    fn append_extends_existing_value() {
+        let engine = KvEngine::new();
+        engine.set(b"k".to_vec(), b"hello ".to_vec()).unwrap();
+        let len = engine.append(b"k".to_vec(), b"world".to_vec()).unwrap();
+        assert_eq!(len, 11);
+        assert_eq!(engine.get(b"k").unwrap(), Some(b"hello world".to_vec()));
+    }
+
+    #[test]
+    fn append_respects_value_size_limit() {
+        let engine = KvEngine::new();
+        let big = vec![b'x'; VALUE_MAX_BYTES];
+        engine.set(b"k".to_vec(), big).unwrap();
+        let err = engine.append(b"k".to_vec(), vec![b'y']).unwrap_err();
+        assert!(matches!(err, FerrumError::ValueTooLarge { .. }));
+    }
+
+    #[test]
+    fn append_persists_final_state_to_aof() {
+        let path = tmp_aof_path("append");
+        let (engine, writer) = engine_with_aof(&path);
+
+        engine.append(b"k".to_vec(), b"hello ".to_vec()).unwrap();
+        engine.append(b"k".to_vec(), b"world".to_vec()).unwrap();
+        drop(engine);
+        drop(writer);
+
+        // Each APPEND is logged as a SET carrying the new full value so
+        // replay converges regardless of the order records are applied in.
+        let bytes = fs::read(&path).unwrap();
+        let expected = concat!(
+            "*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$6\r\nhello \r\n",
+            "*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$11\r\nhello world\r\n",
+        );
+        assert_eq!(bytes, expected.as_bytes());
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn strlen_returns_zero_for_missing_key() {
+        let engine = KvEngine::new();
+        assert_eq!(engine.strlen(b"missing").unwrap(), 0);
+    }
+
+    #[test]
+    fn strlen_counts_raw_bytes() {
+        let engine = KvEngine::new();
+        engine
+            .set(b"k".to_vec(), vec![0x00, 0xff, b'a', b'b'])
+            .unwrap();
+        assert_eq!(engine.strlen(b"k").unwrap(), 4);
+    }
+
+    #[test]
+    fn set_nx_inserts_when_key_is_absent() {
+        let engine = KvEngine::new();
+        assert!(engine.set_nx(b"k".to_vec(), b"v1".to_vec()).unwrap());
+        assert_eq!(engine.get(b"k").unwrap(), Some(b"v1".to_vec()));
+    }
+
+    #[test]
+    fn set_nx_is_noop_when_key_exists() {
+        let engine = KvEngine::new();
+        engine.set(b"k".to_vec(), b"original".to_vec()).unwrap();
+        assert!(!engine.set_nx(b"k".to_vec(), b"other".to_vec()).unwrap());
+        assert_eq!(engine.get(b"k").unwrap(), Some(b"original".to_vec()));
+    }
+
+    #[test]
+    fn set_nx_only_logs_successful_inserts_to_aof() {
+        let path = tmp_aof_path("setnx");
+        let (engine, writer) = engine_with_aof(&path);
+
+        assert!(engine.set_nx(b"k".to_vec(), b"v".to_vec()).unwrap());
+        assert!(!engine.set_nx(b"k".to_vec(), b"other".to_vec()).unwrap());
+        drop(engine);
+        drop(writer);
+
+        let bytes = fs::read(&path).unwrap();
+        assert_eq!(bytes, b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn mset_inserts_every_pair() {
+        let engine = KvEngine::new();
+        engine
+            .mset(vec![
+                (b"a".to_vec(), b"1".to_vec()),
+                (b"b".to_vec(), b"2".to_vec()),
+            ])
+            .unwrap();
+        assert_eq!(engine.get(b"a").unwrap(), Some(b"1".to_vec()));
+        assert_eq!(engine.get(b"b").unwrap(), Some(b"2".to_vec()));
+    }
+
+    #[test]
+    fn mset_rejects_batch_without_applying_any_pair() {
+        let engine = KvEngine::new();
+        engine.set(b"existing".to_vec(), b"keep".to_vec()).unwrap();
+
+        let too_big = vec![b'x'; VALUE_MAX_BYTES + 1];
+        let err = engine
+            .mset(vec![
+                (b"a".to_vec(), b"1".to_vec()),
+                (b"b".to_vec(), too_big),
+            ])
+            .unwrap_err();
+        assert!(matches!(err, FerrumError::ValueTooLarge { .. }));
+        // Neither pair made it into the store because validation happens
+        // before any mutation.
+        assert_eq!(engine.get(b"a").unwrap(), None);
+        assert_eq!(engine.get(b"b").unwrap(), None);
+        assert_eq!(engine.get(b"existing").unwrap(), Some(b"keep".to_vec()));
+    }
+
+    #[test]
+    fn mset_writes_batch_atomically_to_aof() {
+        let path = tmp_aof_path("mset");
+        let (engine, writer) = engine_with_aof(&path);
+
+        engine
+            .mset(vec![
+                (b"a".to_vec(), b"1".to_vec()),
+                (b"b".to_vec(), b"2".to_vec()),
+            ])
+            .unwrap();
+        drop(engine);
+        drop(writer);
+
+        let bytes = fs::read(&path).unwrap();
+        let expected = concat!(
+            "*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\n1\r\n",
+            "*3\r\n$3\r\nSET\r\n$1\r\nb\r\n$1\r\n2\r\n",
+        );
+        assert_eq!(bytes, expected.as_bytes());
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn mget_returns_values_in_request_order() {
+        let engine = KvEngine::new();
+        engine.set(b"a".to_vec(), b"1".to_vec()).unwrap();
+        engine.set(b"c".to_vec(), b"3".to_vec()).unwrap();
+
+        let values = engine
+            .mget(&[b"a".to_vec(), b"missing".to_vec(), b"c".to_vec()])
+            .unwrap();
+        assert_eq!(values, vec![Some(b"1".to_vec()), None, Some(b"3".to_vec())]);
+    }
+
+    #[test]
+    fn incr_by_initialises_missing_key_from_zero() {
+        let engine = KvEngine::new();
+        assert_eq!(engine.incr_by(b"counter".to_vec(), 1).unwrap(), 1);
+        assert_eq!(engine.incr_by(b"counter".to_vec(), 4).unwrap(), 5);
+        assert_eq!(engine.get(b"counter").unwrap(), Some(b"5".to_vec()));
+    }
+
+    #[test]
+    fn incr_by_supports_negative_delta() {
+        let engine = KvEngine::new();
+        engine.set(b"k".to_vec(), b"10".to_vec()).unwrap();
+        assert_eq!(engine.incr_by(b"k".to_vec(), -3).unwrap(), 7);
+    }
+
+    #[test]
+    fn incr_by_rejects_non_integer_value() {
+        let engine = KvEngine::new();
+        engine.set(b"k".to_vec(), b"not a number".to_vec()).unwrap();
+        let err = engine.incr_by(b"k".to_vec(), 1).unwrap_err();
+        assert!(matches!(err, FerrumError::ParseError(ref m) if m.contains("integer")));
+    }
+
+    #[test]
+    fn incr_by_reports_overflow_as_parse_error() {
+        let engine = KvEngine::new();
+        engine
+            .set(b"k".to_vec(), i64::MAX.to_string().into_bytes())
+            .unwrap();
+        let err = engine.incr_by(b"k".to_vec(), 1).unwrap_err();
+        assert!(matches!(err, FerrumError::ParseError(ref m) if m.contains("integer")));
+    }
+
+    #[test]
+    fn incr_by_persists_new_integer_to_aof() {
+        let path = tmp_aof_path("incrby");
+        let (engine, writer) = engine_with_aof(&path);
+
+        engine.incr_by(b"counter".to_vec(), 5).unwrap();
+        engine.incr_by(b"counter".to_vec(), -2).unwrap();
+        drop(engine);
+        drop(writer);
+
+        let bytes = fs::read(&path).unwrap();
+        let expected = concat!(
+            "*3\r\n$3\r\nSET\r\n$7\r\ncounter\r\n$1\r\n5\r\n",
+            "*3\r\n$3\r\nSET\r\n$7\r\ncounter\r\n$1\r\n3\r\n",
+        );
+        assert_eq!(bytes, expected.as_bytes());
+        let _ = fs::remove_file(&path);
     }
 
     #[test]

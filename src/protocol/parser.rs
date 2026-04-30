@@ -8,14 +8,27 @@ use crate::error::FerrumError;
 pub enum Command {
     /// `SET key value`
     Set { key: Vec<u8>, value: Vec<u8> },
+    /// `SETNX key value` — set only if the key does not exist.
+    SetNx { key: Vec<u8>, value: Vec<u8> },
+    /// `MSET key value [key value ...]`
+    MSet { pairs: Vec<(Vec<u8>, Vec<u8>)> },
+    /// `MGET key [key ...]`
+    MGet { keys: Vec<Vec<u8>> },
+    /// `INCR`, `DECR`, `INCRBY`, `DECRBY` — all share the same shape of
+    /// atomically adding a signed delta to the integer value at `key`.
+    IncrBy { key: Vec<u8>, delta: i64 },
     /// `GET key`
     Get { key: Vec<u8> },
-    /// `DEL key`
-    Del { key: Vec<u8> },
+    /// `DEL key [key ...]`
+    Del { keys: Vec<Vec<u8>> },
     /// `EXISTS key`
     Exists { key: Vec<u8> },
     /// `PING [message]`
     Ping { msg: Option<Vec<u8>> },
+    /// `APPEND key value`
+    Append { key: Vec<u8>, value: Vec<u8> },
+    /// `STRLEN key`
+    StrLen { key: Vec<u8> },
     /// `DBSIZE`, which returns the number of keys.
     DbSize,
     /// `FLUSHDB`, which removes all keys.
@@ -222,6 +235,73 @@ fn build_command(parts: Vec<Vec<u8>>) -> Result<Command, FerrumError> {
                 value: it.next().unwrap(),
             })
         }
+        b"SETNX" => {
+            if args.len() != 2 {
+                return Err(FerrumError::WrongArity { cmd: "SETNX" });
+            }
+            let mut it = args.into_iter();
+            Ok(Command::SetNx {
+                key: it.next().unwrap(),
+                value: it.next().unwrap(),
+            })
+        }
+        b"MSET" => {
+            if args.is_empty() || !args.len().is_multiple_of(2) {
+                return Err(FerrumError::WrongArity { cmd: "MSET" });
+            }
+            let mut pairs = Vec::with_capacity(args.len() / 2);
+            let mut it = args.into_iter();
+            while let Some(k) = it.next() {
+                let v = it.next().expect("args length is even");
+                pairs.push((k, v));
+            }
+            Ok(Command::MSet { pairs })
+        }
+        b"MGET" => {
+            if args.is_empty() {
+                return Err(FerrumError::WrongArity { cmd: "MGET" });
+            }
+            Ok(Command::MGet { keys: args })
+        }
+        b"INCR" => {
+            if args.len() != 1 {
+                return Err(FerrumError::WrongArity { cmd: "INCR" });
+            }
+            Ok(Command::IncrBy {
+                key: args.into_iter().next().unwrap(),
+                delta: 1,
+            })
+        }
+        b"DECR" => {
+            if args.len() != 1 {
+                return Err(FerrumError::WrongArity { cmd: "DECR" });
+            }
+            Ok(Command::IncrBy {
+                key: args.into_iter().next().unwrap(),
+                delta: -1,
+            })
+        }
+        b"INCRBY" => {
+            if args.len() != 2 {
+                return Err(FerrumError::WrongArity { cmd: "INCRBY" });
+            }
+            let mut it = args.into_iter();
+            let key = it.next().unwrap();
+            let delta = parse_integer_argument(&it.next().unwrap(), "INCRBY")?;
+            Ok(Command::IncrBy { key, delta })
+        }
+        b"DECRBY" => {
+            if args.len() != 2 {
+                return Err(FerrumError::WrongArity { cmd: "DECRBY" });
+            }
+            let mut it = args.into_iter();
+            let key = it.next().unwrap();
+            let raw = parse_integer_argument(&it.next().unwrap(), "DECRBY")?;
+            let delta = raw.checked_neg().ok_or(FerrumError::ParseError(
+                "value is not an integer or out of range".into(),
+            ))?;
+            Ok(Command::IncrBy { key, delta })
+        }
         b"GET" => {
             if args.len() != 1 {
                 return Err(FerrumError::WrongArity { cmd: "GET" });
@@ -231,12 +311,10 @@ fn build_command(parts: Vec<Vec<u8>>) -> Result<Command, FerrumError> {
             })
         }
         b"DEL" => {
-            if args.len() != 1 {
+            if args.is_empty() {
                 return Err(FerrumError::WrongArity { cmd: "DEL" });
             }
-            Ok(Command::Del {
-                key: args.into_iter().next().unwrap(),
-            })
+            Ok(Command::Del { keys: args })
         }
         b"EXISTS" => {
             if args.len() != 1 {
@@ -253,6 +331,24 @@ fn build_command(parts: Vec<Vec<u8>>) -> Result<Command, FerrumError> {
             }),
             _ => Err(FerrumError::WrongArity { cmd: "PING" }),
         },
+        b"APPEND" => {
+            if args.len() != 2 {
+                return Err(FerrumError::WrongArity { cmd: "APPEND" });
+            }
+            let mut it = args.into_iter();
+            Ok(Command::Append {
+                key: it.next().unwrap(),
+                value: it.next().unwrap(),
+            })
+        }
+        b"STRLEN" => {
+            if args.len() != 1 {
+                return Err(FerrumError::WrongArity { cmd: "STRLEN" });
+            }
+            Ok(Command::StrLen {
+                key: args.into_iter().next().unwrap(),
+            })
+        }
         b"DBSIZE" => {
             if !args.is_empty() {
                 return Err(FerrumError::WrongArity { cmd: "DBSIZE" });
@@ -274,6 +370,19 @@ fn build_command(parts: Vec<Vec<u8>>) -> Result<Command, FerrumError> {
 /// Returns the ASCII-uppercased copy of `bytes`; non-ASCII bytes are preserved.
 fn ascii_uppercase(bytes: &[u8]) -> Vec<u8> {
     bytes.iter().map(|b| b.to_ascii_uppercase()).collect()
+}
+
+/// Parses a RESP bulk string argument as a signed 64-bit integer.
+///
+/// Used by commands such as `INCRBY` / `DECRBY` whose delta is supplied on
+/// the wire as a decimal ASCII number. Non-numeric payloads and values that
+/// do not fit into an [`i64`] map to the Redis-standard error message so
+/// clients get a stable response regardless of the specific failure cause.
+fn parse_integer_argument(bytes: &[u8], _cmd: &'static str) -> Result<i64, FerrumError> {
+    let text = std::str::from_utf8(bytes)
+        .map_err(|_| FerrumError::ParseError("value is not an integer or out of range".into()))?;
+    text.parse::<i64>()
+        .map_err(|_| FerrumError::ParseError("value is not an integer or out of range".into()))
 }
 
 #[cfg(test)]
@@ -328,9 +437,14 @@ mod frame_tests {
     }
 
     #[test]
-    fn parses_del_command() {
-        let cmd = parse_exact(b"*2\r\n$3\r\nDEL\r\n$1\r\nk\r\n");
-        assert_eq!(cmd, Command::Del { key: b"k".to_vec() });
+    fn parses_del_with_multiple_keys() {
+        let cmd = parse_exact(b"*4\r\n$3\r\nDEL\r\n$1\r\na\r\n$1\r\nb\r\n$1\r\nc\r\n");
+        assert_eq!(
+            cmd,
+            Command::Del {
+                keys: vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()],
+            }
+        );
     }
 
     #[test]
@@ -365,6 +479,119 @@ mod frame_tests {
     fn parses_dbsize_and_flushdb() {
         assert_eq!(parse_exact(b"*1\r\n$6\r\nDBSIZE\r\n"), Command::DbSize);
         assert_eq!(parse_exact(b"*1\r\n$7\r\nFLUSHDB\r\n"), Command::FlushDb);
+    }
+
+    #[test]
+    fn parses_append_command() {
+        let cmd = parse_exact(b"*3\r\n$6\r\nAPPEND\r\n$1\r\nk\r\n$3\r\nabc\r\n");
+        assert_eq!(
+            cmd,
+            Command::Append {
+                key: b"k".to_vec(),
+                value: b"abc".to_vec(),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_strlen_command() {
+        let cmd = parse_exact(b"*2\r\n$6\r\nSTRLEN\r\n$1\r\nk\r\n");
+        assert_eq!(cmd, Command::StrLen { key: b"k".to_vec() });
+    }
+
+    #[test]
+    fn parses_setnx_command() {
+        let cmd = parse_exact(b"*3\r\n$5\r\nSETNX\r\n$1\r\nk\r\n$1\r\nv\r\n");
+        assert_eq!(
+            cmd,
+            Command::SetNx {
+                key: b"k".to_vec(),
+                value: b"v".to_vec(),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_mset_command() {
+        let cmd = parse_exact(b"*5\r\n$4\r\nMSET\r\n$1\r\na\r\n$1\r\n1\r\n$1\r\nb\r\n$1\r\n2\r\n");
+        assert_eq!(
+            cmd,
+            Command::MSet {
+                pairs: vec![
+                    (b"a".to_vec(), b"1".to_vec()),
+                    (b"b".to_vec(), b"2".to_vec()),
+                ],
+            }
+        );
+    }
+
+    #[test]
+    fn mset_with_odd_argument_count_is_rejected() {
+        let (err, _) =
+            match parse_frame(b"*4\r\n$4\r\nMSET\r\n$1\r\na\r\n$1\r\n1\r\n$1\r\nb\r\n").unwrap() {
+                FrameParse::Invalid { error, consumed } => (error, consumed),
+                other => panic!("expected Invalid, got {other:?}"),
+            };
+        assert!(matches!(err, FerrumError::WrongArity { cmd: "MSET" }));
+    }
+
+    #[test]
+    fn parses_mget_command() {
+        let cmd = parse_exact(b"*3\r\n$4\r\nMGET\r\n$1\r\na\r\n$1\r\nb\r\n");
+        assert_eq!(
+            cmd,
+            Command::MGet {
+                keys: vec![b"a".to_vec(), b"b".to_vec()],
+            }
+        );
+    }
+
+    #[test]
+    fn parses_incr_and_decr_as_delta_plus_minus_one() {
+        assert_eq!(
+            parse_exact(b"*2\r\n$4\r\nINCR\r\n$1\r\nk\r\n"),
+            Command::IncrBy {
+                key: b"k".to_vec(),
+                delta: 1,
+            }
+        );
+        assert_eq!(
+            parse_exact(b"*2\r\n$4\r\nDECR\r\n$1\r\nk\r\n"),
+            Command::IncrBy {
+                key: b"k".to_vec(),
+                delta: -1,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_incrby_and_decrby_with_signed_delta() {
+        assert_eq!(
+            parse_exact(b"*3\r\n$6\r\nINCRBY\r\n$1\r\nk\r\n$2\r\n10\r\n"),
+            Command::IncrBy {
+                key: b"k".to_vec(),
+                delta: 10,
+            }
+        );
+        // DECRBY is implemented as `INCRBY -delta`, and the parser must
+        // reject a delta of `i64::MIN` because its negation overflows.
+        assert_eq!(
+            parse_exact(b"*3\r\n$6\r\nDECRBY\r\n$1\r\nk\r\n$1\r\n7\r\n"),
+            Command::IncrBy {
+                key: b"k".to_vec(),
+                delta: -7,
+            }
+        );
+    }
+
+    #[test]
+    fn incrby_with_non_integer_argument_is_invalid_frame() {
+        let (err, _) = match parse_frame(b"*3\r\n$6\r\nINCRBY\r\n$1\r\nk\r\n$3\r\nabc\r\n").unwrap()
+        {
+            FrameParse::Invalid { error, consumed } => (error, consumed),
+            other => panic!("expected Invalid, got {other:?}"),
+        };
+        assert!(matches!(err, FerrumError::ParseError(ref m) if m.contains("integer")));
     }
 
     #[test]
@@ -524,6 +751,15 @@ mod frame_tests {
         assert!(matches!(err, FerrumError::WrongArity { cmd: "SET" }));
         // The full frame was consumed so the connection can keep going.
         assert_eq!(consumed, b"*2\r\n$3\r\nSET\r\n$1\r\nk\r\n".len());
+    }
+
+    #[test]
+    fn del_without_any_key_is_wrong_arity() {
+        let (err, _) = match parse_frame(b"*1\r\n$3\r\nDEL\r\n").unwrap() {
+            FrameParse::Invalid { error, consumed } => (error, consumed),
+            other => panic!("expected Invalid, got {other:?}"),
+        };
+        assert!(matches!(err, FerrumError::WrongArity { cmd: "DEL" }));
     }
 
     #[test]

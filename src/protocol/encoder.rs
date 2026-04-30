@@ -72,6 +72,17 @@ pub fn encode_null_bulk(buf: &mut Vec<u8>) {
     buf.extend_from_slice(b"$-1\r\n");
 }
 
+/// Appends a RESP2 Array header (`*<count>\r\n`).
+///
+/// Callers follow this with exactly `count` further RESP2 elements to form a
+/// complete array reply. Used by commands such as `MGET` that return a
+/// heterogeneous sequence of bulk strings and null bulks.
+pub fn encode_array_header(buf: &mut Vec<u8>, count: usize) {
+    buf.push(b'*');
+    buf.extend_from_slice(count.to_string().as_bytes());
+    buf.extend_from_slice(b"\r\n");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -188,6 +199,20 @@ mod tests {
         let mut empty = Vec::new();
         encode_bulk_string(&mut empty, b"");
         assert_ne!(null, empty);
+    }
+
+    #[test]
+    fn array_header_basic() {
+        let mut buf = Vec::new();
+        encode_array_header(&mut buf, 3);
+        assert_eq!(buf, b"*3\r\n");
+    }
+
+    #[test]
+    fn array_header_zero() {
+        let mut buf = Vec::new();
+        encode_array_header(&mut buf, 0);
+        assert_eq!(buf, b"*0\r\n");
     }
 
     #[test]
