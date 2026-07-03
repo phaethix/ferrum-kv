@@ -463,6 +463,37 @@ impl KvEngine {
         Ok(store.values().filter(|v| !v.is_expired(now)).count())
     }
 
+    /// Returns `(expires, avg_ttl_ms)` for `INFO keyspace`, mirroring Redis.
+    ///
+    /// - `expires`: count of live keys that have a TTL (already-expired keys
+    ///   are excluded, matching `dbsize`).
+    /// - `avg_ttl_ms`: mean remaining TTL in milliseconds across those keys,
+    ///   rounded down. `0` when no keys have a TTL.
+    ///
+    /// O(n) over the dataset; acceptable since `INFO` is an infrequent
+    /// administrative command (FERRUM-002 Option B).
+    pub fn expire_stats(&self) -> Result<(usize, u64), FerrumError> {
+        let store = self.store.read()?;
+        let now = Instant::now();
+        let mut count = 0usize;
+        let mut sum_ms: u64 = 0;
+        for entry in store.values() {
+            if entry.is_expired(now) {
+                continue;
+            }
+            if let Some(deadline) = entry.expire_at
+                && let Some(remaining_ms) = deadline
+                    .checked_duration_since(now)
+                    .map(|d| d.as_millis() as u64)
+            {
+                count += 1;
+                sum_ms = sum_ms.saturating_add(remaining_ms);
+            }
+        }
+        let avg_ttl = if count == 0 { 0 } else { sum_ms / count as u64 };
+        Ok((count, avg_ttl))
+    }
+
     /// Appends `suffix` to the value at `key` and returns the new length.
     ///
     /// If `key` is absent, the command behaves like `SET` with an empty

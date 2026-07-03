@@ -2,9 +2,11 @@
 id: FERRUM-002
 title: "INFO keyspace reports expires=0 and avg_ttl=0 regardless of TTL keys"
 severity: low
-status: open
+status: fixed
 component: network
 found_date: 2026-07-02
+fixed_date: 2026-07-04
+fix_branch: fix/info-keyspace-ttl-stats
 reporter: AtomCode
 ---
 

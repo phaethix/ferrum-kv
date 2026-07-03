@@ -23,3 +23,6 @@ docs/
 
 # AtomCode per-user overrides (team-shared .atomcode.md IS committed)
 .atomcode.user.md
+
+# Codegraph analysis artifacts (SQLite DB, daemon logs, exported graphs)
+.codegraph/
