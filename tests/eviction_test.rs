@@ -286,3 +286,47 @@ fn info_stats_reports_keyspace_hits_and_misses() {
     assert!(text.contains("keyspace_hits:1"), "reply: {text}");
     assert!(text.contains("keyspace_misses:1"), "reply: {text}");
 }
+
+#[test]
+fn info_keyspace_reports_real_expire_count_and_avg_ttl() {
+    let engine = KvEngine::new();
+    let guard = spawn_server_with_engine(engine);
+    let mut stream = connect(&guard.addr);
+
+    // Two keys: k1 gets a 60s TTL, k2 has no TTL.
+    send(&mut stream, &build_request(&[b"SET", b"k1", b"v"]));
+    send(&mut stream, &build_request(&[b"SET", b"k2", b"v"]));
+    send(&mut stream, &build_request(&[b"PEXPIRE", b"k1", b"60000"]));
+
+    let reply = send(&mut stream, &build_request(&[b"INFO", b"keyspace"]));
+    let text = String::from_utf8_lossy(&reply);
+    // keys=2, expires=1, avg_ttl should be close to 60000 (allow drift).
+    assert!(text.contains("db0:keys=2,"), "reply: {text}");
+    assert!(text.contains("expires=1,"), "reply: {text}");
+    assert!(
+        text.contains("avg_ttl=59") || text.contains("avg_ttl=60"),
+        "avg_ttl should be near 60000ms, reply: {text}"
+    );
+
+    // PERSIST removes the TTL → expires should drop to 0.
+    send(&mut stream, &build_request(&[b"PERSIST", b"k1"]));
+    let reply = send(&mut stream, &build_request(&[b"INFO", b"keyspace"]));
+    let text = String::from_utf8_lossy(&reply);
+    assert!(text.contains("expires=0,"), "after PERSIST, reply: {text}");
+    assert!(text.contains("avg_ttl=0"), "after PERSIST, reply: {text}");
+}
+
+#[test]
+fn info_keyspace_reports_zero_expires_when_no_ttl_keys() {
+    let engine = KvEngine::new();
+    let guard = spawn_server_with_engine(engine);
+    let mut stream = connect(&guard.addr);
+
+    send(&mut stream, &build_request(&[b"SET", b"k", b"v"]));
+    let reply = send(&mut stream, &build_request(&[b"INFO", b"keyspace"]));
+    let text = String::from_utf8_lossy(&reply);
+    assert!(
+        text.contains("db0:keys=1,expires=0,avg_ttl=0"),
+        "reply: {text}"
+    );
+}

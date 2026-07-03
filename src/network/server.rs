@@ -423,7 +423,10 @@ fn render_info(engine: &KvEngine, section: Option<&[u8]>) -> String {
         let keys = engine.dbsize().unwrap_or(0);
         out.push_str("# Keyspace\r\n");
         if keys > 0 {
-            out.push_str(&format!("db0:keys={keys},expires=0,avg_ttl=0\r\n"));
+            let (expires, avg_ttl) = engine.expire_stats().unwrap_or((0, 0));
+            out.push_str(&format!(
+                "db0:keys={keys},expires={expires},avg_ttl={avg_ttl}\r\n"
+            ));
         }
         out.push_str("\r\n");
     }
