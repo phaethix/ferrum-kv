@@ -2,9 +2,11 @@
 id: FERRUM-001
 title: "EXISTS rejects multi-key requests (Redis incompatibility)"
 severity: medium
-status: open
+status: fixed
 component: protocol
 found_date: 2026-07-02
+fixed_date: 2026-07-04
+fix_branch: fix/exists-multi-key
 reporter: AtomCode
 ---
 

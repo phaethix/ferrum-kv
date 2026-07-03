@@ -126,6 +126,40 @@ fn set_get_del_exists_roundtrip() {
 }
 
 #[test]
+fn exists_multi_key_returns_total_count() {
+    let server = spawn_server();
+    let mut s = connect(&server.addr);
+
+    round_trip(&mut s, &build_request(&[b"SET", b"k1", b"v"]), b"+OK\r\n");
+    round_trip(&mut s, &build_request(&[b"SET", b"k3", b"v"]), b"+OK\r\n");
+    // k1 and k3 exist; k2 missing; k1 duplicated → Redis counts 3.
+    round_trip(
+        &mut s,
+        &build_request(&[b"EXISTS", b"k1", b"k2", b"k3", b"k1"]),
+        b":3\r\n",
+    );
+    // Single key still works (backward compatible).
+    round_trip(&mut s, &build_request(&[b"EXISTS", b"k3"]), b":1\r\n");
+    round_trip(&mut s, &build_request(&[b"EXISTS", b"k2"]), b":0\r\n");
+}
+
+#[test]
+fn exists_with_zero_keys_is_wrong_arity() {
+    let server = spawn_server();
+    let mut s = connect(&server.addr);
+
+    let request = build_request(&[b"EXISTS"]);
+    s.write_all(&request).expect("write");
+    let mut buf = [0u8; 64];
+    let n = s.read(&mut buf).expect("read");
+    let reply = std::str::from_utf8(&buf[..n]).unwrap();
+    assert!(
+        reply.starts_with("-ERR") && reply.contains("wrong number of arguments"),
+        "expected arity error, got: {reply}"
+    );
+}
+
+#[test]
 fn del_with_multiple_keys_returns_removed_count() {
     let server = spawn_server();
     let mut s = connect(&server.addr);
