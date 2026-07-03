@@ -108,7 +108,9 @@ redis-cli -p 16380 INFO keyspace
 ```yaml
 id: FERRUM-002
 severity: low           # observability inaccuracy, no functional/data impact
-status: open
+status: fixed           # fixed via PR #18 (fix/info-keyspace-ttl-stats @ 4e9cfcf)
 component: network      # server.rs render_info; may touch engine.rs
 found_date: 2026-07-02
+fixed_date: 2026-07-04
+fix_branch: fix/info-keyspace-ttl-stats
 ```

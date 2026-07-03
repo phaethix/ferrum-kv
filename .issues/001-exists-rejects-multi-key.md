@@ -100,7 +100,9 @@ redis-cli -p 16380 EXISTS               # expect -ERR wrong arity (unchanged)
 ```yaml
 id: FERRUM-001
 severity: medium          # functional incompatibility, no data loss
-status: open
+status: fixed             # fixed via PR #17 (fix/exists-multi-key @ c7a3f48)
 component: protocol       # parser.rs + server.rs
 found_date: 2026-07-02
+fixed_date: 2026-07-04
+fix_branch: fix/exists-multi-key
 ```
