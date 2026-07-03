@@ -103,3 +103,4 @@ the structured repro and root-cause analysis).
 | FERRUM-002 | low | open | INFO keyspace TTL counts hardcoded to zero |
 | FERRUM-003 | low | fixed | Issues README example describes non-existent bug |
 | FERRUM-004 | low | fixed | Repro scripts leave orphan server processes |
+| FERRUM-005 | low | open | engine.rs exceeds 2000 lines, mixing concerns |
