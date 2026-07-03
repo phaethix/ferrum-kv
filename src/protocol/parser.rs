@@ -21,8 +21,9 @@ pub enum Command {
     Get { key: Vec<u8> },
     /// `DEL key [key ...]`
     Del { keys: Vec<Vec<u8>> },
-    /// `EXISTS key`
-    Exists { key: Vec<u8> },
+    /// `EXISTS key [key ...]` — returns the number of keys that exist.
+    /// Duplicate keys are counted per occurrence, matching Redis semantics.
+    Exists { keys: Vec<Vec<u8>> },
     /// `PING [message]`
     Ping { msg: Option<Vec<u8>> },
     /// `APPEND key value`
@@ -336,12 +337,10 @@ fn build_command(parts: Vec<Vec<u8>>) -> Result<Command, FerrumError> {
             Ok(Command::Del { keys: args })
         }
         b"EXISTS" => {
-            if args.len() != 1 {
+            if args.is_empty() {
                 return Err(FerrumError::WrongArity { cmd: "EXISTS" });
             }
-            Ok(Command::Exists {
-                key: args.into_iter().next().unwrap(),
-            })
+            Ok(Command::Exists { keys: args })
         }
         b"PING" => match args.len() {
             0 => Ok(Command::Ping { msg: None }),
@@ -552,9 +551,35 @@ mod frame_tests {
         assert_eq!(
             cmd,
             Command::Exists {
-                key: b"name".to_vec()
+                keys: vec![b"name".to_vec()]
             }
         );
+    }
+
+    #[test]
+    fn parses_exists_with_multiple_keys() {
+        let cmd = parse_exact(b"*4\r\n$6\r\nEXISTS\r\n$2\r\nk1\r\n$2\r\nk2\r\n$2\r\nk3\r\n");
+        assert_eq!(
+            cmd,
+            Command::Exists {
+                keys: vec![b"k1".to_vec(), b"k2".to_vec(), b"k3".to_vec()]
+            }
+        );
+    }
+
+    #[test]
+    fn exists_with_zero_keys_is_wrong_arity() {
+        let result = parse_frame(b"*1\r\n$6\r\nEXISTS\r\n");
+        match result {
+            Ok(FrameParse::Invalid { error, .. }) => {
+                let msg = error.to_string();
+                assert!(
+                    msg.contains("wrong number of arguments"),
+                    "expected arity error, got: {msg}"
+                );
+            }
+            other => panic!("expected Invalid arity error, got {other:?}"),
+        }
     }
 
     #[test]

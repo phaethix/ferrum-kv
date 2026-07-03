@@ -125,7 +125,7 @@ All commands are spoken over **RESP2** (the same wire protocol as Redis), so any
 | `INCRBY key delta`        | Atomically add a signed delta                                | `:N` — new value                           |
 | `DECRBY key delta`        | Atomically subtract a signed delta                           | `:N` — new value                           |
 | `DEL key [key ...]`       | Delete one or more keys                                      | `:N` — number of keys actually deleted    |
-| `EXISTS key`              | Check whether a key exists                                   | `:0` or `:1`                               |
+| `EXISTS key [key ...]`    | Count existing keys (duplicates counted)                     | `:N`                                       |
 | `PING [message]`          | Health check (echoes `message` if given)                     | `+PONG` or bulk string                     |
 | `DBSIZE`                  | Return number of keys                                        | `:N`                                       |
 | `FLUSHDB`                 | Remove all keys                                              | `+OK`                                      |

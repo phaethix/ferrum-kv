@@ -309,9 +309,8 @@ pub fn execute_command(cmd: Command, engine: &KvEngine, out: &mut Vec<u8>) {
             Ok(n) => encoder::encode_integer(out, n as i64),
             Err(e) => write_ferrum_error(out, &e),
         },
-        Command::Exists { key } => match engine.exists(&key) {
-            Ok(true) => encoder::encode_integer(out, 1),
-            Ok(false) => encoder::encode_integer(out, 0),
+        Command::Exists { keys } => match engine.exists_many(&keys) {
+            Ok(n) => encoder::encode_integer(out, n as i64),
             Err(e) => write_ferrum_error(out, &e),
         },
         Command::Ping { msg } => match msg {

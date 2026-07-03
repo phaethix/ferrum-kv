@@ -453,6 +453,37 @@ impl KvEngine {
         }
     }
 
+    /// Counts how many of the given keys currently exist (lazily expiring
+    /// any that are past their TTL). Duplicate keys are counted per
+    /// occurrence, matching Redis `EXISTS` semantics.
+    ///
+    /// Empty input returns `0` without touching the keyspace counters.
+    pub fn exists_many(&self, keys: &[Vec<u8>]) -> Result<usize, FerrumError> {
+        if keys.is_empty() {
+            return Ok(0);
+        }
+        let mut store = self.store.write()?;
+        let now = Instant::now();
+        let mut count = 0usize;
+        for key in keys {
+            match store.get(key.as_slice()) {
+                Some(entry) if entry.is_expired(now) => {
+                    self.track_remove(&mut store, key.as_slice());
+                    self.log_expire_drop(key.as_slice());
+                    self.record_miss();
+                }
+                Some(_) => {
+                    self.record_hit();
+                    count += 1;
+                }
+                None => {
+                    self.record_miss();
+                }
+            }
+        }
+        Ok(count)
+    }
+
     /// Returns the number of keys currently stored.
     ///
     /// Already-expired keys still pending lazy cleanup are excluded so
@@ -1439,6 +1470,42 @@ mod tests {
         assert!(engine.exists(b"key").unwrap());
         engine.del(b"key").unwrap();
         assert!(!engine.exists(b"key").unwrap());
+    }
+
+    #[test]
+    fn exists_many_counts_live_keys_and_deduplicates() {
+        let engine = KvEngine::new();
+        engine.set(b"k1".to_vec(), b"v".to_vec()).unwrap();
+        engine.set(b"k3".to_vec(), b"v".to_vec()).unwrap();
+        // k1 and k3 exist; k2 missing; k1 duplicated — Redis counts
+        // duplicates, so the total is 3.
+        let keys: Vec<Vec<u8>> = vec![
+            b"k1".to_vec(),
+            b"k2".to_vec(),
+            b"k3".to_vec(),
+            b"k1".to_vec(),
+        ];
+        assert_eq!(engine.exists_many(&keys).unwrap(), 3);
+    }
+
+    #[test]
+    fn exists_many_lazily_expires_keys() {
+        let engine = KvEngine::new();
+        engine.set(b"k1".to_vec(), b"v".to_vec()).unwrap();
+        // Expire k1 in the past — it should be lazily dropped and not counted.
+        engine.expire_at_ms(b"k1", 1).unwrap();
+        assert_eq!(
+            engine
+                .exists_many(&[b"k1".to_vec(), b"k2".to_vec()])
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn exists_many_empty_input_returns_zero() {
+        let engine = KvEngine::new();
+        assert_eq!(engine.exists_many(&[]).unwrap(), 0);
     }
 
     #[test]
