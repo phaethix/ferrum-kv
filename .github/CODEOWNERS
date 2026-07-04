@@ -1,0 +1,19 @@
+# CODEOWNERS for FerrumKV
+# https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+#
+# Each line: <path pattern> @owner
+# Pull requests touching these paths auto-request review.
+
+# Default — everything not matched below
+*                        @phaethix
+
+# Core data path: binary safety and persistence invariants are sacred.
+# Extra eyes on any change here.
+/src/storage/            @phaethix
+/src/persistence/        @phaethix
+/src/protocol/           @phaethix
+
+# CI and release plumbing
+/.github/                @phaethix
+/Cargo.toml              @phaethix
+/Cargo.lock              @phaethix

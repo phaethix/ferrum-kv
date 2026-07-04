@@ -1,0 +1,63 @@
+name: ✨ Feature request
+description: Suggest a new command, behaviour, or improvement
+title: "feat: <short summary>"
+labels: ["enhancement", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the suggestion! For anything larger than ~50 lines,
+        please discuss here before writing code so we can agree on scope.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What use case is not covered by the current commands?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: |
+        The command shape, arguments, and RESP2 response. If there is a
+        Redis analogue, reference it — Redis is the compatibility baseline.
+      placeholder: |
+        EXPIREAT key unix-time-seconds
+        -> :1 on success, :0 if key missing
+        (Redis: https://redis.io/commands/expireat/)
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Workarounds today, and why they fall short.
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      options:
+        - protocol (RESP2 parser/encoder)
+        - network (TCP, shutdown, timeout)
+        - storage (KvEngine, eviction)
+        - persistence (AOF writer/replay)
+        - expire (TTL/PEXPIRE/sweeper)
+        - config (cli flags, config file)
+        - error (FerrumError messages)
+        - ci (build/test pipeline)
+        - docs (README, comments)
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: willing
+    attributes:
+      label: Willing to implement?
+      options:
+        - label: I am willing to submit a PR for this feature
+          required: false
