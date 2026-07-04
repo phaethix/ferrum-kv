@@ -1,0 +1,20 @@
+# FerrumKV — Cursor Rules
+#
+# The canonical AI collaboration rules for this project live in CLAUDE.md.
+# Read that file in full before making any changes. It is AI-agnostic and
+# applies to every assistant including Cursor.
+#
+# Key invariants, restated for visibility:
+#
+# - Never push directly to master. All changes go through a PR.
+# - Commit messages in English, Conventional Commits format, imperative
+#   subject <= 72 chars, body wrapped at 72 columns explaining what/why.
+# - PR body must contain: Summary, What changed, Why, Compatibility/risk,
+#   Verification, Issue references.
+# - Run `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
+#   `cargo check`, `cargo test --all-targets` before declaring done.
+# - Keys/values are Vec<u8> — binary-safe, never assume UTF-8.
+# - One concern per PR; rebase (don't merge-commit) when syncing with master.
+#
+# See CLAUDE.md for the full rationale, examples, and the complete
+# hard-rules list.
