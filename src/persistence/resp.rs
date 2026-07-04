@@ -39,6 +39,96 @@ pub(crate) fn encode_command(parts: &[&[u8]]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::parser::{Command, FrameParse, parse_frame};
+
+    /// Decodes an AOF-encoded frame back through the wire-protocol parser and
+    /// asserts the resulting [`Command`] matches the one that produced the
+    /// bytes. This is the cross-cutting invariant flagged in FERRUM-R3: the AOF
+    /// on-disk format and the wire protocol must share identical RESP2 frame
+    /// semantics, even though replay uses a separate `read_record` (Seek +
+    /// precise `consumed`) rather than `parse_frame`.
+    fn round_trip_via_parser(parts: &[&[u8]]) -> Command {
+        let bytes = encode_command(parts);
+        match parse_frame(&bytes) {
+            Ok(FrameParse::Complete { command, consumed }) => {
+                assert_eq!(consumed, bytes.len(), "parser left trailing bytes");
+                command
+            }
+            other => panic!("parse_frame did not yield a complete command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn aof_frame_is_wire_compatible_set() {
+        let cmd = round_trip_via_parser(&[b"SET", b"name", b"ferrum"]);
+        assert_eq!(
+            cmd,
+            Command::Set {
+                key: b"name".to_vec(),
+                value: b"ferrum".to_vec()
+            }
+        );
+    }
+
+    #[test]
+    fn aof_frame_is_wire_compatible_del_multi_key() {
+        let cmd = round_trip_via_parser(&[b"DEL", b"k1", b"k2", b"k3"]);
+        assert_eq!(
+            cmd,
+            Command::Del {
+                keys: vec![b"k1".to_vec(), b"k2".to_vec(), b"k3".to_vec()]
+            }
+        );
+    }
+
+    #[test]
+    fn aof_frame_is_wire_compatible_flushdb() {
+        let cmd = round_trip_via_parser(&[b"FLUSHDB"]);
+        assert_eq!(cmd, Command::FlushDb);
+    }
+
+    #[test]
+    fn aof_frame_is_wire_compatible_mset() {
+        let cmd = round_trip_via_parser(&[b"MSET", b"a", b"1", b"b", b"2"]);
+        assert_eq!(
+            cmd,
+            Command::MSet {
+                pairs: vec![
+                    (b"a".to_vec(), b"1".to_vec()),
+                    (b"b".to_vec(), b"2".to_vec())
+                ]
+            }
+        );
+    }
+
+    #[test]
+    fn aof_frame_is_wire_compatible_binary_safe() {
+        // NUL + embedded CRLF + high bytes must survive both encode_command and
+        // parse_frame identically — the same invariant the binary_safe_* tests
+        // guard on the wire path.
+        let key: &[u8] = &[0x00, b'\r', b'\n', 0xff];
+        let value: &[u8] = &[0x80, 0x00, 0xc3, b'\r', b'\n'];
+        let cmd = round_trip_via_parser(&[b"SET", key, value]);
+        assert_eq!(
+            cmd,
+            Command::Set {
+                key: key.to_vec(),
+                value: value.to_vec()
+            }
+        );
+    }
+
+    #[test]
+    fn aof_frame_is_wire_compatible_pexpireat() {
+        let cmd = round_trip_via_parser(&[b"PEXPIREAT", b"k", b"1700000000000"]);
+        assert_eq!(
+            cmd,
+            Command::PExpireAt {
+                key: b"k".to_vec(),
+                abs_epoch_ms: 1_700_000_000_000
+            }
+        );
+    }
 
     #[test]
     fn encodes_set_command() {
