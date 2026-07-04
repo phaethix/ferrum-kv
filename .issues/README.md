@@ -104,3 +104,9 @@ the structured repro and root-cause analysis).
 | FERRUM-003 | low | fixed | Issues README example describes non-existent bug |
 | FERRUM-004 | low | fixed | Repro scripts leave orphan server processes |
 | FERRUM-005 | low | fixed | engine.rs exceeds 2000 lines, mixing concerns |
+| FERRUM-006 | medium | open | Add CONFIG SET/GET for runtime configuration |
+| FERRUM-007 | high | open | Add AUTH command and requirepass authentication |
+| FERRUM-008 | medium | open | Extract WriteGuard pipeline to eliminate write-path boilerplate |
+| FERRUM-009 | medium | open | Implement SIEVE cache eviction algorithm (NSDI'24) |
+| FERRUM-010 | medium | open | Extract EvictionPolicy trait for pluggable eviction algorithms |
+| FERRUM-011 | medium | open | Build eviction algorithm benchmark suite with standard workloads |

@@ -1,17 +1,200 @@
 # FerrumKV 🦀
 
 [![CI](https://github.com/phaethix/ferrum-kv/actions/workflows/ci.yml/badge.svg)](https://github.com/phaethix/ferrum-kv/actions/workflows/ci.yml)
-![version](https://img.shields.io/badge/version-v0.4.1-blue)
-![license](https://img.shields.io/badge/license-MIT-green)
-![PRs welcome](https://img.shields.io/badge/PRs-welcome-brightgreen)
+[![version](https://img.shields.io/badge/version-v0.5.0--dev-blue)](https://crates.io/crates/ferrum-kv)
+[![license](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
+[![PRs welcome](https://img.shields.io/badge/PRs-welcome-brightgreen)](./CONTRIBUTING.md)
 
-A lightweight, multi-threaded KV storage server written in Rust — built from scratch for systems programming practice.
+**The eviction algorithm laboratory for RESP2-compatible KV stores — and the most readable systems-programming codebase in Rust.**
+
+FerrumKV is not the fastest RESP2 server (that's [kevy](https://github.com/goliajp/kevy)). It's not the most command-complete (that's Redis). It's the one you can **understand in an afternoon**, **experiment with 10 cache eviction policies**, and **contribute to without a PhD in database internals**.
+
+---
+
+## Why FerrumKV?
+
+<table>
+<tr>
+<td width="33%">
+
+### 🧪 Eviction Algorithm Lab
+
+The only KV that ships **10 eviction policies** as first-class features — LRU, LFU, random, TTL, and our own **AHE** (Adaptive Hybrid Eviction) that blends recency, frequency, and TTL into a self-tuning score. Swap policies at runtime. Benchmark them against each other. Add your own.
+
+</td>
+<td width="33%">
+
+### 📖 Readable by Design
+
+~8,500 lines of clean, layered, well-commented Rust. No hand-bound syscalls. No custom slab allocators. No macro magic. Every module has a doc comment explaining *why*, not just *what*. If you're learning systems programming, this is the codebase you want to read.
+
+</td>
+<td width="33%">
+
+### 🔌 Embeddable Library
+
+Zero heavy dependencies. Use it as a binary (`ferrum-kv`) or as a library (`ferrum-kv = "0.5"`). Embed a RESP2-compatible cache directly into your Rust application — no external process, no port to secure, no Redis to manage.
+
+</td>
+</tr>
+</table>
+
+---
+
+## Eviction Algorithm Showcase
+
+This is where FerrumKV is unique. Pick your policy based on your workload:
+
+| Policy | Type | Recency | Frequency | TTL-Aware | Self-Tuning | Best For |
+|--------|------|---------|-----------|-----------|-------------|----------|
+| `noeviction` | — | — | — | — | — | Write-through caches, bounded datasets |
+| `allkeys-lru` | LRU | ✅ | — | — | — | Temporal locality (most web workloads) |
+| `volatile-lru` | LRU | ✅ | — | ✅ | — | Mixed TTL + recency patterns |
+| `allkeys-lfu` | LFU | — | ✅ | — | — | Stable popularity distributions |
+| `volatile-lfu` | LFU | — | ✅ | ✅ | — | TTL keys with frequency bias |
+| `allkeys-random` | Random | — | — | — | — | Uniform access (rare, but cheap) |
+| `volatile-random` | Random | — | — | ✅ | — | Quick-and-dirty TTL eviction |
+| `volatile-ttl` | TTL | — | — | ✅ | — | Shortest TTL first (session stores) |
+| **`allkeys-ahe`** ✨ | **Adaptive** | ✅ | ✅ | ✅ | ✅ | **Mixed workloads, unknown patterns** |
+| **`volatile-ahe`** ✨ | **Adaptive** | ✅ | ✅ | ✅ | ✅ | **TTL keys with shifting popularity** |
+
+> **AHE (Adaptive Hybrid Eviction)** is FerrumKV's original contribution. It computes an *Eviction Priority Score* (EPS) for each candidate key, blending three signals:
+> - **Recency** — how recently was this key accessed?
+> - **Frequency** — how often is this key accessed? (Morris probabilistic counter)
+> - **TTL urgency** — how close is this key to expiring naturally?
+>
+> The weight between recency and frequency (`α`) adapts automatically based on the observed hit ratio. Read the [AHE whitepaper](./docs/whitepaper.md) for the full design.
+
+```bash
+# Try different policies on the same workload:
+ferrum-kv --maxmemory 256mb --maxmemory-policy allkeys-lru
+ferrum-kv --maxmemory 256mb --maxmemory-policy allkeys-ahe
+ferrum-kv --maxmemory 256mb --maxmemory-policy volatile-ttl
+```
+
+---
+
+## Code Tour (30 seconds)
+
+The entire server request path, from TCP byte to TCP response, fits in your head:
+
+```rust
+// src/network/server.rs — the hot path, simplified
+async fn handle_client(stream: TcpStream, engine: KvEngine) {
+    let mut buf = Vec::new();
+    loop {
+        // 1. Read bytes from the wire
+        let n = stream.read_buf(&mut buf).await?;
+
+        // 2. Parse one complete RESP2 frame
+        let (cmd, consumed) = parser::parse_frame(&buf)?;
+        buf.drain(..consumed);
+
+        // 3. Execute the command against the engine
+        let result = execute_command(&engine, cmd);
+
+        // 4. Encode the result as RESP2 and flush
+        let resp = encoder::encode(&result);
+        stream.write_all(&resp).await?;
+    }
+}
+```
+
+Every module follows this pattern — one concern, one file, clear boundaries:
+
+```
+src/
+├── main.rs              # entry point, signal handlers
+├── cli.rs               # argument parsing + config merging
+├── protocol/
+│   ├── parser.rs        # incremental RESP2 frame parser
+│   └── encoder.rs       # RESP2 response encoder
+├── network/
+│   ├── server.rs        # accept loop, handle_client, command dispatch
+│   └── shutdown.rs      # graceful shutdown (SIGINT/SIGTERM)
+├── storage/
+│   ├── engine/          # KvEngine — the core hash map + command API
+│   ├── eviction.rs      # 10 eviction policies + AHE algorithm
+│   └── expire.rs        # background TTL sweeper
+├── persistence/
+│   ├── writer.rs        # AOF append + fsync policies
+│   └── replay.rs        # AOF replay on startup
+├── config/              # Redis-style config file parser
+└── error/               # unified FerrumError (9 variants)
+```
+
+**You can read this codebase end-to-end in an afternoon.** That's the point.
+
+---
+
+## Quick Start
+
+```bash
+# Build and run (in-memory, no persistence)
+cargo build --release
+./target/release/ferrum-kv
+
+# With AOF persistence + eviction
+./target/release/ferrum-kv \
+  --aof-path /tmp/ferrum.aof \
+  --maxmemory 256mb \
+  --maxmemory-policy allkeys-ahe
+
+# Talk to it with any Redis client
+redis-cli -p 6380
+```
+
+```
+redis-cli -p 6380> SET user:1000 '{"name":"Alice"}'
+OK
+redis-cli -p 6380> GET user:1000
+{"name":"Alice"}
+redis-cli -p 6380> EXPIRE user:1000 3600
+(integer) 1
+redis-cli -p 6380> INFO memory
+# Memory
+used_memory:184
+maxmemory:268435456
+ahe_alpha:0.62
+...
+```
+
+### CLI Flags (essentials)
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--addr HOST:PORT` | `127.0.0.1:6380` | Listening address |
+| `--aof-path PATH` | *(disabled)* | Enable AOF persistence |
+| `--appendfsync POLICY` | `everysec` | `always` / `everysec` / `no` |
+| `--maxmemory BYTES` | `0` (unlimited) | Memory cap with optional suffix: `512b`, `64kb`, `256mb`, `1gb` |
+| `--maxmemory-policy POLICY` | `noeviction` | Any of the 10 policies above |
+| `--maxmemory-samples N` | `5` | Candidates inspected per eviction |
+| `--io-threads N` | `0` (auto) | Tokio worker thread count |
+
+For all flags: `ferrum-kv --help`. Redis-style config file: see [`ferrum.conf.example`](./ferrum.conf.example).
+
+---
+
+## Benchmarks
+
+Apple M5 (10 cores), 32GB RAM, loopback, `redis-benchmark -n 100000 -c 50`:
+
+| Scenario | SET QPS | GET QPS | p50 Latency |
+|----------|---------|---------|-------------|
+| Baseline (no eviction) | 62,189 | 65,231 | 0.42ms |
+| Pipelined (`-P 16`) | 350,877 | 378,787 | 1.06ms |
+| LFU eviction (16MB cap) | 57,339 | 61,690 | 0.42ms |
+| AHE eviction (16MB cap) | 59,559 | 50,787 | 0.42ms |
+| 500 concurrent clients | 50,301 | 43,440 | 5.87ms |
+
+Full benchmark report: [`benches/redis-benchmark.md`](./benches/redis-benchmark.md).
+
+---
 
 ## Architecture
 
 ```mermaid
 flowchart TB
-    %% 1. Global Tailwind Colors
     classDef runtime fill:#f8fafc,stroke:#94a3b8,stroke-width:2px,color:#334155,stroke-dasharray: 5 5
     classDef engine fill:#eff6ff,stroke:#3b82f6,stroke-width:2px,color:#1e3a8a
     classDef entity fill:#fef2f2,stroke:#ef4444,stroke-width:2px,color:#7f1d1d
@@ -19,13 +202,11 @@ flowchart TB
     classDef config fill:#faf5ff,stroke:#a855f7,stroke-width:2px,color:#581c87
     classDef ext fill:#fff7ed,stroke:#ea580c,stroke-width:2px,color:#9a3412
 
-    %% 2. External Clients
     subgraph ClientLayer ["🌐 External Input"]
         direction LR
         Client[/"redis-cli / any RESP2 client"/]
     end
 
-    %% 3. Network & Concurrency
     subgraph NetLayer ["🔌 Network & Concurrency"]
         direction LR
         Listener(("TcpListener (Port 6380)"))
@@ -34,7 +215,6 @@ flowchart TB
         Listener -->|"accept connection"| WorkerThread
     end
 
-    %% 4. Command Processing Pipeline
     subgraph ProcessLayer ["⚙️ Processing Pipeline"]
         direction LR
         Parser["RESP2 Parser (Array of Bulk Strings)"]
@@ -45,7 +225,6 @@ flowchart TB
         Exec -->|"return result"| Encoder
     end
 
-    %% 5. Storage Engine
     subgraph StoreLayer ["💾 Storage Layer"]
         direction LR
         Engine[("KvEngine")]
@@ -54,7 +233,6 @@ flowchart TB
         Engine -->|"manages"| State
     end
 
-    %% 6. Persistence Layer
     subgraph PersistLayer ["🗄️ Persistence (AOF)"]
         direction LR
         AofWriter["AofWriter (Mutex<File>)"]
@@ -65,7 +243,6 @@ flowchart TB
         AofFile -->|"restore on boot"| Replay
     end
 
-    %% 7. Cross-System Data Flow
     ClientLayer == "TCP Stream" === NetLayer
     WorkerThread -.->|"delegates stream"| ProcessLayer
     ProcessLayer == "read & write data" === StoreLayer
@@ -73,7 +250,6 @@ flowchart TB
     Replay -.->|"apply commands"| Engine
     Encoder -.->|"flush to socket"| Client
 
-    %% 8. Apply Styles
     class ClientLayer,NetLayer,ProcessLayer,StoreLayer,PersistLayer runtime
     class Client ext
     class Listener,WorkerThread engine
@@ -82,135 +258,97 @@ flowchart TB
     class State,AofFile config
 ```
 
-## Quick Start
-
-```bash
-# Build
-cargo build --release
-
-# Run without persistence (in-memory only)
-cargo run --release
-
-# Run with AOF persistence (survives restarts)
-cargo run --release -- --aof-path /tmp/ferrum.aof
-
-# Run with explicit fsync policy: always | everysec (default) | no
-cargo run --release -- --aof-path /tmp/ferrum.aof --appendfsync always
-
-# Connect with the official Redis CLI
-redis-cli -p 6380
-```
-
-### CLI Flags
-
-| Flag | Default | Description |
-|---|---|---|
-| `--addr HOST:PORT` | `127.0.0.1:6380` | Listening address |
-| `--aof-path PATH` | *(disabled)* | Enables AOF persistence at the given path |
-| `--appendfsync POLICY` | `everysec` | Fsync policy when AOF is enabled (`always` / `everysec` / `no`) |
-| `--io-threads N` | `0` (= CPU count) | Tokio worker thread pool size |
-
-## Supported Commands
-
-All commands are spoken over **RESP2** (the same wire protocol as Redis), so any Redis client works out of the box.
-
-| Command                   | Description                                                  | RESP2 Response                            |
-|---------------------------|--------------------------------------------------------------|--------------------------------------------|
-| `SET key value`           | Store a key-value pair                                       | `+OK`                                      |
-| `SETNX key value`         | Store only if the key does not already exist                 | `:1` on insert, `:0` when the key exists   |
-| `GET key`                 | Retrieve value by key                                        | Bulk string, or nil (`$-1`)                |
-| `MSET k v [k v ...]`      | Atomically set every key-value pair                          | `+OK`                                      |
-| `MGET key [key ...]`      | Return every value in order; missing keys serialise as nil   | Array of bulk / nil                        |
-| `APPEND key value`        | Append bytes to the value at `key`, creating it if absent    | `:N` — new byte length                    |
-| `STRLEN key`              | Return the byte length of the value at `key` (0 if missing)  | `:N`                                       |
-| `INCR key` / `DECR key`   | Atomically add ±1 to the integer value at `key`              | `:N` — new value                           |
-| `INCRBY key delta`        | Atomically add a signed delta                                | `:N` — new value                           |
-| `DECRBY key delta`        | Atomically subtract a signed delta                           | `:N` — new value                           |
-| `DEL key [key ...]`       | Delete one or more keys                                      | `:N` — number of keys actually deleted    |
-| `EXISTS key [key ...]`    | Count existing keys (duplicates counted)                     | `:N`                                       |
-| `PING [message]`          | Health check (echoes `message` if given)                     | `+PONG` or bulk string                     |
-| `DBSIZE`                  | Return number of keys                                        | `:N`                                       |
-| `FLUSHDB`                 | Remove all keys                                              | `+OK`                                      |
-
-Command names are **case-insensitive**. `INCR` / `DECR` / `INCRBY` / `DECRBY` treat a missing key as `0` and reply with `-ERR value is not an integer or out of range` if the stored value does not parse as a signed 64-bit integer.
-
-### Binary Safety
-
-Keys and values are stored as raw `Vec<u8>`, so arbitrary bytes — including `NUL`, `\r\n`, and non‑UTF‑8 sequences — round-trip unchanged through both the network layer and the AOF file.
-
-## Error Handling
-
-All operations return structured RESP2 errors (`-ERR ...`) instead of panicking:
-
-- Parse errors: `-ERR wrong number of arguments for 'SET' command`
-- Unknown commands: `-ERR unknown command 'FOOBAR'`
-- Internal errors: `-ERR internal error: lock poisoned`
-
-## Persistence (AOF)
-
-When `--aof-path` is set, every write command (`SET` / `DEL` / `FLUSHDB`) is appended to the AOF file **in RESP2 format** — the exact same bytes a client would send over the wire. On startup, FerrumKV replays the file to rebuild state; a half-written tail record is safely truncated.
-
-Fsync policies follow Redis semantics:
-
-- `always` — fsync after every write (safest, slowest)
-- `everysec` — fsync once per second on a background tick (default)
-- `no` — let the OS decide (fastest, least durable)
-
-## Testing & Benchmarks
-
-```bash
-cargo test                    # all unit + integration tests (185 unit + 9 integration suites)
-cargo bench                   # Criterion microbenchmarks (engine + RESP2 codec)
-./scripts/bench-smoke.sh      # native load generator: SET / GET / MIXED @ 100K ops
-```
-
-The GitHub Actions pipeline runs `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test`, and `cargo bench --no-run` on every push and pull request. A `redis-benchmark` smoke run against a release binary (loopback, 100K ops, 50 clients) is captured in [`benches/redis-benchmark.md`](benches/redis-benchmark.md) and refreshed at release time.
-
-## Roadmap
-
-- [x] Core KV engine (`SET` / `GET` / `DEL` / `EXISTS` / `PING` / `DBSIZE` / `FLUSHDB`)
-- [x] Unified error handling with `Result` propagation
-- [x] RESP2 protocol (binary-safe, compatible with `redis-cli`)
-- [x] AOF persistence with configurable fsync + replay on startup
-- [x] String-family commands (`MSET` / `MGET` / `APPEND` / `STRLEN` / `SETNX` / `INCR*` / `DECR*`)
-- [x] Graceful shutdown (SIGINT / SIGTERM), connection timeouts, max-connections cap
-- [x] Structured logging (`log` + `env_logger`) & Redis-style config file
-- [x] Unit / integration / concurrency tests + Criterion benchmarks + CI
-- [x] Key expiration: `EXPIRE` / `PEXPIRE` / `PEXPIREAT` / `PERSIST` / `TTL` / `PTTL` with lazy + active scanning
-- [x] Memory cap + sampled eviction: `noeviction` / `allkeys-lru` / `allkeys-lfu` / `allkeys-random` / `allkeys-ahe` / `volatile-lru` / `volatile-lfu` / `volatile-random` / `volatile-ttl` / `volatile-ahe`
-- [x] Observability: `MEMORY USAGE`, `INFO memory` (incl. `ahe_alpha`), `INFO stats` (`keyspace_hits` / `keyspace_misses`)
-- [x] Async I/O runtime on Tokio (`--io-threads`, 500-client concurrency smoke test)
+---
 
 ## Contributing
 
-Contributions are welcome! Whether you are fixing a typo, reporting a
-bug, or implementing a new command, please read
-[`CONTRIBUTING.md`](./CONTRIBUTING.md) first — it covers the fork →
-branch → quality-gates → PR workflow, Conventional Commits, branch
-naming, and the project's hard rules (binary safety, RESP2 compatibility,
-persistence invariants).
+FerrumKV is built for contributors. The codebase is small enough to understand in a day, the test suite tells you immediately if you broke something, and there's a structured path from "first PR" to "core contributor."
 
-Quick checklist before opening a pull request:
+### Good First Issues
+
+| Issue | Area | Difficulty | Skills |
+|-------|------|------------|--------|
+| [FERRUM-006](./.issues/006-config-set-get-runtime-config.md) — CONFIG SET/GET | Config + Protocol | **Beginner** | Rust enums, string parsing |
+| [FERRUM-007](./.issues/007-auth-requirepass.md) — AUTH command | Network | **Beginner** | Connection state, config |
+| [FERRUM-009](./.issues/009-implement-sieve-eviction.md) — SIEVE eviction | Storage | **Intermediate** | Algorithm implementation |
+| [FERRUM-011](./.issues/011-eviction-benchmark-suite.md) — Benchmark suite | Storage + Scripting | **Intermediate** | Workload generation, statistics |
+
+### Development Flow
 
 ```bash
-cargo fmt --all -- --check
-cargo clippy --all-targets --all-features -- -D warnings
+git clone https://github.com/phaethix/ferrum-kv.git
+cd ferrum-kv
+
+# Make your change, then run the CI gate locally:
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
 cargo test --all-targets --all-features
-cargo bench --no-run --all-features
+
+# 293 tests. Zero warnings. If it's green, it's ready for review.
 ```
 
-CI runs these on every push and PR; a PR failing any gate will not be
-merged. For non-trivial work (new commands, behaviour changes, refactors
-> ~50 lines), open an issue to discuss scope before writing code.
+Read [`CONTRIBUTING.md`](./CONTRIBUTING.md) for the full workflow, commit conventions, and review process.
 
-- 🐛 **Bug reports** → [open an issue](https://github.com/phaethix/ferrum-kv/issues/new?template=bug_report.yml)
-- ✨ **Feature requests** → [open an issue](https://github.com/phaethix/ferrum-kv/issues/new?template=feature_request.yml)
-- 💬 **Questions / design discussion** → [GitHub Discussions](https://github.com/phaethix/ferrum-kv/discussions)
-- 🔒 **Security vulnerabilities** → see [`SECURITY.md`](./SECURITY.md) — **do not** file a public issue
+### Project Values
 
-All participants are expected to uphold the
-[Code of Conduct](./CODE_OF_CONDUCT.md).
+- **Binary safety is sacred.** Keys and values are `Vec<u8>`, never assume UTF-8.
+- **No unwrap() on runtime data.** Every fallible path returns `Result<_, FerrumError>`.
+- **Tests guard invariants, not just coverage.** 293 tests exist to prevent regressions, not to hit a metric.
+- **Design decisions are documented.** See `.atomcode.md` for hard rules, `docs/whitepaper.md` for architecture rationale.
+
+---
+
+## Supported Commands
+
+All commands speak **RESP2** — any Redis client works out of the box. Command names are case-insensitive.
+
+| Command | Description | Response |
+|---------|-------------|----------|
+| `SET key value` | Store a key-value pair | `+OK` |
+| `SETNX key value` | Store only if key doesn't exist | `:1` / `:0` |
+| `GET key` | Retrieve value by key | Bulk string or nil |
+| `MSET k v [k v ...]` | Atomically set multiple pairs | `+OK` |
+| `MGET key [key ...]` | Retrieve multiple values | Array of bulk/nil |
+| `APPEND key value` | Append bytes to key's value | `:N` (new length) |
+| `STRLEN key` | Byte length of value | `:N` |
+| `INCR` / `DECR` | Increment/decrement by 1 | `:N` (new value) |
+| `INCRBY` / `DECRBY` | Increment/decrement by delta | `:N` (new value) |
+| `DEL key [key ...]` | Delete one or more keys | `:N` (deleted count) |
+| `EXISTS key [key ...]` | Count existing keys | `:N` |
+| `PING [message]` | Health check | `+PONG` or echo |
+| `DBSIZE` | Number of keys | `:N` |
+| `FLUSHDB` | Remove all keys | `+OK` |
+| `EXPIRE` / `PEXPIRE` | Set TTL in seconds/ms | `:1` / `:0` |
+| `PEXPIREAT key ms-ts` | Set absolute TTL (ms epoch) | `:1` / `:0` |
+| `PERSIST key` | Remove TTL | `:1` / `:0` |
+| `TTL` / `PTTL key` | Remaining TTL in seconds/ms | `:N` / `-1` / `-2` |
+| `MEMORY USAGE key` | Estimated memory for a key | `:N` or nil |
+| `INFO [section]` | Server metrics | Bulk string |
+
+---
+
+## What's Next
+
+FerrumKV is on a mission to be the best platform for learning and experimenting with KV store internals. Here's what's coming:
+
+| Version | Focus | Highlights |
+|---------|-------|------------|
+| **v0.5.0** | Operational readiness | CONFIG SET/GET, AUTH, SLOWLOG, AOF REWRITE, MONITOR |
+| **v0.5.1** | Eviction platform | SIEVE (NSDI'24), SIEVE-S (TTL-aware SIEVE), AdaptiveClimb, EvictionPolicy trait, benchmark suite |
+| **v0.6.0** | RESP3 protocol | `HELLO 3` handshake, typed replies, client-side caching, backward-compatible with RESP2 |
+| **v0.7.0** | Data types | List (LPUSH/RPOP/LRANGE), Hash (HSET/HGET/HGETALL), Set (SADD/SMEMBERS/SINTER) |
+
+See [`docs/product-strategy.md`](./docs/product-strategy.md) for the full roadmap and rationale.
+
+---
 
 ## License
 
 MIT — see [`LICENSE`](./LICENSE).
+
+---
+
+<p align="center">
+  <b>Built for learning. Designed for experimentation. Open for contribution.</b><br>
+  <sub>If you've ever wanted to understand how Redis works under the hood, start here.</sub>
+</p>
