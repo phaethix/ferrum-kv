@@ -1,7 +1,9 @@
 # FerrumKV 🦀
 
 [![CI](https://github.com/phaethix/ferrum-kv/actions/workflows/ci.yml/badge.svg)](https://github.com/phaethix/ferrum-kv/actions/workflows/ci.yml)
-![version](https://img.shields.io/badge/version-v0.4.0-blue)
+![version](https://img.shields.io/badge/version-v0.4.1-blue)
+![license](https://img.shields.io/badge/license-MIT-green)
+![PRs welcome](https://img.shields.io/badge/PRs-welcome-brightgreen)
 
 A lightweight, multi-threaded KV storage server written in Rust — built from scratch for systems programming practice.
 
@@ -179,6 +181,36 @@ The GitHub Actions pipeline runs `cargo fmt --check`, `cargo clippy -- -D warnin
 - [x] Observability: `MEMORY USAGE`, `INFO memory` (incl. `ahe_alpha`), `INFO stats` (`keyspace_hits` / `keyspace_misses`)
 - [x] Async I/O runtime on Tokio (`--io-threads`, 500-client concurrency smoke test)
 
+## Contributing
+
+Contributions are welcome! Whether you are fixing a typo, reporting a
+bug, or implementing a new command, please read
+[`CONTRIBUTING.md`](./CONTRIBUTING.md) first — it covers the fork →
+branch → quality-gates → PR workflow, Conventional Commits, branch
+naming, and the project's hard rules (binary safety, RESP2 compatibility,
+persistence invariants).
+
+Quick checklist before opening a pull request:
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-targets --all-features
+cargo bench --no-run --all-features
+```
+
+CI runs these on every push and PR; a PR failing any gate will not be
+merged. For non-trivial work (new commands, behaviour changes, refactors
+> ~50 lines), open an issue to discuss scope before writing code.
+
+- 🐛 **Bug reports** → [open an issue](https://github.com/phaethix/ferrum-kv/issues/new?template=bug_report.yml)
+- ✨ **Feature requests** → [open an issue](https://github.com/phaethix/ferrum-kv/issues/new?template=feature_request.yml)
+- 💬 **Questions / design discussion** → [GitHub Discussions](https://github.com/phaethix/ferrum-kv/discussions)
+- 🔒 **Security vulnerabilities** → see [`SECURITY.md`](./SECURITY.md) — **do not** file a public issue
+
+All participants are expected to uphold the
+[Code of Conduct](./CODE_OF_CONDUCT.md).
+
 ## License
 
-MIT
+MIT — see [`LICENSE`](./LICENSE).

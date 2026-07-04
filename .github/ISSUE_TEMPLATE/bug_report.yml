@@ -1,0 +1,106 @@
+name: 🐛 Bug report
+description: Report something that behaves differently from Redis or from documented FerrumKV behaviour
+title: "bug: <short symptom>"
+labels: ["bug", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug! Before you continue:
+
+        - Search [existing issues](https://github.com/phaethix/ferrum-kv/issues)
+          and the local [`.issues/`](https://github.com/phaethix/ferrum-kv/tree/master/.issues)
+          tracker — it may already be reported or a documented intentional
+          deviation (`FERRUM-NNN`).
+        - **Security vulnerabilities must NOT be filed here** — see
+          [SECURITY.md](https://github.com/phaethix/ferrum-kv/blob/master/SECURITY.md)
+          for responsible disclosure.
+
+  - type: input
+    id: version
+    attributes:
+      label: FerrumKV version
+      placeholder: "0.4.1, or git commit hash"
+    validations:
+      required: true
+
+  - type: input
+    id: redis-cli-version
+    attributes:
+      label: redis-cli version (if relevant)
+      placeholder: "redis-cli 7.2.4"
+
+  - type: textarea
+    id: start-command
+    attributes:
+      label: Server start command
+      description: The exact flags used to launch the server. AOF / fsync / io-threads flags matter.
+      placeholder: "cargo run --release -- --aof-path /tmp/ferrum.aof --appendfsync always"
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: Prefer real `redis-cli` commands over hand-crafted RESP frames.
+      placeholder: |
+        redis-cli -p 6380 SET foo bar
+        redis-cli -p 6380 APPEND foo baz
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What Redis (or the FerrumKV docs) says should happen.
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: The exact RESP2 reply FerrumKV returned, or the crash/panic trace.
+      render: shell
+    validations:
+      required: true
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      options:
+        - protocol (RESP2 parser/encoder)
+        - network (TCP, shutdown, timeout)
+        - storage (KvEngine, eviction)
+        - persistence (AOF writer/replay)
+        - expire (TTL/PEXPIRE/sweeper)
+        - config (cli flags, config file)
+        - error (FerrumError messages)
+        - ci (build/test pipeline)
+        - docs (README, comments)
+    validations:
+      required: true
+
+  - type: textarea
+    id: severity
+    attributes:
+      label: Severity & impact
+      description: |
+        Data loss / corruption / crash = critical. Core feature broken, no
+        workaround = high. Wrong output with workaround = medium. Cosmetic /
+        edge-case = low.
+      placeholder: "medium — MGET returns nil for a key that exists"
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs / backtrace
+      description: Server log output or a panic backtrace, if the server crashed.
+      render: shell
