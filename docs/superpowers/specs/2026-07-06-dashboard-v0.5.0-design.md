@@ -44,7 +44,7 @@ implementation plan.
 | 8 | SSE frame format | Standard `event: metrics\ndata: {json}\n\n` at 500ms tick; `EventSource` consumer | One combined payload per tick: metrics + eviction log snapshot + keyspace dist + RESP2 tap snapshot. Bounded payload size (ring buffers cap all). |
 | 9 | Dashboard spawn timing | Inside `block_on`, before `accept_loop`; bind failure → `warn!` + return, accept_loop runs normally | Ops-friendly: misconfigured dashboard port must not break the RESP2 server. |
 | 10 | `0.0.0.0` warning trigger | In `main.rs`, after resolving `CliArgs::dashboard_addr`, before `TcpListener::bind`: `if addr.ip().is_unspecified() { warn!("Dashboard bound to {} — no authentication is enforced", addr); }` | Spec §7. Lives in `main.rs` (not `dashboard::serve`) so it fires even when the dashboard is disabled by config — the user explicitly chose `0.0.0.0`, so warning regardless of listener spawn is correct ops behavior. §4.6 documents the same call site. |
-| 11 | Uptime source | `KvEngine` records `Instant::now()` at construction into an `Arc<AtomicU64>` (epoch millis). `uptime_secs = (now - epoch) / 1000`. | ops/s card computes `total_commands / uptime_secs`. Lifetime average per spec §3. |
+| 11 | Uptime source | `KvEngine` records `Instant::now()` at construction into an `Arc<OnceLock<Instant>>` (monotonic clock, immune to NTP/wall-clock jumps). `uptime_secs = start.get().unwrap().elapsed().as_secs()`. `Arc`-shared so all clones read the same Instant. | ops/s card computes `total_commands / uptime_secs`. Lifetime average per spec §3. Not `AtomicU64` epoch millis — `Instant` is not atomically-storable, and wall-clock epoch would jump on NTP adjusts. |
 | 12 | Command counter tick | `execute_command` (server.rs:272, free fn) entry: `engine.tick_command();`. Includes invalid commands (an op is an op). | Spec §3 "ops/s". Atomic, lock-free. `tick_command` is a thin `&self` method on `KvEngine` wrapping `self.commands.fetch_add(1, Relaxed)` — see §4.7. `execute_command` is not a method so cannot use `self.` directly. |
 | 13 | Eviction counter tick | `enforce_memory_limit`: after the bounded loop, single `self.evictions.fetch_add(evicted, Relaxed)` with the loop's local `evicted` count. | One atomic per sweep, not per victim. Avoids hot-path atomic contention inside the eviction loop. |
 | 14 | Bench gate | `resp2_bench.rs`: `dashboard_tap_inactive_zero_overhead` group. Control = no dashboard spawn. Experiment = dashboard spawned, no connection. Assert `delta < 1%`. | Spec §9 success metric "±1%". Criterion group, runs in CI via `cargo bench --no-run` + local full bench. |
@@ -362,11 +362,11 @@ bind+port, `0.0.0.0` parses without error (warning is caller's job).
 
 ### 4.7 `storage/engine/mod.rs` — new fields and methods
 
-**New fields on `KvEngine`** (all `Arc<AtomicU64>` to match existing `used_memory`/`hits`/`misses`/`rng` shape — `KvEngine::clone()` relies on `Arc`-shared interior mutability, bare atomics would break it):
+**New fields on `KvEngine`** (all `Arc<AtomicU64>` to match existing `used_memory`/`hits`/`misses`/`rng` shape — `KvEngine::clone()` relies on `Arc`-shared interior mutability, bare atomics would break it. Exception: `start` is `OnceLock<Instant>` because `Instant` is not atomically-storable and we want a monotonic clock for uptime, immune to wall-clock jumps like NTP adjusts):
 ```rust
 commands: Arc<AtomicU64>,      // ticked via engine.tick_command() from execute_command
 evictions: Arc<AtomicU64>,     // ticked in enforce_memory_limit
-epoch_ms: Arc<AtomicU64>,      // set once in KvEngine::new, base64 of Instant::now().as_millis()
+start: Arc<OnceLock<Instant>>, // set once in KvEngine::new; uptime_secs = start.get().unwrap().elapsed().as_secs(). Arc-shared so all clones read the same Instant.
 eviction_log: Option<Arc<EvictionLog>>,  // None when maxmemory == 0
 ```
 
