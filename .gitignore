@@ -24,5 +24,8 @@ docs/
 # AtomCode per-user overrides (team-shared .atomcode.md IS committed)
 .atomcode.user.md
 
+# Git worktrees for isolated feature work (superpowers:using-git-worktrees)
+.worktrees/
+
 # Codegraph analysis artifacts (SQLite DB, daemon logs, exported graphs)
 .codegraph/
