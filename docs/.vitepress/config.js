@@ -65,12 +65,7 @@ export default defineConfig({
     ['link', { rel: 'icon', href: '/ferrum-kv/logo.svg', type: 'image/svg+xml' }],
   ],
   srcExclude: [
-    'market-research.md',
-    'development-plan.md',
-    'dashboard-design.md',
-    'product-strategy.md',
-    'whitepaper.md',
-    'superpowers/**',
+    'design/**',
   ],
   lastUpdated: true,
   cleanUrls: true,

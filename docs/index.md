@@ -3,8 +3,8 @@ layout: home
 
 hero:
   name: FerrumKV
-  text: Eviction algorithm laboratory for RESP2 KV stores
-  tagline: 10 cache eviction policies, a built-in web dashboard, and zero-dependency Rust.
+  text: Eviction algorithm laboratory for RESP2-compatible KV stores
+  tagline: 10 cache eviction policies, built-in web dashboard, written in Rust.
   actions:
     - theme: brand
       text: Get Started
