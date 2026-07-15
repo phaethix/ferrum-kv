@@ -20,7 +20,6 @@ target
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 .idea/
 .vscode/
-docs/
 
 # AtomCode per-user overrides (team-shared .atomcode.md IS committed)
 .atomcode.user.md
@@ -31,7 +30,7 @@ docs/
 # Codegraph analysis artifacts (SQLite DB, daemon logs, exported graphs)
 .codegraph/
 
-# Docs site (VitePress)
-docs-site/node_modules/
-docs-site/.vitepress/dist/
-docs-site/.vitepress/cache/
+# Docs site (VitePress) build artifacts
+docs/node_modules/
+docs/.vitepress/dist/
+docs/.vitepress/cache/

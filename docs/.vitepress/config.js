@@ -60,6 +60,18 @@ const zhNav = [
 export default defineConfig({
   title: 'FerrumKV',
   description: 'Eviction algorithm laboratory for RESP2-compatible KV stores.',
+  base: '/ferrum-kv/',
+  head: [
+    ['link', { rel: 'icon', href: '/ferrum-kv/logo.svg', type: 'image/svg+xml' }],
+  ],
+  srcExclude: [
+    'market-research.md',
+    'development-plan.md',
+    'dashboard-design.md',
+    'product-strategy.md',
+    'whitepaper.md',
+    'superpowers/**',
+  ],
   lastUpdated: true,
   cleanUrls: true,
   locales: {
