@@ -3,7 +3,7 @@
 > Date: 2026-07-06
 > Owner: Engineering
 > Status: design complete, pending implementation plan
-> Source spec: `docs/dashboard-design.md` v2.1 (2026-07-05)
+> Source spec: `design/dashboard-design.md` v2.1 (2026-07-05)
 > Issue: FERRUM-012
 
 ---

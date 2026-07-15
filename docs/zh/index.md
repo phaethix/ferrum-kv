@@ -3,8 +3,8 @@ layout: home
 
 hero:
   name: FerrumKV
-  text: 面向 RESP2 KV 存储的淘汰算法实验室
-  tagline: 10 种缓存淘汰策略、内置 Web 控制台，以及零依赖的 Rust 实现。
+  text: 面向 RESP2 兼容 KV 存储的淘汰算法实验室
+  tagline: 10 种缓存淘汰策略、内置 Web 控制台，使用 Rust 编写。
   actions:
     - theme: brand
       text: 快速开始

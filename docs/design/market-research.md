@@ -167,4 +167,4 @@ THE BET:
 
 ---
 
-*Sources: see Appendix A in docs/product-strategy.md*
+*Sources: see Appendix A in design/product-strategy.md*

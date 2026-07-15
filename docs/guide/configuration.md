@@ -7,13 +7,18 @@ directive in the config file (`ferrum.conf.example`).
 
 | Flag | Default | Description |
 |------|---------|-------------|
+| `--config PATH` | *(none)* | Load a config file (directives below) |
 | `--addr HOST:PORT` | `127.0.0.1:6380` | RESP listening address |
 | `--dashboard-addr ADDR\|off` | `127.0.0.1:6381` | Web dashboard address, or `off` to disable |
 | `--aof-path PATH` | *(disabled)* | Enable AOF persistence |
 | `--appendfsync POLICY` | `everysec` | `always` / `everysec` / `no` |
+| `--client-timeout SECONDS` | `0` (disabled) | Per-connection idle timeout |
+| `--maxclients N` | *(unlimited)* | Max concurrent client connections |
 | `--maxmemory BYTES` | `0` (unlimited) | Memory cap (`512b` / `64kb` / `256mb` / `1gb`) |
 | `--maxmemory-policy POLICY` | `noeviction` | Any of the 10 policies |
+| `--maxmemory-samples N` | `5` | Keys sampled per eviction round |
 | `--io-threads N` | `0` (auto) | Tokio worker threads |
+| `--loglevel LEVEL` | `info` | `off` / `error` / `warn` / `info` / `debug` / `trace` |
 
 ## Config file
 
@@ -28,5 +33,5 @@ appendonly yes
 appendfsync everysec
 ```
 
-Pass the file with `--config-file ferrum.conf` (or the matching flag). Flags override
-config-file values. See `ferrum-kv --help` for the full list.
+Pass the file with `--config ferrum.conf`. Flags override config-file values.
+See `ferrum-kv --help` for the full list.

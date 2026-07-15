@@ -235,7 +235,7 @@ FerrumKV occupies the **bottom-left** quadrant: embedded library, but optimized 
 
 ### Qualitative
 
-- **Eviction credibility**: A researcher can read `docs/ahe-whitepaper.md`, reproduce the benchmarks, and understand how AHE differs from AdaptiveClimb.
+- **Eviction credibility**: A researcher can read `design/whitepaper.md`, reproduce the benchmarks, and understand how AHE differs from AdaptiveClimb.
 - **Library experience**: A developer adds `ferrum-kv = "0.5"` and has an embedded cache with their choice of 13 eviction policies.
 - **Educational value**: A student can read the codebase from `main.rs` → `parser.rs` → `engine/mod.rs` → `eviction.rs` and understand every layer.
 
