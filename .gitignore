@@ -19,6 +19,7 @@ target
 #  and can be added to the global gitignore or merged into this file.  For a more nuclear
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 .idea/
+.vscode/
 docs/
 
 # AtomCode per-user overrides (team-shared .atomcode.md IS committed)
@@ -29,3 +30,8 @@ docs/
 
 # Codegraph analysis artifacts (SQLite DB, daemon logs, exported graphs)
 .codegraph/
+
+# Docs site (VitePress)
+docs-site/node_modules/
+docs-site/.vitepress/dist/
+docs-site/.vitepress/cache/

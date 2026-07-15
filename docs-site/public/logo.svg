@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="FerrumKV logo">
+  <defs>
+    <linearGradient id="fk" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#6366f1"/>
+      <stop offset="1" stop-color="#22d3ee"/>
+    </linearGradient>
+  </defs>
+  <!-- Iron hexagon (strength / Rust / memory lattice) with a keyhole
+       (key-value store) punched through it. -->
+  <path fill="url(#fk)" fill-rule="evenodd" d="
+    M256 46 L466 171 L466 341 L256 466 L46 341 L46 171 Z
+    M210 210 a46 46 0 1 0 92 0 a46 46 0 1 0 -92 0 Z
+    M240 252 L272 252 L264 350 L248 350 Z
+  "/>
+</svg>
