@@ -916,3 +916,32 @@ fn zero_max_memory_disables_enforcement() {
     }
     assert_eq!(engine.dbsize().unwrap(), 100);
 }
+
+#[test]
+fn scan_keys_glob_filtering() {
+    let engine = KvEngine::new();
+    engine.set(b"user:1".to_vec(), b"a".to_vec()).unwrap();
+    engine.set(b"user:2".to_vec(), b"b".to_vec()).unwrap();
+    engine
+        .set(b"config:theme".to_vec(), b"dark".to_vec())
+        .unwrap();
+    engine.set(b"session:ab".to_vec(), b"c".to_vec()).unwrap();
+
+    // '*' matches everything.
+    assert_eq!(engine.scan_keys(b"*").unwrap().len(), 4);
+
+    // Prefix wildcard.
+    let users = engine.scan_keys(b"user:*").unwrap();
+    assert_eq!(users.len(), 2);
+
+    // Single-character wildcard.
+    let sessions = engine.scan_keys(b"session:?b").unwrap();
+    assert_eq!(sessions.len(), 1);
+
+    // Character class.
+    let either = engine.scan_keys(b"user:[12]").unwrap();
+    assert_eq!(either.len(), 2);
+
+    // No match.
+    assert_eq!(engine.scan_keys(b"nope:*").unwrap().len(), 0);
+}

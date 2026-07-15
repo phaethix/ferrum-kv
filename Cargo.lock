@@ -287,7 +287,7 @@ dependencies = [
 
 [[package]]
 name = "ferrum-kv"
-version = "0.4.0"
+version = "0.5.0-dev"
 dependencies = [
  "criterion",
  "env_logger",

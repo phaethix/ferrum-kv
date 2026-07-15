@@ -19,12 +19,18 @@ use ferrum_kv::storage::eviction::{EvictionConfig, EvictionPolicy};
 
 pub const DEFAULT_ADDR: &str = "127.0.0.1:6380";
 
+/// Address the built-in web dashboard listens on when no explicit
+/// `--dashboard-addr` is given. Always enabled by default so operators get a
+/// zero-config visualisation out of the box.
+pub const DEFAULT_DASHBOARD_ADDR: &str = "127.0.0.1:6381";
+
 pub const USAGE: &str = concat!(
     "usage: ferrum-kv [--config PATH] [--addr HOST:PORT] [--aof-path PATH]\n",
     "                 [--appendfsync always|everysec|no]\n",
     "                 [--client-timeout SECONDS] [--maxclients N]\n",
     "                 [--maxmemory BYTES] [--maxmemory-policy POLICY]\n",
     "                 [--maxmemory-samples N] [--io-threads N]\n",
+    "                 [--dashboard-addr ADDR|off]\n",
     "                 [--loglevel off|error|warn|info|debug|trace]"
 );
 
@@ -63,6 +69,10 @@ pub struct CliArgs {
     /// Number of tokio worker threads; `0` (unset) asks tokio for the
     /// default (usually one per logical CPU).
     io_threads: Option<usize>,
+    /// Bind address for the built-in web dashboard, or the sentinels
+    /// `off` / `disabled` / `none` to turn it off. `None` means "use the
+    /// built-in default" rather than "disabled".
+    dashboard_addr: Option<String>,
 }
 
 /// Raw, un-merged values taken verbatim from the command line.
@@ -85,6 +95,9 @@ struct RawFlags {
     max_memory_policy: Option<EvictionPolicy>,
     max_memory_samples: Option<usize>,
     io_threads: Option<usize>,
+    /// Bind address for the built-in web dashboard. `None` means "use the
+    /// default address"; the literals `off` / `disabled` / `none` disable it.
+    dashboard_addr: Option<String>,
     /// Whether AOF was explicitly enabled via the config file's `appendonly yes`.
     /// CLI `--aof-path` implies enabled; this field only carries the file's
     /// intent so that a later merge step can decide.
@@ -135,6 +148,25 @@ impl CliArgs {
     /// "let tokio pick", which is what most deployments want.
     pub fn io_threads(&self) -> Option<usize> {
         self.io_threads
+    }
+
+    /// Returns the dashboard bind address, or `None` to disable it.
+    ///
+    /// A `None` field from parsing means "use the built-in default"
+    /// ([`DEFAULT_DASHBOARD_ADDR`]); the literal values `off` / `disabled` /
+    /// `none` explicitly switch the dashboard off.
+    pub fn dashboard_addr(&self) -> Option<String> {
+        match &self.dashboard_addr {
+            None => Some(DEFAULT_DASHBOARD_ADDR.to_string()),
+            Some(s)
+                if s.eq_ignore_ascii_case("off")
+                    || s.eq_ignore_ascii_case("disabled")
+                    || s.eq_ignore_ascii_case("none") =>
+            {
+                None
+            }
+            Some(s) => Some(s.clone()),
+        }
     }
 
     /// Returns the resolved eviction configuration. Defaults (unlimited
@@ -226,6 +258,10 @@ fn scan_argv<I: IntoIterator<Item = String>>(args: I) -> Result<ScanOutcome, Str
                     format!("invalid --io-threads: '{value}' is not a non-negative integer")
                 })?);
             }
+            "--dashboard-addr" => {
+                let value = take_value(&mut iter, "--dashboard-addr")?;
+                raw.dashboard_addr = Some(value);
+            }
             "-h" | "--help" => return Ok(ScanOutcome::Help),
             other => return Err(format!("unrecognised argument: '{other}'")),
         }
@@ -295,6 +331,9 @@ fn merge(raw: RawFlags, file: Option<&FileConfig>) -> Result<CliArgs, String> {
         .max_memory_samples
         .or_else(|| file.and_then(|f| f.max_memory_samples));
     let io_threads = raw.io_threads.or_else(|| file.and_then(|f| f.io_threads));
+    let dashboard_addr = raw
+        .dashboard_addr
+        .or_else(|| file.and_then(|f| f.dashboard_addr.clone()));
 
     Ok(CliArgs {
         addr,
@@ -307,6 +346,7 @@ fn merge(raw: RawFlags, file: Option<&FileConfig>) -> Result<CliArgs, String> {
         max_memory_policy,
         max_memory_samples,
         io_threads,
+        dashboard_addr,
     })
 }
 
@@ -697,5 +737,51 @@ mod tests {
         let conf = TempConf::new("io-threads-override", "io-threads 8\n");
         let args = parse_run(&["--config", conf.path.to_str().unwrap(), "--io-threads", "2"]);
         assert_eq!(args.io_threads(), Some(2));
+    }
+
+    #[test]
+    fn dashboard_addr_defaults_to_builtin() {
+        assert_eq!(
+            parse_run(&[]).dashboard_addr(),
+            Some("127.0.0.1:6381".to_string())
+        );
+    }
+
+    #[test]
+    fn dashboard_addr_flag_is_parsed() {
+        assert_eq!(
+            parse_run(&["--dashboard-addr", "0.0.0.0:9000"]).dashboard_addr(),
+            Some("0.0.0.0:9000".to_string())
+        );
+    }
+
+    #[test]
+    fn dashboard_addr_off_disables() {
+        assert_eq!(
+            parse_run(&["--dashboard-addr", "off"]).dashboard_addr(),
+            None
+        );
+        assert_eq!(
+            parse_run(&["--dashboard-addr", "disabled"]).dashboard_addr(),
+            None
+        );
+        assert_eq!(
+            parse_run(&["--dashboard-addr", "none"]).dashboard_addr(),
+            None
+        );
+    }
+
+    #[test]
+    fn dashboard_addr_from_config_file() {
+        let conf = TempConf::new("dash", "dashboard-addr 0.0.0.0:7000\n");
+        let args = parse_run(&["--config", conf.path.to_str().unwrap()]);
+        assert_eq!(args.dashboard_addr(), Some("0.0.0.0:7000".to_string()));
+    }
+
+    #[test]
+    fn dashboard_addr_off_in_config_file() {
+        let conf = TempConf::new("dash-off", "dashboard-addr off\n");
+        let args = parse_run(&["--config", conf.path.to_str().unwrap()]);
+        assert_eq!(args.dashboard_addr(), None);
     }
 }

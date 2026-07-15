@@ -108,6 +108,26 @@ fn main() -> ExitCode {
 
     let expire_handle = expire::spawn(engine.clone(), shutdown.clone());
 
+    // Start the built-in web dashboard on its own thread/runtime, if enabled.
+    if let Some(dashboard_addr) = args.dashboard_addr() {
+        let dash_engine = engine.clone();
+        let dash_shutdown = shutdown.clone();
+        if let Err(e) = thread::Builder::new()
+            .name("ferrum-dashboard".into())
+            .spawn(move || {
+                if let Err(e) = ferrum_kv::network::dashboard::serve(
+                    &dashboard_addr,
+                    dash_engine,
+                    dash_shutdown,
+                ) {
+                    error!("dashboard error: {e}");
+                }
+            })
+        {
+            error!("failed to spawn dashboard thread: {e}");
+        }
+    }
+
     let server_result =
         ferrum_kv::network::server::run_listener(listener, engine, shutdown, server_config);
     expire_handle.shutdown();

@@ -45,6 +45,9 @@ pub struct FileConfig {
     /// Number of tokio worker threads. `0` (or unset) lets the runtime
     /// pick a sensible default (usually the logical CPU count).
     pub io_threads: Option<usize>,
+    /// Bind address for the built-in web dashboard. `None` uses the default
+    /// address; the literal `off` (or `no`) disables the dashboard.
+    pub dashboard_addr: Option<String>,
 }
 
 /// Error type for configuration file parsing.
@@ -185,6 +188,16 @@ fn apply_directive(cfg: &mut FileConfig, key: &str, value: &str) -> Result<(), S
         }
         "io-threads" => {
             cfg.io_threads = Some(parse_usize(value, "io-threads")?);
+        }
+        "dashboard-addr" => {
+            // `off` / `no` switch the dashboard off; anything else is taken
+            // verbatim as a `host:port` bind address.
+            let v = value.trim();
+            if v.eq_ignore_ascii_case("off") || v.eq_ignore_ascii_case("no") {
+                cfg.dashboard_addr = Some("off".to_string());
+            } else {
+                cfg.dashboard_addr = Some(v.to_string());
+            }
         }
         other => return Err(format!("unknown directive '{other}'")),
     }
