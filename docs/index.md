@@ -3,8 +3,7 @@ layout: home
 
 hero:
   name: FerrumKV
-  text: Eviction algorithm laboratory for RESP2-compatible KV stores
-  tagline: 10 cache eviction policies, built-in web dashboard, written in Rust.
+  text: A readable KV store with 10 eviction policies
   actions:
     - theme: brand
       text: Get Started
@@ -14,12 +13,10 @@ hero:
       link: https://github.com/phaethix/ferrum-kv
 
 features:
-  - title: 10 Eviction Policies
-    details: LRU, LFU, Random, TTL, and AHE — an adaptive, self-tuning policy. Swap at runtime with no restart.
+  - title: Original AHE Algorithm
+    details: Self-tuning eviction that blends recency, frequency, and TTL into one score, then adapts its own weights from live hit-ratio feedback. No tuning required.
   - title: Built-in Dashboard
-    details: Browse keys, edit inline, watch live stats, and run RESP commands straight from the browser. No extra dependencies.
-  - title: RESP2 Compatible
-    details: Drop-in for any Redis client — redis-cli, Redis Insight, or your own application.
+    details: Browse keys, edit inline, watch live stats, and run RESP commands straight from the browser. Zero extra dependencies to install.
   - title: Readable Rust
-    details: ~8,500 lines of layered, well-commented code. No macro magic, no custom allocators.
+    details: ~8,500 lines of layered, well-commented code. No macro magic, no custom allocators — built to be read and learned from.
 ---

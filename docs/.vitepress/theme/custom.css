@@ -5,8 +5,190 @@
   --vp-c-brand-soft: rgba(99, 102, 241, 0.14);
 }
 
-/* Minimal, content-first feel */
+/* ── Doc headings ── */
 .vp-doc h2 {
   border-top: none;
   margin-top: 2.5rem;
+}
+
+.vp-doc .kv-diagram {
+  margin: 28px 0;
+  padding: 18px;
+  border: 1px solid var(--vp-divider);
+  border-radius: 18px;
+  background: linear-gradient(180deg, rgba(99, 102, 241, 0.06), rgba(15, 23, 42, 0.03));
+  overflow-x: auto;
+}
+
+.dark .vp-doc .kv-diagram {
+  border-color: rgba(148, 163, 184, 0.14);
+  background: linear-gradient(180deg, rgba(99, 102, 241, 0.10), rgba(15, 23, 42, 0.22));
+}
+
+.vp-doc .kv-diagram svg {
+  display: block;
+  width: 100%;
+  max-width: 860px;
+  min-width: 640px;
+  height: auto;
+  margin: 0 auto;
+}
+
+/* ══════════════════════════════════════
+   HERO — centered, premium landing feel
+   ══════════════════════════════════════ */
+.VPHero {
+  text-align: center;
+  position: relative;
+  padding: 76px 24px 0 !important;
+}
+
+.VPHero > .container {
+  display: block !important;
+  max-width: 100% !important;
+  margin: 0 auto;
+}
+
+.VPHero > .container > .main {
+  display: block !important;
+  max-width: 760px !important;
+  margin: 0 auto !important;
+  flex: none !important;
+  text-align: center;
+}
+
+/* ambient glow behind hero */
+.VPHero::before {
+  content: '';
+  position: absolute;
+  top: -120px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: min(760px, 90vw);
+  height: 520px;
+  background:
+    radial-gradient(circle at center, rgba(124, 58, 237, 0.16) 0%, rgba(99, 102, 241, 0.08) 34%, transparent 68%);
+  pointer-events: none;
+  z-index: 0;
+}
+.VPHero > .container { position: relative; z-index: 1; }
+
+.VPHero .heading {
+  align-items: center;
+  gap: 0;
+}
+
+/* ── Title ── */
+.VPHero .name {
+  width: fit-content;
+  max-width: 100% !important;
+  margin-right: auto !important;
+  margin-left: auto !important;
+  text-align: center;
+  font-size: clamp(56px, 7.2vw, 86px);
+  font-weight: 850;
+  letter-spacing: -2.8px;
+  background: linear-gradient(135deg, #7c7cff 0%, #8b5cf6 46%, #c4b5fd 100%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+  line-height: 0.98;
+  filter: drop-shadow(0 18px 42px rgba(99, 102, 241, 0.18));
+}
+
+/* ── Subtitle ── */
+.VPHero .text {
+  width: fit-content;
+  max-width: 720px !important;
+  margin: 22px auto 0 !important;
+  text-align: center;
+  font-size: clamp(20px, 2.25vw, 25px);
+  font-weight: 500;
+  letter-spacing: -0.35px;
+  color: var(--vp-c-text-1);
+  line-height: 1.35;
+}
+
+.dark .VPHero .text {
+  color: rgba(255, 255, 255, 0.86);
+}
+
+/* ── Refined tagline capsule ── */
+.VPHero .tagline {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  max-width: 620px;
+  margin: 26px auto 0 !important;
+  padding: 12px 18px;
+  border: 1px solid rgba(100, 116, 139, 0.18);
+  border-radius: 999px;
+  background: rgba(99, 102, 241, 0.035);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.42);
+  font-size: 14px;
+  font-weight: 450;
+  color: var(--vp-c-text-2);
+  line-height: 1.65;
+}
+
+.dark .VPHero .tagline {
+  border-color: rgba(148, 163, 184, 0.16);
+  background: rgba(255, 255, 255, 0.035);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.055);
+  color: rgba(226, 232, 240, 0.64);
+}
+
+/* ── Action buttons ── */
+.VPHero .actions {
+  justify-content: center;
+  gap: 16px;
+  margin-top: 40px !important;
+}
+
+/* ══════════════════════════════════════
+   FEATURE CARDS — icon-first, full-width grid
+   ══════════════════════════════════════ */
+.VPFeatures {
+  padding: 56px 24px 72px !important;
+}
+
+.VPFeature {
+  border: 1px solid var(--vp-divider);
+  border-radius: 14px;
+  padding: 28px 24px !important;
+  transition:
+    transform 0.25s cubic-bezier(0.4, 0, 0.2, 1),
+    border-color 0.25s ease,
+    box-shadow 0.25s ease;
+  background: var(--vp-c-bg-soft);
+}
+
+.VPFeature .icon {
+  font-size: 34px;
+  line-height: 1;
+  margin-bottom: 14px;
+  display: block;
+}
+
+.VPFeature .title {
+  font-weight: 700;
+  font-size: 17px;
+  letter-spacing: -0.2px;
+  color: var(--vp-c-text-1);
+}
+
+.VPFeature .details {
+  color: var(--vp-c-text-2);
+  font-size: 14.5px;
+  line-height: 1.65;
+  margin-top: 8px;
+}
+
+.VPFeature:hover {
+  transform: translateY(-4px);
+  border-color: rgba(99, 102, 241, 0.35);
+  box-shadow:
+    0 8px 30px rgba(79, 70, 229, 0.10),
+    0 2px 8px rgba(0, 0, 0, 0.06);
+  background: var(--vp-c-bg);
 }

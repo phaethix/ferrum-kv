@@ -22,6 +22,7 @@
 ## Table of Contents
 
 - [Features](#features)
+- [Why FerrumKV](#why-ferrumkv)
 - [Quick Start](#quick-start)
 - [Dashboard](#dashboard)
 - [Eviction Policies](#eviction-policies)
@@ -35,10 +36,21 @@
 
 ## Features
 
-- **10 Eviction Policies** — LRU, LFU, Random, TTL, and **AHE** (Adaptive Hybrid Eviction) with self-tuning score. Swap at runtime.
+- **Original AHE Algorithm** — FerrumKV's own *Adaptive Hybrid Eviction* blends recency, frequency, and TTL into one score and tunes its own weights from live hit-ratio feedback. No tuning required. [Read the paper →](docs/reference/ahe.md)
+- **10 Eviction Policies** — LRU, LFU, Random, TTL, and AHE. Swap at runtime, exactly like Redis' `maxmemory-policy`.
 - **Built-in Web Dashboard** — Key browser, inline editor, live stats, command console. Zero config, no extra dependencies.
 - **RESP2 Compatible** — Works with any Redis client (`redis-cli`, Redis Insight, etc.).
-- **Readable Codebase** — ~8,500 lines of layered, well-commented Rust. No macro magic, no custom allocators.
+- **Readable Codebase** — ~8,500 lines of layered, well-commented Rust. No macro magic, no custom allocators — built to be read.
+
+## Why FerrumKV
+
+There are many mature KV stores. FerrumKV does **not** try to replace Redis in production — it is built to be **read, learned from, and experimented with**. Three things set it apart:
+
+- **A real, original algorithm — not a clone.** `AHE` (Adaptive Hybrid Eviction) is FerrumKV's own contribution: it fuses recency, frequency, and TTL into a single *Eviction Priority Score* and self-tunes its weights from live hit-ratio feedback. [Paper →](docs/reference/ahe.md)
+- **Readable end-to-end.** ~8,500 lines of layered Rust with no macro magic and no custom allocators. From TCP → RESP2 parsing → engine → eviction → AOF → Tokio async, the whole pipeline is followable in an afternoon.
+- **Self-contained and Redis-flavoured.** A single static binary, RESP2-compatible, driven by `redis-cli`/`redis-benchmark`, with a zero-dependency web dashboard and 9 Redis-style eviction policies you can swap at runtime.
+
+In short: the shortest path from *"I use Redis"* to *"I understand how a Redis-like KV store actually works."*
 
 ## Quick Start
 
@@ -92,7 +104,7 @@ Open **http://127.0.0.1:6381** for the built-in dashboard.
 | `volatile-ttl` | TTL | | | x | |
 | **`allkeys-ahe`** / **`volatile-ahe`** | Adaptive | x | x | x | x |
 
-[AHE](./docs/design/whitepaper.md) (Adaptive Hybrid Eviction) blends recency, frequency, and TTL urgency into a self-tuning *Eviction Priority Score*.
+[AHE](./docs/reference/ahe.md) (Adaptive Hybrid Eviction) blends recency, frequency, and TTL urgency into a self-tuning *Eviction Priority Score*.
 
 ## Architecture
 

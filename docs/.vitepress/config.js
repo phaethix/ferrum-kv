@@ -10,13 +10,14 @@ const enNav = [
       { text: 'Dashboard', link: '/guide/dashboard' },
     ],
   },
-  {
-    text: 'Reference',
-    items: [
-      { text: 'Architecture', link: '/reference/architecture' },
-      { text: 'Benchmarks', link: '/reference/benchmarks' },
-    ],
-  },
+    {
+      text: 'Reference',
+      items: [
+        { text: 'Architecture', link: '/reference/architecture' },
+        { text: 'AHE Algorithm', link: '/reference/ahe' },
+        { text: 'Benchmarks', link: '/reference/benchmarks' },
+      ],
+    },
 ]
 
 const enSidebar = [
@@ -29,13 +30,14 @@ const enSidebar = [
       { text: 'Dashboard', link: '/guide/dashboard' },
     ],
   },
-  {
-    text: 'Reference',
-    items: [
-      { text: 'Architecture', link: '/reference/architecture' },
-      { text: 'Benchmarks', link: '/reference/benchmarks' },
-    ],
-  },
+    {
+      text: 'Reference',
+      items: [
+        { text: 'Architecture', link: '/reference/architecture' },
+        { text: 'AHE Algorithm', link: '/reference/ahe' },
+        { text: 'Benchmarks', link: '/reference/benchmarks' },
+      ],
+    },
 ]
 
 const zhNav = [
@@ -52,6 +54,7 @@ const zhNav = [
     text: '参考',
     items: [
       { text: '架构', link: '/zh/reference/architecture' },
+      { text: 'AHE 算法', link: '/zh/reference/ahe' },
       { text: '性能基准', link: '/zh/reference/benchmarks' },
     ],
   },
