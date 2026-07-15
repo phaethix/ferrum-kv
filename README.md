@@ -111,6 +111,10 @@ src/
 │   └── encoder.rs       # RESP2 response encoder
 ├── network/
 │   ├── server.rs        # accept loop, handle_client, command dispatch
+│   ├── dashboard/       # built-in web UI (HTTP server + embedded SPA)
+│   │   ├── mod.rs       # serve(): own tokio runtime + thread
+│   │   ├── http.rs      # pure route() handler + helpers
+│   │   └── index.html   # self-contained UI (HTML/CSS/JS inline)
 │   └── shutdown.rs      # graceful shutdown (SIGINT/SIGTERM)
 ├── storage/
 │   ├── engine/          # KvEngine — the core hash map + command API
@@ -170,8 +174,47 @@ ahe_alpha:0.62
 | `--maxmemory-policy POLICY` | `noeviction` | Any of the 10 policies above |
 | `--maxmemory-samples N` | `5` | Candidates inspected per eviction |
 | `--io-threads N` | `0` (auto) | Tokio worker thread count |
+| `--dashboard-addr ADDR\|off` | `127.0.0.1:6381` | Built-in web dashboard address, or `off` to disable |
 
 For all flags: `ferrum-kv --help`. Redis-style config file: see [`ferrum.conf.example`](./ferrum.conf.example).
+
+---
+
+## Built-in Web Dashboard
+
+FerrumKV ships with a **zero-config web UI** — no separate desktop client (Redis Insight / DataGrip) required. Start the server and open the dashboard URL in any browser.
+
+```bash
+# Default: dashboard listens on http://127.0.0.1:6381
+./target/release/ferrum-kv
+
+# Custom address (bind on all interfaces)
+./target/release/ferrum-kv --dashboard-addr 0.0.0.0:8080
+
+# Disable it entirely
+./target/release/ferrum-kv --dashboard-addr off
+```
+
+The dashboard is fully **self-contained** — the HTML/CSS/JS is embedded in the binary at compile time, so there is no asset directory to deploy. It adds **no extra dependencies** beyond the KV server's own `tokio` runtime, runs on its own lightweight HTTP server and thread, and shares the same `KvEngine` instance as the RESP port.
+
+**Features**
+- **Key browser** — glob search (`user:*`, `session?`), paginated list with live TTL badges.
+- **Inline editor** — view, edit, set TTL, and delete any key directly in the browser.
+- **Live stats** — keys, memory usage, hit ratio, eviction policy and uptime, refreshing every 2s.
+- **Command console** — run any RESP command (`GET`, `SET`, `INFO`, `DBSIZE`, …) against the live server and see the decoded reply.
+
+**REST API** (the UI is just a client for it):
+
+| Endpoint | Method | Purpose |
+|----------|--------|---------|
+| `/api/info` | GET | Server stats snapshot |
+| `/api/keys?filter=&limit=&offset=` | GET | Paginated, filtered key list |
+| `/api/keys/:key` | GET | Key value + TTL |
+| `/api/keys` | POST | Create/update a key (`key`, `value`, `ttl`) |
+| `/api/keys/:key` | PUT / DELETE | Update or delete a key |
+| `/api/command` | POST | Execute a raw command (`command=...`) |
+
+> Values are displayed as UTF-8; binary values render lossily in the browser, while the engine itself remains fully binary-safe.
 
 ---
 

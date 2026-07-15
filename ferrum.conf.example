@@ -60,3 +60,8 @@ loglevel info
 # for most deployments. Bump it higher only if you are pinning other
 # workloads to specific cores and want to cap FerrumKV's share.
 # io-threads 0
+
+# ---- Web dashboard -------------------------------------------------
+# Address the built-in web dashboard listens on. Enabled by default on
+# 127.0.0.1:6381. Set to "off" to disable the dashboard entirely.
+# dashboard-addr 127.0.0.1:6381
