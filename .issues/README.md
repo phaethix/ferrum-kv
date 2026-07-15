@@ -110,3 +110,4 @@ the structured repro and root-cause analysis).
 | FERRUM-009 | medium | open | Implement SIEVE cache eviction algorithm (NSDI'24) |
 | FERRUM-010 | medium | open | Extract EvictionPolicy trait for pluggable eviction algorithms |
 | FERRUM-011 | medium | open | Build eviction algorithm benchmark suite with standard workloads |
+| FERRUM-012 | medium | open | Build interactive visual dashboard for real-time internals visualization |
