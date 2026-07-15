@@ -58,6 +58,13 @@ pub const VALUE_MAX_BYTES: usize = 16 * 1024 * 1024;
 /// to match the allocator to the byte.
 pub const PER_ENTRY_OVERHEAD: u64 = 48;
 
+/// Upper bound on the number of keys [`KvEngine::scan_keys`] returns in one
+/// call.
+///
+/// The dashboard key browser paginates over this window, so the limit only
+/// bounds a single response's footprint — not the total addressable keyspace.
+pub const SCAN_KEYS_LIMIT: usize = 10_000;
+
 /// A thread-safe key-value storage engine backed by a [`HashMap`].
 ///
 /// Keys and values are stored as `Vec<u8>`, making the engine fully
@@ -455,6 +462,30 @@ impl KvEngine {
         let store = self.store.read()?;
         let now = Instant::now();
         Ok(store.values().filter(|v| !v.is_expired(now)).count())
+    }
+
+    /// Returns up to [`SCAN_KEYS_LIMIT`] live keys whose name matches the
+    /// Redis-style glob `pattern` (e.g. `*` for everything, `user:*` for a
+    /// prefix, `session?` for a single wildcard). Expired keys are skipped.
+    ///
+    /// The dashboard key browser calls this for search and pagination; the
+    /// cap keeps a single response bounded even when the keyspace is huge.
+    pub fn scan_keys(&self, pattern: &[u8]) -> Result<Vec<Vec<u8>>, FerrumError> {
+        let store = self.store.read()?;
+        let now = Instant::now();
+        let mut out = Vec::new();
+        for (key, entry) in store.iter() {
+            if entry.is_expired(now) {
+                continue;
+            }
+            if Self::glob_match(pattern, key) {
+                out.push(key.clone());
+                if out.len() >= SCAN_KEYS_LIMIT {
+                    break;
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// Returns `(expires, avg_ttl_ms)` for `INFO keyspace`, mirroring Redis.
@@ -872,6 +903,110 @@ impl KvEngine {
                 .unwrap_or(0),
         );
         self.enforce_memory_limit(store, net)
+    }
+
+    /// Matches `text` against a Redis-style glob `pattern`.
+    ///
+    /// Supports `*`, `?`, character classes (`[abc]`, `[a-z]`, `[!abc]`) and
+    /// backslash escapes. Used by [`KvEngine::scan_keys`] so the dashboard
+    /// can offer prefix / wildcard key search.
+    fn glob_match(pattern: &[u8], text: &[u8]) -> bool {
+        fn matches(pat: &[u8], txt: &[u8]) -> bool {
+            let (mut p, mut t) = (0usize, 0usize);
+            let (pl, tl) = (pat.len(), txt.len());
+            while p < pl {
+                match pat[p] {
+                    b'*' => {
+                        while p + 1 < pl && pat[p + 1] == b'*' {
+                            p += 1;
+                        }
+                        if p + 1 == pl {
+                            return true;
+                        }
+                        for i in t..=tl {
+                            if matches(&pat[p + 1..], &txt[i..]) {
+                                return true;
+                            }
+                        }
+                        return false;
+                    }
+                    b'?' => {
+                        if t >= tl {
+                            return false;
+                        }
+                        p += 1;
+                        t += 1;
+                    }
+                    b'\\' => {
+                        let pc = if p + 1 < pl { pat[p + 1] } else { pat[p] };
+                        if t >= tl || txt[t] != pc {
+                            return false;
+                        }
+                        p += 2;
+                        t += 1;
+                    }
+                    b'[' => {
+                        if t >= tl {
+                            return false;
+                        }
+                        let mut j = p + 1;
+                        let mut negate = false;
+                        if j < pl && pat[j] == b'!' {
+                            negate = true;
+                            j += 1;
+                        }
+                        let mut matched = false;
+                        let mut k = j;
+                        while k < pl && pat[k] != b']' {
+                            if pat[k] == b'\\' && k + 1 < pl {
+                                if txt[t] == pat[k + 1] {
+                                    matched = true;
+                                }
+                                k += 2;
+                            } else if k + 2 < pl && pat[k + 1] == b'-' && pat[k + 2] != b']' {
+                                let lo = pat[k];
+                                let hi = pat[k + 2];
+                                let c = txt[t];
+                                if (lo <= hi && lo <= c && c <= hi)
+                                    || (lo > hi && (c >= lo || c <= hi))
+                                {
+                                    matched = true;
+                                }
+                                k += 3;
+                            } else if txt[t] == pat[k] {
+                                matched = true;
+                                k += 1;
+                            } else {
+                                k += 1;
+                            }
+                        }
+                        if k >= pl {
+                            // No closing bracket: treat '[' as a literal.
+                            if txt[t] != b'[' {
+                                return false;
+                            }
+                            p += 1;
+                            t += 1;
+                            continue;
+                        }
+                        if matched == negate {
+                            return false;
+                        }
+                        p = k + 1;
+                        t += 1;
+                    }
+                    c => {
+                        if t >= tl || txt[t] != c {
+                            return false;
+                        }
+                        p += 1;
+                        t += 1;
+                    }
+                }
+            }
+            t == tl
+        }
+        matches(pattern, text)
     }
 
     /// Removes `key` from `store`, updates the memory counter, and
