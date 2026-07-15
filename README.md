@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/phaethix/ferrum-kv/releases"><img src="https://img.shields.io/badge/release-v0.5.0--dev-blue" alt="Release" /></a>
+  <a href="https://github.com/phaethix/ferrum-kv/releases"><img src="https://img.shields.io/badge/release-v0.5.0-blue" alt="Release" /></a>
   <a href="./LICENSE"><img src="https://img.shields.io/badge/license-MIT-green" alt="License" /></a>
   <a href="https://github.com/phaethix/ferrum-kv/actions/workflows/ci.yml"><img src="https://github.com/phaethix/ferrum-kv/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
   <img src="https://img.shields.io/badge/rust-1.85%2B-orange" alt="Rust 1.85+" />
