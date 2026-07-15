@@ -1,0 +1,410 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>FerrumKV · Dashboard</title>
+<style>
+  :root {
+    --bg: #0e1117;
+    --panel: #161b22;
+    --panel-2: #1c2230;
+    --border: #2a3140;
+    --text: #e6edf3;
+    --muted: #8b98a9;
+    --accent: #6366f1;
+    --accent-2: #22d3ee;
+    --green: #34d399;
+    --red: #f87171;
+    --amber: #fbbf24;
+    --shadow: 0 8px 30px rgba(0, 0, 0, 0.35);
+    --radius: 14px;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica,
+      Arial, "PingFang SC", "Microsoft YaHei", sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; }
+  body {
+    background: radial-gradient(1200px 600px at 80% -10%, #1b2130 0%, var(--bg) 55%);
+    color: var(--text);
+    display: flex;
+    flex-direction: column;
+    min-height: 100vh;
+  }
+  button { font-family: inherit; cursor: pointer; }
+  input, textarea {
+    font-family: inherit;
+    color: var(--text);
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 9px 11px;
+    outline: none;
+    transition: border-color 0.15s, box-shadow 0.15s;
+  }
+  input:focus, textarea:focus {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.18);
+  }
+
+  .topbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 14px 22px;
+    border-bottom: 1px solid var(--border);
+    backdrop-filter: blur(6px);
+  }
+  .brand { display: flex; align-items: center; gap: 10px; font-size: 19px; font-weight: 600; letter-spacing: 0.3px; }
+  .brand .logo {
+    width: 30px; height: 30px; display: grid; place-items: center;
+    border-radius: 9px;
+    background: linear-gradient(135deg, var(--accent), var(--accent-2));
+    color: #0b0e14; font-weight: 800; box-shadow: var(--shadow);
+  }
+  .brand b { color: var(--accent-2); font-weight: 600; }
+  .status { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 13px; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--amber); box-shadow: 0 0 0 4px rgba(251,191,36,0.15); }
+  .dot.ok { background: var(--green); box-shadow: 0 0 0 4px rgba(52,211,153,0.15); }
+  .dot.err { background: var(--red); box-shadow: 0 0 0 4px rgba(248,113,113,0.15); }
+
+  .stats {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+    gap: 14px;
+    padding: 20px 22px 4px;
+  }
+  .card {
+    background: linear-gradient(180deg, var(--panel), var(--panel-2));
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 14px 16px;
+    box-shadow: var(--shadow);
+  }
+  .card .label { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0.6px; }
+  .card .value { margin-top: 6px; font-size: 24px; font-weight: 700; }
+  .card .value small { font-size: 13px; color: var(--muted); font-weight: 500; }
+
+  .layout {
+    flex: 1;
+    display: grid;
+    grid-template-columns: 340px 1fr;
+    gap: 18px;
+    padding: 18px 22px;
+    min-height: 0;
+  }
+  @media (max-width: 820px) { .layout { grid-template-columns: 1fr; } }
+
+  .keys-panel, .detail {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+    display: flex; flex-direction: column;
+    min-height: 0;
+  }
+  .search { display: flex; gap: 8px; padding: 14px; border-bottom: 1px solid var(--border); }
+  .search input { flex: 1; }
+  .btn {
+    border: 1px solid var(--border);
+    background: var(--panel-2);
+    color: var(--text);
+    border-radius: 10px;
+    padding: 9px 13px;
+    font-size: 13px;
+    transition: background 0.15s, border-color 0.15s, transform 0.05s;
+  }
+  .btn:hover { border-color: var(--accent); }
+  .btn:active { transform: translateY(1px); }
+  .btn.primary { background: linear-gradient(135deg, var(--accent), #4f46e5); border: none; color: #fff; }
+  .btn.danger { background: rgba(248,113,113,0.12); border-color: rgba(248,113,113,0.4); color: var(--red); }
+  .btn.accent2 { background: rgba(34,211,238,0.12); border-color: rgba(34,211,238,0.4); color: var(--accent-2); }
+
+  .key-list { list-style: none; margin: 0; padding: 8px; overflow-y: auto; flex: 1; }
+  .key-list li {
+    padding: 9px 11px; border-radius: 9px; cursor: pointer;
+    display: flex; align-items: center; justify-content: space-between; gap: 8px;
+    border: 1px solid transparent;
+  }
+  .key-list li:hover { background: var(--panel-2); }
+  .key-list li.active { background: rgba(99,102,241,0.14); border-color: rgba(99,102,241,0.5); }
+  .key-list .kname { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .key-list .ttl { font-size: 11px; color: var(--muted); flex-shrink: 0; }
+  .key-list .ttl.live { color: var(--accent-2); }
+
+  .pager { display: flex; align-items: center; justify-content: center; gap: 12px; padding: 10px; border-top: 1px solid var(--border); color: var(--muted); font-size: 13px; }
+  .add-btn { margin: 0 14px 14px; }
+
+  .detail { padding: 0; }
+  .empty { flex: 1; display: grid; place-items: center; color: var(--muted); font-size: 14px; }
+  .detail-body { padding: 18px; display: flex; flex-direction: column; gap: 10px; overflow-y: auto; }
+  .detail-head { display: flex; align-items: center; gap: 10px; }
+  .detail-head input.key-name { flex: 1; font-family: ui-monospace, monospace; font-weight: 600; }
+  .badge { font-size: 11px; color: var(--accent-2); border: 1px solid rgba(34,211,238,0.35); padding: 3px 8px; border-radius: 999px; }
+  .detail label { font-size: 12px; color: var(--muted); margin-top: 4px; }
+  textarea#detail-value { resize: vertical; font-family: ui-monospace, monospace; line-height: 1.5; }
+  .detail-actions { display: flex; align-items: center; gap: 10px; margin-top: 4px; }
+  #detail-msg { font-size: 13px; color: var(--green); }
+
+  .console {
+    margin: 0 22px 22px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+    overflow: hidden;
+  }
+  .console-head { display: flex; align-items: center; gap: 8px; padding: 10px 12px; border-bottom: 1px solid var(--border); }
+  .console-head span { font-size: 12px; text-transform: uppercase; letter-spacing: 0.6px; color: var(--muted); }
+  .console-head input { flex: 1; font-family: ui-monospace, monospace; }
+  #console-out {
+    margin: 0; padding: 12px 14px; max-height: 200px; overflow-y: auto;
+    font-family: ui-monospace, monospace; font-size: 13px; line-height: 1.55;
+    color: #cdd6e0; white-space: pre-wrap; word-break: break-word;
+  }
+  #console-out .line { padding: 1px 0; }
+  #console-out .cmd { color: var(--accent-2); }
+  #console-out .err { color: var(--red); }
+  .hint { color: var(--muted); font-size: 12px; }
+</style>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand"><span class="logo">◆</span> Ferrum<b>KV</b></div>
+    <div class="status"><span class="dot" id="status-dot"></span> <span id="status-text">connecting…</span></div>
+  </header>
+
+  <section class="stats" id="stats"></section>
+
+  <main class="layout">
+    <aside class="keys-panel">
+      <div class="search">
+        <input id="filter" placeholder="Filter keys (e.g. user:*)" />
+        <button class="btn" id="search-btn">Search</button>
+      </div>
+      <ul class="key-list" id="key-list"></ul>
+      <div class="pager">
+        <button class="btn" id="prev">‹</button>
+        <span id="page-info">—</span>
+        <button class="btn" id="next">›</button>
+      </div>
+      <button class="btn accent2 add-btn" id="add-btn">+ Add Key</button>
+    </aside>
+
+    <section class="detail" id="detail">
+      <div class="empty" id="detail-empty">Select a key to view its value, or click “+ Add Key”.</div>
+      <div class="detail-body" id="detail-body" hidden>
+        <div class="detail-head">
+          <input class="key-name" id="detail-key" placeholder="key" />
+          <span class="badge" id="detail-type">string</span>
+        </div>
+        <label>TTL (seconds · 0 = no expiry)</label>
+        <input id="detail-ttl" type="number" min="0" value="0" />
+        <label>Value</label>
+        <textarea id="detail-value" rows="12" placeholder="value"></textarea>
+        <div class="detail-actions">
+          <button class="btn primary" id="save-btn">Save</button>
+          <button class="btn danger" id="del-btn">Delete</button>
+          <span id="detail-msg"></span>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <section class="console">
+    <div class="console-head">
+      <span>Console</span>
+      <input id="cmd-input" placeholder="Command — e.g. GET mykey  ·  SET k v  ·  DBSIZE  ·  INFO memory" />
+      <button class="btn" id="cmd-run">Run</button>
+    </div>
+    <pre id="console-out"><span class="hint">Run RESP commands against the live server. Try <b>DBSIZE</b> or <b>INFO</b>.</span></pre>
+  </section>
+
+<script>
+  const state = { filter: "*", offset: 0, limit: 50, total: 0, currentKey: null, mode: "view" };
+
+  const $ = (id) => document.getElementById(id);
+
+  function bytes(n) {
+    if (n < 1024) return n + " B";
+    const u = ["KB", "MB", "GB", "TB"];
+    let i = -1;
+    do { n /= 1024; i++; } while (n >= 1024 && i < u.length - 1);
+    return n.toFixed(n < 10 ? 2 : 1) + " " + u[i];
+  }
+  function fmtTtl(ms) {
+    if (ms < 0) return "no ttl";
+    const s = Math.round(ms / 1000);
+    if (s < 60) return s + "s";
+    if (s < 3600) return Math.round(s / 60) + "m";
+    if (s < 86400) return Math.round(s / 3600) + "h";
+    return Math.round(s / 86400) + "d";
+  }
+
+  async function api(path, opts) {
+    try {
+      const resp = await fetch(path, opts);
+      let data = null;
+      const text = await resp.text();
+      try { data = JSON.parse(text); } catch { data = { error: text }; }
+      return { ok: resp.ok, status: resp.status, data };
+    } catch (e) {
+      return { ok: false, status: 0, data: { error: String(e) } };
+    }
+  }
+
+  async function loadStats() {
+    const { ok, data } = await api("/api/info");
+    const dot = $("status-dot"), txt = $("status-text");
+    if (ok) {
+      dot.className = "dot ok";
+      txt.textContent = "connected · v" + (data.version || "?");
+      const cards = [
+        { label: "Keys", value: data.keys.toLocaleString() },
+        { label: "Memory used", value: bytes(data.used_memory) + (data.max_memory ? " <small>/ " + bytes(data.max_memory) + "</small>" : "") },
+        { label: "Hit ratio", value: (data.hit_ratio * 100).toFixed(1) + "%" },
+        { label: "Eviction", value: data.eviction_policy || "—" },
+        { label: "Expiring", value: (data.expires || 0).toLocaleString() },
+        { label: "Uptime", value: ((data.uptime_sec || 0) / 60).toFixed(0) + " <small>min</small>" },
+      ];
+      $("stats").innerHTML = cards.map(c =>
+        `<div class="card"><div class="label">${c.label}</div><div class="value">${c.value}</div></div>`
+      ).join("");
+    } else {
+      dot.className = "dot err";
+      txt.textContent = "disconnected";
+    }
+  }
+
+  async function loadKeys() {
+    const q = `filter=${encodeURIComponent(state.filter)}&limit=${state.limit}&offset=${state.offset}`;
+    const { ok, data } = await api("/api/keys?" + q);
+    if (!ok) return;
+    state.total = data.total || 0;
+    const list = $("key-list");
+    list.innerHTML = "";
+    (data.keys || []).forEach(k => {
+      const li = document.createElement("li");
+      li.dataset.key = k.key;
+      const ttlCls = k.ttl_ms >= 0 ? "ttl live" : "ttl";
+      li.innerHTML = `<span class="kname">${escapeHtml(k.key)}</span><span class="${ttlCls}">${k.ttl_ms >= 0 ? fmtTtl(k.ttl_ms) : "∞"}</span>`;
+      li.onclick = () => selectKey(k.key);
+      if (k.key === state.currentKey) li.classList.add("active");
+      list.appendChild(li);
+    });
+    const start = state.total === 0 ? 0 : state.offset + 1;
+    const end = Math.min(state.offset + state.limit, state.total);
+    $("page-info").textContent = state.total === 0 ? "no keys" : `${start}–${end} of ${state.total}`;
+  }
+
+  function escapeHtml(s) {
+    return s.replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+  }
+
+  async function selectKey(key) {
+    state.currentKey = key;
+    state.mode = "view";
+    const { ok, data } = await api("/api/keys/" + encodeURIComponent(key));
+    $("detail-empty").hidden = true;
+    $("detail-body").hidden = false;
+    if (!ok) { $("detail-msg").textContent = data.error || "not found"; return; }
+    $("detail-key").value = data.key;
+    $("detail-key").readOnly = true;
+    $("detail-ttl").value = data.ttl_ms >= 0 ? Math.round(data.ttl_ms / 1000) : 0;
+    $("detail-value").value = data.value ?? "";
+    $("detail-msg").textContent = "";
+    document.querySelectorAll(".key-list li").forEach(li =>
+      li.classList.toggle("active", li.dataset.key === key));
+  }
+
+  function newKey() {
+    state.currentKey = null;
+    state.mode = "create";
+    $("detail-empty").hidden = true;
+    $("detail-body").hidden = false;
+    $("detail-key").value = "";
+    $("detail-key").readOnly = false;
+    $("detail-ttl").value = 0;
+    $("detail-value").value = "";
+    $("detail-msg").textContent = "";
+    $("detail-key").focus();
+  }
+
+  async function saveKey() {
+    const key = $("detail-key").value.trim();
+    const value = $("detail-value").value;
+    const ttl = $("detail-ttl").value || 0;
+    if (!key) { $("detail-msg").textContent = "key required"; $("detail-msg").style.color = "var(--red)"; return; }
+    const body = new URLSearchParams({ value, ttl });
+    let res;
+    if (state.mode === "create") {
+      body.set("key", key);
+      res = await api("/api/keys", { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body });
+    } else {
+      res = await api("/api/keys/" + encodeURIComponent(key), { method: "PUT", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body });
+    }
+    if (res.ok) {
+      $("detail-msg").style.color = "var(--green)";
+      $("detail-msg").textContent = "saved";
+      state.currentKey = key; state.mode = "view"; $("detail-key").readOnly = true;
+      loadKeys();
+    } else {
+      $("detail-msg").style.color = "var(--red)";
+      $("detail-msg").textContent = res.data.error || "save failed";
+    }
+  }
+
+  async function deleteKey() {
+    if (!state.currentKey) return;
+    const res = await api("/api/keys/" + encodeURIComponent(state.currentKey), { method: "DELETE" });
+    if (res.ok) {
+      state.currentKey = null;
+      $("detail-body").hidden = true;
+      $("detail-empty").hidden = false;
+      loadKeys();
+    } else {
+      $("detail-msg").style.color = "var(--red)";
+      $("detail-msg").textContent = res.data.error || "delete failed";
+    }
+  }
+
+  async function runCommand() {
+    const input = $("cmd-input").value.trim();
+    if (!input) return;
+    const out = $("console-out");
+    const line = document.createElement("div");
+    line.className = "line cmd";
+    line.textContent = "> " + input;
+    out.appendChild(line);
+    const res = await api("/api/command", { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: new URLSearchParams({ command: input }) });
+    const resp = document.createElement("div");
+    if (res.ok) {
+      resp.className = "line";
+      resp.textContent = (res.data.response ?? "");
+    } else {
+      resp.className = "line err";
+      resp.textContent = res.data.error || "command failed";
+    }
+    out.appendChild(resp);
+    out.scrollTop = out.scrollHeight;
+    $("cmd-input").value = "";
+    loadStats(); loadKeys();
+  }
+
+  // wire up
+  $("search-btn").onclick = () => { state.filter = $("filter").value.trim() || "*"; state.offset = 0; loadKeys(); };
+  $("filter").addEventListener("keydown", e => { if (e.key === "Enter") $("search-btn").click(); });
+  $("add-btn").onclick = newKey;
+  $("save-btn").onclick = saveKey;
+  $("del-btn").onclick = deleteKey;
+  $("cmd-run").onclick = runCommand;
+  $("cmd-input").addEventListener("keydown", e => { if (e.key === "Enter") runCommand(); });
+  $("prev").onclick = () => { if (state.offset >= state.limit) { state.offset -= state.limit; loadKeys(); } };
+  $("next").onclick = () => { if (state.offset + state.limit < state.total) { state.offset += state.limit; loadKeys(); } };
+
+  loadStats();
+  loadKeys();
+  setInterval(() => { loadStats(); loadKeys(); }, 2000);
+</script>
+</body>
+</html>
