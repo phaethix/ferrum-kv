@@ -2,7 +2,7 @@
 
 > A self-tuning cache eviction algorithm that blends recency, frequency, and TTL urgency into a single score — and adapts its own weights from live hit-ratio feedback.
 
-- **Status:** Original algorithm, shipped since `v0.3`
+- **Status:** Adaptive hybrid algorithm, shipped since `v0.3`
 - **Source:** [`src/storage/eviction.rs`](https://github.com/phaethix/ferrum-kv/blob/master/src/storage/eviction.rs)
 - **Related:** [Whitepaper §9.5](https://github.com/phaethix/ferrum-kv/blob/master/docs/design/whitepaper.md)
 

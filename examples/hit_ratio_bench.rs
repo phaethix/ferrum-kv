@@ -46,6 +46,7 @@ enum Pattern {
     Shift,
     Mixed,
     Scan,
+    Ttl,
 }
 
 impl Pattern {
@@ -55,6 +56,7 @@ impl Pattern {
             Pattern::Shift => "shift",
             Pattern::Mixed => "mixed",
             Pattern::Scan => "scan",
+            Pattern::Ttl => "ttl",
         }
     }
 }
@@ -130,8 +132,20 @@ struct Params {
     epochs: u64,
     zipf_s: f64,
     hot_frac: f64,
+    durable_frac: f64,
     base_port: u16,
 }
+
+/// TTL (seconds) given to the durable hot set in the `ttl` pattern. Long
+/// enough that it is never eligible for AHE's short-TTL eviction penalty.
+const DURABLE_TTL: u64 = 3600;
+
+/// TTL (seconds) given to the churning ephemeral set in the `ttl` pattern.
+/// Long enough that keys don't self-expire during a run (so they keep
+/// pressuring the cache and force eviction), but under 30s so AHE's
+/// `TTL_PENALTY` kicks in and it prefers evicting these soon-to-expire keys
+/// over the durable hot set.
+const EPHEMERAL_TTL: u64 = 25;
 
 struct Cdfs {
     whole: Vec<f64>,
@@ -164,6 +178,34 @@ fn gen_id(pattern: Pattern, op: u64, ops: u64, p: &Params, cdfs: &Cdfs, rng: &mu
                 sample_zipf(&cdfs.hot, rng.next_f64())
             } else {
                 op % p.working_set
+            }
+        }
+        Pattern::Ttl => {
+            // TTL-heavy workload: a fraction of traffic hits a *durable* hot
+            // set (long TTL) that should stay resident, while the rest churns
+            // through a LARGE *ephemeral* set with short TTLs. The ephemeral
+            // pool is large (so the cache is under real eviction pressure,
+            // ~20:1 like the other patterns) but Zipf-skewed, so a hot subset
+            // of ephemeral keys looks valuable to a recency/frequency policy.
+            //
+            // A TTL-aware policy (AHE) instead sees the short TTLs and evicts
+            // the ephemeral keys first, preserving the durable set. LRU/LFU
+            // cannot tell them apart from the durable keys and end up evicting
+            // durable data to make room for soon-to-expire junk. This is the
+            // scenario AHE's TTL awareness is for.
+            if rng.next_f64() < p.durable_frac {
+                // Durable pool is intentionally smaller than the cache
+                // (`capacity/2`) so there is spare room the ephemeral keys
+                // compete for. A recency/frequency policy that protects the hot
+                // ephemeral subset will evict some durable keys to make room;
+                // a TTL-aware policy keeps the durable set resident.
+                sample_zipf(&cdfs.hot, rng.next_f64()) % (p.capacity / 2).max(1)
+            } else {
+                // Ephemeral: Zipf-skewed over a large pool so there is real
+                // eviction pressure and a hot ephemeral subset for LRU/LFU to
+                // mistakenly protect.
+                let pool = (p.working_set - p.capacity).max(1);
+                p.capacity + sample_zipf(&cdfs.whole, rng.next_f64()) % pool
             }
         }
     }
@@ -206,6 +248,12 @@ fn read_reply(s: &mut TcpStream) -> std::io::Result<Reply> {
             Ok(Reply::Simple)
         }
         b'-' => Ok(Reply::Error(read_line(s)?)),
+        b':' => {
+            // Integer reply (e.g. EXPIRE returns :1/:0). We only issue EXPIRE
+            // to attach a TTL and discard the result, so the value is ignored.
+            let _ = read_line(s)?;
+            Ok(Reply::Simple)
+        }
         b'$' => {
             let line = read_line(s)?;
             let len: i64 = line
@@ -250,6 +298,19 @@ fn build_set(key: &[u8], value: &[u8]) -> Vec<u8> {
     out
 }
 
+fn build_set_ex(key: &[u8], ttl_secs: u64) -> Vec<u8> {
+    // FerrumKV's SET does not accept inline EX/PX options, so the caller
+    // issues a separate EXPIRE after the SET. This helper builds that
+    // EXPIRE frame.
+    let ttl = ttl_secs.to_string();
+    let mut out = Vec::with_capacity(32 + key.len() + ttl.len());
+    out.extend_from_slice(b"*3\r\n");
+    append_bulk(&mut out, b"EXPIRE");
+    append_bulk(&mut out, key);
+    append_bulk(&mut out, ttl.as_bytes());
+    out
+}
+
 fn connect(addr: &str) -> std::io::Result<TcpStream> {
     let s = TcpStream::connect(addr)?;
     s.set_nodelay(true).ok();
@@ -281,6 +342,19 @@ fn run_workload(addr: &str, pattern: Pattern, p: &Params, cdfs: &Cdfs) -> std::i
                 // Cache miss -> read-through populate, which may trigger eviction.
                 s.write_all(&build_set(&key, &value))?;
                 let _ = read_reply(&mut s);
+                // For the TTL workload, attach a TTL after the SET: durable
+                // keys (id < capacity) get a long TTL, ephemeral keys a short
+                // one so AHE's TTL penalty engages and it prefers evicting
+                // them over the durable hot set.
+                if pattern == Pattern::Ttl {
+                    let ttl = if id < p.capacity {
+                        DURABLE_TTL
+                    } else {
+                        EPHEMERAL_TTL
+                    };
+                    s.write_all(&build_set_ex(&key, ttl))?;
+                    let _ = read_reply(&mut s);
+                }
             }
             Reply::Bulk(_) => {}
             Reply::Error(e) => {
@@ -381,6 +455,7 @@ fn parse_patterns(s: &str) -> Vec<Pattern> {
             "shift" => Pattern::Shift,
             "mixed" => Pattern::Mixed,
             "scan" => Pattern::Scan,
+            "ttl" => Pattern::Ttl,
             other => panic!("unknown pattern: {other}"),
         })
         .collect()
@@ -411,6 +486,7 @@ fn parse_args() -> Config {
         epochs: 8,
         zipf_s: 1.0,
         hot_frac: 0.7,
+        durable_frac: 0.5,
         base_port: 6391,
     };
     let mut patterns = parse_patterns("zipf,shift,mixed,scan");
@@ -432,6 +508,7 @@ fn parse_args() -> Config {
             "--epochs" => params.epochs = val().parse().expect("epochs"),
             "--zipf-s" => params.zipf_s = val().parse().expect("zipf-s"),
             "--hot-frac" => params.hot_frac = val().parse().expect("hot-frac"),
+            "--durable-frac" => params.durable_frac = val().parse().expect("durable-frac"),
             "--base-port" => params.base_port = val().parse().expect("base-port"),
             "--patterns" => patterns = parse_patterns(&val()),
             "--policies" => policies = parse_policies(&val()),
@@ -453,8 +530,8 @@ fn print_help() {
     eprintln!(
         "usage: hit_ratio_bench [--working-set N] [--capacity N] [--ops N] \
          [--pace-ms F] [--value-size B] [--seed N] [--epochs N] \
-         [--zipf-s F] [--hot-frac F] [--base-port P] \
-         [--patterns zipf,shift,mixed,scan] [--policies lru,lfu,ahe,random]"
+         [--zipf-s F] [--hot-frac F] [--durable-frac F] [--base-port P] \
+         [--patterns zipf,shift,mixed,scan,ttl] [--policies lru,lfu,ahe,random]"
     );
 }
 
