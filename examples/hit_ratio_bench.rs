@@ -150,7 +150,7 @@ fn gen_id(pattern: Pattern, op: u64, ops: u64, p: &Params, cdfs: &Cdfs, rng: &mu
             // non-stationary workload: a frequency policy clings to the
             // previous band while a recency/adaptive policy can follow.
             let band = (p.working_set / p.epochs).max(1);
-            let epoch = (op * p.epochs / ops.max(1)) as u64;
+            let epoch = op * p.epochs / ops.max(1);
             let base = epoch * band;
             let within = sample_zipf(&cdfs.band, rng.next_f64());
             (base + within) % p.working_set
@@ -259,12 +259,7 @@ fn connect(addr: &str) -> std::io::Result<TcpStream> {
 }
 
 /// Runs one workload against a live server and returns the hit ratio.
-fn run_workload(
-    addr: &str,
-    pattern: Pattern,
-    p: &Params,
-    cdfs: &Cdfs,
-) -> std::io::Result<f64> {
+fn run_workload(addr: &str, pattern: Pattern, p: &Params, cdfs: &Cdfs) -> std::io::Result<f64> {
     let mut s = connect(addr)?;
     let value = vec![b'v'; p.value_size];
     let pace = if p.pace_ms > 0.0 {
@@ -325,7 +320,9 @@ fn parse_hit_ratio(body: &[u8]) -> std::io::Result<f64> {
                 Ok(h as f64 / total as f64)
             }
         }
-        _ => Err(std::io::Error::other("missing keyspace_hits/misses in INFO")),
+        _ => Err(std::io::Error::other(
+            "missing keyspace_hits/misses in INFO",
+        )),
     }
 }
 
@@ -496,12 +493,20 @@ fn main() {
             let mut child = match start_server(&bin, policy.name(), max_memory, &addr) {
                 Ok(c) => c,
                 Err(e) => {
-                    eprintln!("!! {} {}: failed to start server: {e}", policy.name(), pattern.as_str());
+                    eprintln!(
+                        "!! {} {}: failed to start server: {e}",
+                        policy.name(),
+                        pattern.as_str()
+                    );
                     continue;
                 }
             };
             if !wait_ready(&addr, Duration::from_secs(10)) {
-                eprintln!("!! {} {}: server not ready", policy.name(), pattern.as_str());
+                eprintln!(
+                    "!! {} {}: server not ready",
+                    policy.name(),
+                    pattern.as_str()
+                );
                 let _ = child.kill();
                 continue;
             }
@@ -534,8 +539,11 @@ fn main() {
 fn print_table(cfg: &Config, results: &[Vec<f64>], ok: &[Vec<bool>], max_memory: u64) {
     let p = &cfg.params;
     println!();
-    println!("## Hit ratio by eviction policy (working set {} keys, cache cap {} KiB)",
-             p.working_set, max_memory / 1024);
+    println!(
+        "## Hit ratio by eviction policy (working set {} keys, cache cap {} KiB)",
+        p.working_set,
+        max_memory / 1024
+    );
     println!();
     // Header
     let mut header = String::from("| Policy");
@@ -548,7 +556,7 @@ fn print_table(cfg: &Config, results: &[Vec<f64>], ok: &[Vec<bool>], max_memory:
     for _ in &cfg.patterns {
         sep.push_str("|--------:");
     }
-    sep.push_str("|");
+    sep.push('|');
     println!("{sep}");
     for (pi, &policy) in cfg.policies.iter().enumerate() {
         let mut row = format!("| `{}`", policy.name());
