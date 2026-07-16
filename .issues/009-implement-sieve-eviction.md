@@ -2,7 +2,7 @@
 id: FERRUM-009
 title: "Implement SIEVE cache eviction algorithm (NSDI'24)"
 severity: medium
-status: open
+status: in-progress
 component: storage
 found_date: 2026-07-04
 reporter: PM Research
@@ -94,6 +94,30 @@ cargo test sieve_quick_demotion
 - Zhang et al., "SIEVE is Simpler than LRU: an Efficient Turn-Key Eviction Algorithm for Web Caches," NSDI'24.
 - https://www.usenix.org/conference/nsdi24/presentation/zhang-yazhuo
 - https://github.com/Thesys-lab/NSDI24-SIEVE
+
+## Implementation
+
+Implemented in PR against `master`. Summary of the approach:
+
+- New `src/storage/sieve.rs` (`SieveState`) holds an `IndexMap<Vec<u8>, bool>`
+  FIFO queue + a hand pointer + per-key `visited` bit. `IndexMap` gives O(1)
+  insertion-order iteration *and* O(1) removal by key, which the hand sweep
+  needs to drop tombstones. This keeps SIEVE stateful and self-contained,
+  mirroring how `AdaptiveHybridState` lives in the engine.
+- `EvictionPolicy` gains four variants: `allkeys-sieve`, `volatile-sieve`,
+  `allkeys-sieves`, `volatile-sieves` (the `-s` pair is the FerrumKV-original
+  TTL-aware SIEVE-S; keys within `SIEVE_S_TTL_THRESHOLD` of expiry are
+  force-demoted).
+- The engine maintains the SIEVE queue on every insert / access / remove (so a
+  runtime switch via `set_eviction_config` is immediately consistent) and
+  special-cases SIEVE in `enforce_memory_limit` — SIEVE does not use the random
+  sample path, unlike the approximate policies.
+- Unit tests in `sieve.rs` (quick demotion, all-visited wrap, volatile scope,
+  SIEVE-S force-demote) and end-to-end tests in `tests/eviction_test.rs`.
+
+Design note: because the engine only stores a monotonic deadline, SIEVE-S's
+"near expiry" is approximated against a fixed `SIEVE_S_HORIZON_MS` horizon
+rather than each key's original TTL.
 
 ## Metadata
 

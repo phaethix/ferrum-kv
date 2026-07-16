@@ -35,6 +35,16 @@ pub enum EvictionPolicy {
     AllKeysAhe,
     /// AHE restricted to keys with a TTL.
     VolatileAhe,
+    /// SIEVE (NSDI'24): a FIFO queue + one hand. Simpler than LRU yet beats
+    /// it on many production traces. State lives in [`crate::storage::sieve`].
+    AllKeysSieve,
+    /// SIEVE restricted to keys with a TTL.
+    VolatileSieve,
+    /// SIEVE-S: FerrumKV's TTL-aware SIEVE variant — keys near expiry are
+    /// force-demoted so they become immediate eviction candidates.
+    AllKeysSieveS,
+    /// SIEVE-S restricted to keys with a TTL.
+    VolatileSieveS,
 }
 
 impl EvictionPolicy {
@@ -51,6 +61,10 @@ impl EvictionPolicy {
             "volatile-ttl" => Some(Self::VolatileTtl),
             "allkeys-ahe" => Some(Self::AllKeysAhe),
             "volatile-ahe" => Some(Self::VolatileAhe),
+            "allkeys-sieve" => Some(Self::AllKeysSieve),
+            "volatile-sieve" => Some(Self::VolatileSieve),
+            "allkeys-sieves" => Some(Self::AllKeysSieveS),
+            "volatile-sieves" => Some(Self::VolatileSieveS),
             _ => None,
         }
     }
@@ -67,21 +81,39 @@ impl EvictionPolicy {
             Self::VolatileTtl => "volatile-ttl",
             Self::AllKeysAhe => "allkeys-ahe",
             Self::VolatileAhe => "volatile-ahe",
+            Self::AllKeysSieve => "allkeys-sieve",
+            Self::VolatileSieve => "volatile-sieve",
+            Self::AllKeysSieveS => "allkeys-sieves",
+            Self::VolatileSieveS => "volatile-sieves",
         }
     }
 
     pub fn scope(self) -> EvictionScope {
         match self {
             Self::NoEviction => EvictionScope::AllKeys,
-            Self::AllKeysLru | Self::AllKeysLfu | Self::AllKeysRandom | Self::AllKeysAhe => {
-                EvictionScope::AllKeys
-            }
+            Self::AllKeysLru
+            | Self::AllKeysLfu
+            | Self::AllKeysRandom
+            | Self::AllKeysAhe
+            | Self::AllKeysSieve
+            | Self::AllKeysSieveS => EvictionScope::AllKeys,
             Self::VolatileLru
             | Self::VolatileLfu
             | Self::VolatileRandom
             | Self::VolatileTtl
-            | Self::VolatileAhe => EvictionScope::Volatile,
+            | Self::VolatileAhe
+            | Self::VolatileSieve
+            | Self::VolatileSieveS => EvictionScope::Volatile,
         }
+    }
+
+    /// Whether this policy is one of the stateful SIEVE variants that consult
+    /// the engine's FIFO queue rather than a sampled candidate set.
+    pub fn is_sieve(self) -> bool {
+        matches!(
+            self,
+            Self::AllKeysSieve | Self::VolatileSieve | Self::AllKeysSieveS | Self::VolatileSieveS
+        )
     }
 }
 
@@ -174,6 +206,14 @@ pub fn pick_victim(policy: EvictionPolicy, candidates: Vec<Candidate>) -> Option
         EvictionPolicy::AllKeysAhe | EvictionPolicy::VolatileAhe => {
             pick_victim_ahe(AHE_DEFAULT_ALPHA, candidates)
         }
+        // SIEVE selects its victim from the engine's FIFO queue, not from a
+        // sampled candidate set, so this function cannot serve it. Callers
+        // (`enforce_memory_limit`) special-case SIEVE and never reach this
+        // branch for these variants.
+        EvictionPolicy::AllKeysSieve
+        | EvictionPolicy::VolatileSieve
+        | EvictionPolicy::AllKeysSieveS
+        | EvictionPolicy::VolatileSieveS => None,
     }
 }
 
@@ -446,6 +486,10 @@ mod tests {
             "volatile-ttl",
             "allkeys-ahe",
             "volatile-ahe",
+            "allkeys-sieve",
+            "volatile-sieve",
+            "allkeys-sieves",
+            "volatile-sieves",
         ] {
             let p = EvictionPolicy::from_name(name).unwrap();
             assert_eq!(p.name(), name);

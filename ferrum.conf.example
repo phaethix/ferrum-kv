@@ -47,6 +47,10 @@ loglevel info
 #   allkeys-random   — random key
 #   volatile-random  — random key with TTL
 #   volatile-ttl     — key with the shortest remaining TTL
+#   allkeys-sieve    — SIEVE (NSDI'24): FIFO queue + hand, simpler than LRU
+#   volatile-sieve   — SIEVE restricted to keys with TTL
+#   allkeys-sieves   — SIEVE-S: FerrumKV's TTL-aware SIEVE (force-demotes near-expiry keys)
+#   volatile-sieves  — SIEVE-S restricted to keys with TTL
 #   allkeys-ahe      — Adaptive Hybrid Eviction (recency + frequency + TTL)
 #   volatile-ahe     — AHE restricted to keys with TTL
 # maxmemory-policy noeviction

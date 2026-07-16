@@ -42,7 +42,10 @@ use crate::storage::engine::util::{
     deadline_to_epoch_ms, log_aof_result, rng_seed, sample_candidates, validate_key,
     validate_value, xorshift32,
 };
-use crate::storage::eviction::{self, AdaptiveHybridState, EvictionConfig, EvictionPolicy};
+use crate::storage::eviction::{
+    self, AdaptiveHybridState, EvictionConfig, EvictionPolicy, EvictionScope,
+};
+use crate::storage::sieve::SieveState;
 
 /// Maximum allowed key size in bytes (64 KiB).
 pub const KEY_MAX_BYTES: usize = 64 * 1024;
@@ -113,6 +116,12 @@ pub struct KvEngine {
     /// Adaptive Hybrid Eviction controller. Shared state so every caller
     /// sees the same `alpha`, regardless of which engine clone they hold.
     pub(crate) ahe: Arc<Mutex<AdaptiveHybridState>>,
+    /// SIEVE eviction FIFO queue + hand (NSDI'24). Like [`KvEngine::ahe`], it
+    /// is shared so every engine clone sees the same queue. It is maintained
+    /// on every insert / access / remove so a runtime switch to a SIEVE
+    /// policy (via [`KvEngine::set_eviction_config`]) is immediately
+    /// consistent without replaying the whole keyspace.
+    pub(crate) sieve: Arc<Mutex<SieveState>>,
     /// Seed for the per-call PRNG used to drive probabilistic LFU
     /// increments and random-policy tie breaks. Xorshift32 is plenty for
     /// sampling purposes and keeps the engine free of `rand` as a
@@ -137,6 +146,7 @@ impl KvEngine {
             hits: Arc::new(AtomicU64::new(0)),
             misses: Arc::new(AtomicU64::new(0)),
             ahe: Arc::new(Mutex::new(AdaptiveHybridState::default())),
+            sieve: Arc::new(Mutex::new(SieveState::new())),
             // Seed the PRNG from the system clock so two engines started
             // in the same second don't share a sequence. The seed is
             // never exposed, so predictability is not a concern.
@@ -156,8 +166,19 @@ impl KvEngine {
     /// Replaces the live eviction configuration.
     ///
     /// Takes effect for all subsequent writes; already-stored keys are
-    /// eligible under the new policy immediately.
+    /// eligible under the new policy immediately. When the new policy is a
+    /// SIEVE variant the FIFO queue is rebuilt from the current keyspace so
+    /// the algorithm has accurate state at once; when leaving SIEVE the queue
+    /// is cleared so it does not retain stale entries.
     pub fn set_eviction_config(&self, cfg: EvictionConfig) -> Result<(), FerrumError> {
+        if cfg.policy.is_sieve() {
+            let store = self.store.read()?;
+            let mut sieve = self.sieve.lock()?;
+            sieve.rebuild(&store, cfg.policy.scope());
+        } else {
+            let mut sieve = self.sieve.lock()?;
+            sieve.clear();
+        }
         let mut guard = self.eviction.write()?;
         *guard = cfg;
         Ok(())
@@ -187,6 +208,43 @@ impl KvEngine {
         }
         let previous = self.track_insert(&mut store, key, ValueEntry::new(value));
         Ok(previous.and_then(live_payload))
+    }
+
+    /// Records a (re)insertion in auxiliary eviction structures.
+    ///
+    /// Kept separate so the public command methods stay terse; callers must
+    /// already hold the write lock or own the engine reference. The SIEVE
+    /// queue is updated even when the active policy is not SIEVE so a runtime
+    /// switch to a SIEVE variant is immediately consistent.
+    #[inline]
+    fn sieve_notify_insert(&self, key: &[u8]) {
+        if let Ok(mut s) = self.sieve.lock() {
+            s.observe_insert(key);
+        }
+    }
+
+    /// Mirrors a key access into the SIEVE `visited` bit.
+    #[inline]
+    fn sieve_notify_access(&self, key: &[u8]) {
+        if let Ok(mut s) = self.sieve.lock() {
+            s.observe_access(key);
+        }
+    }
+
+    /// Mirrors a key removal from the SIEVE FIFO queue.
+    #[inline]
+    fn sieve_notify_remove(&self, key: &[u8]) {
+        if let Ok(mut s) = self.sieve.lock() {
+            s.observe_remove(key);
+        }
+    }
+
+    /// Clears the SIEVE FIFO queue (used by `FLUSHDB`).
+    #[inline]
+    fn sieve_notify_clear(&self) {
+        if let Ok(mut s) = self.sieve.lock() {
+            s.clear();
+        }
     }
 
     /// Sets `key` to `value` only if the key is not already present.
@@ -795,6 +853,7 @@ impl KvEngine {
             .map(|p| util::entry_bytes(&key, p))
             .unwrap_or(0);
         self.apply_delta(incoming as i64 - outgoing as i64);
+        self.sieve_notify_insert(&key);
         previous
     }
 
@@ -834,24 +893,43 @@ impl KvEngine {
                 return Err(FerrumError::OutOfMemory);
             }
 
-            let candidates = sample_candidates(store, cfg.policy.scope(), cfg.samples);
-            let victim = match cfg.policy {
+            // SIEVE keeps its own FIFO queue + hand, so it does not consult a
+            // random sample; the other policies do.
+            let victim_key: Option<Vec<u8>> = match cfg.policy {
                 EvictionPolicy::AllKeysAhe | EvictionPolicy::VolatileAhe => {
                     let alpha = self.ahe_alpha();
-                    eviction::pick_victim_ahe(alpha, candidates)
+                    eviction::pick_victim_ahe(
+                        alpha,
+                        sample_candidates(store, cfg.policy.scope(), cfg.samples),
+                    )
+                    .map(|c| c.key)
                 }
-                _ => eviction::pick_victim(cfg.policy, candidates),
+                EvictionPolicy::AllKeysSieve
+                | EvictionPolicy::VolatileSieve
+                | EvictionPolicy::AllKeysSieveS
+                | EvictionPolicy::VolatileSieveS => {
+                    let ttl_aware = matches!(
+                        cfg.policy,
+                        EvictionPolicy::AllKeysSieveS | EvictionPolicy::VolatileSieveS
+                    );
+                    self.evict_sieve(store, cfg.policy.scope(), ttl_aware)?
+                }
+                _ => eviction::pick_victim(
+                    cfg.policy,
+                    sample_candidates(store, cfg.policy.scope(), cfg.samples),
+                )
+                .map(|c| c.key),
             };
-            let Some(victim) = victim else {
+            let Some(victim_key) = victim_key else {
                 // For volatile policies on a dataset without TTL, Redis
                 // reports OOM; we do the same so the caller sees a clear
                 // failure instead of a silent accept.
                 return Err(FerrumError::OutOfMemory);
             };
-            self.track_remove(store, &victim.key);
+            self.track_remove(store, &victim_key);
             evicted += 1;
             if let Some(aof) = &self.aof {
-                log_aof_result("DEL", aof.append_del(&victim.key));
+                log_aof_result("DEL", aof.append_del(&victim_key));
             }
         }
 
@@ -883,7 +961,22 @@ impl KvEngine {
         if let Some(entry) = store.get_mut(key) {
             let r = self.next_rand01();
             entry.touch(r);
+            self.sieve_notify_access(key);
         }
+    }
+
+    /// Runs one SIEVE sweep and returns the key to evict, or `None` when no
+    /// eligible victim exists. The store is consulted read-only to test
+    /// eligibility (TTL scope, tombstones); the queue mutation happens inside
+    /// [`SieveState::evict_one`].
+    fn evict_sieve(
+        &self,
+        store: &HashMap<Vec<u8>, ValueEntry>,
+        scope: EvictionScope,
+        ttl_aware: bool,
+    ) -> Result<Option<Vec<u8>>, FerrumError> {
+        let mut sieve = self.sieve.lock()?;
+        Ok(sieve.evict_one(store, scope, ttl_aware, Instant::now()))
     }
 
     /// Convenience wrapper: computes the net byte increase that writing
@@ -1020,12 +1113,14 @@ impl KvEngine {
         if let Some(entry) = &removed {
             self.apply_delta(-(util::entry_bytes(key, entry) as i64));
         }
+        self.sieve_notify_remove(key);
         removed
     }
 
     /// Clears every entry, resetting the memory counter to zero.
     fn track_clear(&self, store: &mut HashMap<Vec<u8>, ValueEntry>) {
         store.clear();
+        self.sieve_notify_clear();
         self.used_memory.store(0, Ordering::Relaxed);
     }
 
