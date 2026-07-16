@@ -242,7 +242,8 @@ fn scan_argv<I: IntoIterator<Item = String>>(args: I) -> Result<ScanOutcome, Str
                             "invalid --maxmemory-policy '{value}' (expected noeviction, \
                              allkeys-lru, volatile-lru, allkeys-lfu, volatile-lfu, \
                              allkeys-random, volatile-random, volatile-ttl, \
-                             allkeys-ahe, volatile-ahe)"
+                             allkeys-ahe, volatile-ahe, allkeys-sieve, volatile-sieve, \
+                             allkeys-sieves, volatile-sieves)"
                         )
                     })?);
             }
@@ -676,6 +677,22 @@ mod tests {
     fn maxmemory_policy_flag_is_parsed() {
         let args = parse_run(&["--maxmemory-policy", "allkeys-lru"]);
         assert_eq!(args.eviction_config().policy, EvictionPolicy::AllKeysLru);
+    }
+
+    #[test]
+    fn maxmemory_policy_accepts_sieve_variants() {
+        for name in [
+            "allkeys-sieve",
+            "volatile-sieve",
+            "allkeys-sieves",
+            "volatile-sieves",
+        ] {
+            let args = parse_run(&["--maxmemory-policy", name]);
+            assert_eq!(
+                args.eviction_config().policy,
+                EvictionPolicy::from_name(name).unwrap()
+            );
+        }
     }
 
     #[test]
