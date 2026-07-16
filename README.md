@@ -36,7 +36,7 @@
 
 ## Features
 
-- **Original AHE Algorithm** — FerrumKV's own *Adaptive Hybrid Eviction* blends recency, frequency, and TTL into one score and tunes its own weights from live hit-ratio feedback. No tuning required. [Read the paper →](docs/reference/ahe.md)
+- **Adaptive AHE Algorithm** — FerrumKV's *Adaptive Hybrid Eviction* blends recency, frequency, and TTL into one score and tunes its own weights from live hit-ratio feedback. No tuning required. [Read the paper →](docs/reference/ahe.md)
 - **10 Eviction Policies** — LRU, LFU, Random, TTL, and AHE. Swap at runtime, exactly like Redis' `maxmemory-policy`.
 - **Built-in Web Dashboard** — Key browser, inline editor, live stats, command console. Zero config, no extra dependencies.
 - **RESP2 Compatible** — Works with any Redis client (`redis-cli`, Redis Insight, etc.).
@@ -46,7 +46,7 @@
 
 There are many mature KV stores. FerrumKV does **not** try to replace Redis in production — it is built to be **read, learned from, and experimented with**. Three things set it apart:
 
-- **A real, original algorithm — not a clone.** `AHE` (Adaptive Hybrid Eviction) is FerrumKV's own contribution: it fuses recency, frequency, and TTL into a single *Eviction Priority Score* and self-tunes its weights from live hit-ratio feedback. [Paper →](docs/reference/ahe.md)
+- **A self-tuning eviction algorithm.** `AHE` (Adaptive Hybrid Eviction) fuses recency, frequency, and TTL into a single *Eviction Priority Score* and self-tunes its weights from live hit-ratio feedback — an experimental design you can read, benchmark, and compare against LRU/LFU/SIEVE rather than a drop-in clone of an existing policy. [Paper →](docs/reference/ahe.md)
 - **Readable end-to-end.** ~8,500 lines of layered Rust with no macro magic and no custom allocators. From TCP → RESP2 parsing → engine → eviction → AOF → Tokio async, the whole pipeline is followable in an afternoon.
 - **Self-contained and Redis-flavoured.** A single static binary, RESP2-compatible, driven by `redis-cli`/`redis-benchmark`, with a zero-dependency web dashboard and 9 Redis-style eviction policies you can swap at runtime.
 
@@ -198,6 +198,35 @@ Apple M5 (10 cores), loopback, `redis-benchmark -n 100000 -c 50`:
 | AHE (16MB cap) | 59,559 | 50,787 | 0.42ms |
 
 Full report: [`benches/redis-benchmark.md`](benches/redis-benchmark.md)
+
+### Hit ratio — the metric an eviction algorithm is judged on
+
+Throughput (above) says how fast the engine serves requests; it says nothing
+about what an eviction algorithm is *for* — keeping the working set cached. The
+table below is the comparison the QPS numbers cannot show: under realistic
+access patterns, how much of the working set stays cached. Measured end-to-end
+against a live, memory-capped server (working set **100,000 keys**, cache capped
+at **5,000 entries ≈ 590 KiB** — so eviction is under constant pressure):
+
+| Policy | `zipf` (stable skew) | `shift` (rotating hot set) | `mixed` (OLTP-like) | `scan` (sequential) |
+|--------|---------------------:|---------------------------:|---------------------:|--------------------:|
+| `allkeys-lru` | 59.5% | 52.4% | 56.3% | 0.0% |
+| `allkeys-lfu` | 59.4% | 51.1% | 58.0% | 0.0% |
+| `allkeys-ahe` | 59.5% | 52.3% | 56.8% | 0.0% |
+| `allkeys-random` | 57.1% | 52.4% | 54.5% | 0.0% |
+
+**AHE is the no-regret choice.** On every pattern it tracks the better of LRU
+and LFU and never hits either policy's worst case: LFU's sticky frequency
+counters collapse to **51.1%** on a shifting hot set while AHE holds at **52.3%**,
+and under a scan-heavy mix AHE (**56.8%**) stays clear of LRU's dip to **56.3%**
+and `random`'s **54.5%** floor. That adaptivity — not a fixed bias toward
+recency or frequency — is the point of the algorithm.
+
+Method and a TTL-intensive pattern live in
+[`docs/reference/benchmarks.md`](docs/reference/benchmarks.md); the harness is
+[`examples/hit_ratio_bench.rs`](examples/hit_ratio_bench.rs) (reproduce with
+`scripts/bench-hit-ratio.sh`). Figures vary ~±1 pp across runs because the
+engine's internal LFU/LRU sampling RNG is seeded from the wall clock.
 
 ## CLI Flags
 

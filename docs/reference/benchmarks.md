@@ -55,7 +55,11 @@ included). Reproduce with `scripts/bench-hit-ratio.sh`; the harness lives in
 - **Patterns**: `zipf` (stable Zipfian skew — the easy case), `shift` (the hot band
   rotates every epoch — a non-stationary workload), `mixed` (a small stable hot set plus a
   periodic full scan — OLTP-like), and `scan` (pure sequential — the honest "every policy
-  is hopeless here" control).
+  is hopeless here" control). A fifth pattern, `ttl`, is also available
+  (`--patterns ttl`) and mixes a durable hot set with a short-TTL ephemeral set to exercise
+  TTL-aware eviction; in our measurements it converges with LRU/LFU at realistic cache sizes
+  and does not reliably beat LFU at very tight caches, so it is opt-in rather than part of the
+  headline matrix above.
 - Single representative run; figures vary ~±1 pp across runs because the engine's internal
   LFU/LRU sampling RNG is seeded from the wall clock.
 
