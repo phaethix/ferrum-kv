@@ -179,7 +179,8 @@ fn apply_directive(cfg: &mut FileConfig, key: &str, value: &str) -> Result<(), S
                     "invalid maxmemory-policy '{value}' (expected one of noeviction, \
                          allkeys-lru, volatile-lru, allkeys-lfu, volatile-lfu, \
                          allkeys-random, volatile-random, volatile-ttl, \
-                         allkeys-ahe, volatile-ahe)"
+                         allkeys-ahe, volatile-ahe, allkeys-sieve, volatile-sieve, \
+                         allkeys-sieves, volatile-sieves)"
                 )
             })?);
         }

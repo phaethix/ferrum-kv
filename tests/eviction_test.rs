@@ -271,6 +271,95 @@ fn allkeys_ahe_evicts_and_publishes_alpha_in_info() {
 }
 
 #[test]
+fn allkeys_sieve_evicts_over_the_wire() {
+    let engine = KvEngine::new();
+    // Room for two small entries.
+    engine
+        .set_eviction_config(EvictionConfig {
+            max_memory: 2 * (1 + 1 + 48),
+            policy: EvictionPolicy::AllKeysSieve,
+            samples: 10,
+        })
+        .unwrap();
+    let guard = spawn_server_with_engine(engine);
+    let mut stream = connect(&guard.addr);
+
+    send(&mut stream, &build_request(&[b"SET", b"a", b"1"]));
+    send(&mut stream, &build_request(&[b"SET", b"b", b"2"]));
+    // Access `a` so it becomes `visited`; `b` stays unvisited.
+    send(&mut stream, &build_request(&[b"GET", b"a"]));
+    // Insert a third key. SIEVE gives `b` (never revisited) the boot.
+    send(&mut stream, &build_request(&[b"SET", b"c", b"3"]));
+
+    // `b` should have been evicted; `a` and `c` should be alive.
+    let reply_b = send(&mut stream, &build_request(&[b"EXISTS", b"b"]));
+    assert_eq!(reply_b, b":0\r\n");
+    let reply_a = send(&mut stream, &build_request(&[b"EXISTS", b"a"]));
+    assert_eq!(reply_a, b":1\r\n");
+    let reply_c = send(&mut stream, &build_request(&[b"EXISTS", b"c"]));
+    assert_eq!(reply_c, b":1\r\n");
+}
+
+#[test]
+fn allkeys_sieves_evicts_and_publishes_policy_in_info() {
+    let engine = KvEngine::new();
+    // Room for two small entries.
+    engine
+        .set_eviction_config(EvictionConfig {
+            max_memory: 2 * (1 + 1 + 48),
+            policy: EvictionPolicy::AllKeysSieveS,
+            samples: 10,
+        })
+        .unwrap();
+    let guard = spawn_server_with_engine(engine);
+    let mut stream = connect(&guard.addr);
+
+    send(&mut stream, &build_request(&[b"SET", b"a", b"1"]));
+    send(&mut stream, &build_request(&[b"SET", b"b", b"2"]));
+    send(&mut stream, &build_request(&[b"GET", b"a"]));
+    send(&mut stream, &build_request(&[b"SET", b"c", b"3"]));
+
+    // SIEVE-S still evicts the unvisited key under pressure.
+    let reply_b = send(&mut stream, &build_request(&[b"EXISTS", b"b"]));
+    assert_eq!(reply_b, b":0\r\n");
+
+    let reply = send(&mut stream, &build_request(&[b"INFO", b"memory"]));
+    let text = String::from_utf8_lossy(&reply);
+    assert!(text.contains("maxmemory_policy:allkeys-sieves"));
+}
+
+#[test]
+fn volatile_sieve_only_considers_ttl_keys() {
+    let engine = KvEngine::new();
+    // Room for two small entries, volatile scope.
+    engine
+        .set_eviction_config(EvictionConfig {
+            max_memory: 2 * (1 + 1 + 48),
+            policy: EvictionPolicy::VolatileSieve,
+            samples: 10,
+        })
+        .unwrap();
+    let guard = spawn_server_with_engine(engine);
+    let mut stream = connect(&guard.addr);
+
+    // `a` has no TTL; `b` does. Only `b` is a candidate, so it is evicted.
+    send(&mut stream, &build_request(&[b"SET", b"a", b"1"]));
+    send(&mut stream, &build_request(&[b"SET", b"b", b"2"]));
+    send(&mut stream, &build_request(&[b"PEXPIRE", b"b", b"60000"]));
+    send(&mut stream, &build_request(&[b"SET", b"c", b"3"]));
+
+    let reply_a = send(&mut stream, &build_request(&[b"EXISTS", b"a"]));
+    assert_eq!(
+        reply_a, b":1\r\n",
+        "non-TTL key must survive volatile-sieve"
+    );
+    let reply_b = send(&mut stream, &build_request(&[b"EXISTS", b"b"]));
+    assert_eq!(reply_b, b":0\r\n", "TTL key should be evicted");
+    let reply_c = send(&mut stream, &build_request(&[b"EXISTS", b"c"]));
+    assert_eq!(reply_c, b":1\r\n");
+}
+
+#[test]
 fn info_stats_reports_keyspace_hits_and_misses() {
     let engine = KvEngine::new();
     let guard = spawn_server_with_engine(engine);
