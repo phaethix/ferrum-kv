@@ -483,3 +483,122 @@ fn non_utf8_key_and_value_round_trip_end_to_end() {
     expected.extend_from_slice(b"\r\n");
     assert_eq!(reply, expected);
 }
+
+#[test]
+fn config_get_wildcard_returns_all_eviction_params() {
+    let server = spawn_server();
+    let mut s = connect(&server.addr);
+
+    // Default engine: maxmemory=0, maxmemory-policy=noeviction,
+    // maxmemory-samples=5. `CONFIG GET *` returns a flat array of
+    // (name, value) pairs.
+    round_trip(
+        &mut s,
+        &build_request(&[b"CONFIG", b"GET", b"*"]),
+        b"*6\r\n$9\r\nmaxmemory\r\n$1\r\n0\r\n$16\r\nmaxmemory-policy\r\n$10\r\nnoeviction\
+          \r\n$17\r\nmaxmemory-samples\r\n$1\r\n5\r\n",
+    );
+}
+
+#[test]
+fn config_get_single_param_returns_one_pair() {
+    let server = spawn_server();
+    let mut s = connect(&server.addr);
+
+    round_trip(
+        &mut s,
+        &build_request(&[b"CONFIG", b"GET", b"maxmemory"]),
+        b"*2\r\n$9\r\nmaxmemory\r\n$1\r\n0\r\n",
+    );
+}
+
+#[test]
+fn config_get_unknown_param_returns_empty_array() {
+    let server = spawn_server();
+    let mut s = connect(&server.addr);
+
+    round_trip(
+        &mut s,
+        &build_request(&[b"CONFIG", b"GET", b"nonexistent"]),
+        b"*0\r\n",
+    );
+}
+
+#[test]
+fn config_set_policy_then_get_reflects_change() {
+    let server = spawn_server();
+    let mut s = connect(&server.addr);
+
+    round_trip(
+        &mut s,
+        &build_request(&[b"CONFIG", b"SET", b"maxmemory-policy", b"allkeys-lru"]),
+        b"+OK\r\n",
+    );
+    // The change must be visible immediately to a subsequent GET.
+    round_trip(
+        &mut s,
+        &build_request(&[b"CONFIG", b"GET", b"maxmemory-policy"]),
+        b"*2\r\n$16\r\nmaxmemory-policy\r\n$11\r\nallkeys-lru\r\n",
+    );
+}
+
+#[test]
+fn config_set_maxmemory_with_byte_suffix() {
+    let server = spawn_server();
+    let mut s = connect(&server.addr);
+
+    // `1mb` parses to 1_048_576 bytes via the same grammar as the config file.
+    round_trip(
+        &mut s,
+        &build_request(&[b"CONFIG", b"SET", b"maxmemory", b"1mb"]),
+        b"+OK\r\n",
+    );
+    round_trip(
+        &mut s,
+        &build_request(&[b"CONFIG", b"GET", b"maxmemory"]),
+        b"*2\r\n$9\r\nmaxmemory\r\n$7\r\n1048576\r\n",
+    );
+}
+
+#[test]
+fn config_set_maxmemory_samples_then_get() {
+    let server = spawn_server();
+    let mut s = connect(&server.addr);
+
+    round_trip(
+        &mut s,
+        &build_request(&[b"CONFIG", b"SET", b"maxmemory-samples", b"12"]),
+        b"+OK\r\n",
+    );
+    round_trip(
+        &mut s,
+        &build_request(&[b"CONFIG", b"GET", b"maxmemory-samples"]),
+        b"*2\r\n$17\r\nmaxmemory-samples\r\n$2\r\n12\r\n",
+    );
+}
+
+#[test]
+fn config_set_unknown_param_is_rejected() {
+    let server = spawn_server();
+    let mut s = connect(&server.addr);
+
+    round_trip(
+        &mut s,
+        &build_request(&[b"CONFIG", b"SET", b"bogus", b"1"]),
+        b"-ERR Unknown parameter 'bogus'\r\n",
+    );
+    // The connection must stay usable after the error.
+    round_trip(&mut s, &build_request(&[b"PING"]), b"+PONG\r\n");
+}
+
+#[test]
+fn config_set_invalid_policy_is_rejected() {
+    let server = spawn_server();
+    let mut s = connect(&server.addr);
+
+    round_trip(
+        &mut s,
+        &build_request(&[b"CONFIG", b"SET", b"maxmemory-policy", b"not-a-policy"]),
+        b"-ERR Invalid argument 'not-a-policy' for CONFIG SET 'maxmemory-policy'\r\n",
+    );
+}

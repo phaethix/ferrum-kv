@@ -53,6 +53,14 @@ pub enum Command {
     /// "everything"; only known sections are recognised and unknown ones
     /// produce an empty reply, as in Redis.
     Info { section: Option<Vec<u8>> },
+    /// `CONFIG SET parameter value` / `CONFIG GET parameter|*`.
+    ///
+    /// A container command like `MEMORY`. Only the eviction-related
+    /// parameters (`maxmemory`, `maxmemory-policy`, `maxmemory-samples`) are
+    /// recognised; other parameters and unknown subcommands are rejected.
+    /// `sub` is the verb (`SET`/`GET`, already upper-cased at parse time) and
+    /// `args` holds the parameter name, plus its value for `SET`.
+    Config { sub: Vec<u8>, args: Vec<Vec<u8>> },
 }
 
 /// Outcome of attempting to parse a single RESP2 frame from a byte buffer.
@@ -458,6 +466,48 @@ fn build_command(parts: Vec<Vec<u8>>) -> Result<Command, FerrumError> {
             Ok(Command::Info {
                 section: args.into_iter().next(),
             })
+        }
+        b"CONFIG" => {
+            // Container command in Redis. We implement the `GET` and `SET`
+            // subcommands for the eviction-related parameters only.
+            if args.is_empty() {
+                return Err(FerrumError::WrongArity { cmd: "CONFIG" });
+            }
+            let mut it = args.into_iter();
+            let sub = it.next().unwrap();
+            match ascii_uppercase(&sub).as_slice() {
+                b"GET" => {
+                    let param = it
+                        .next()
+                        .ok_or(FerrumError::WrongArity { cmd: "CONFIG GET" })?;
+                    if it.next().is_some() {
+                        return Err(FerrumError::WrongArity { cmd: "CONFIG GET" });
+                    }
+                    Ok(Command::Config {
+                        sub: b"GET".to_vec(),
+                        args: vec![param],
+                    })
+                }
+                b"SET" => {
+                    let param = it
+                        .next()
+                        .ok_or(FerrumError::WrongArity { cmd: "CONFIG SET" })?;
+                    let value = it
+                        .next()
+                        .ok_or(FerrumError::WrongArity { cmd: "CONFIG SET" })?;
+                    if it.next().is_some() {
+                        return Err(FerrumError::WrongArity { cmd: "CONFIG SET" });
+                    }
+                    Ok(Command::Config {
+                        sub: b"SET".to_vec(),
+                        args: vec![param, value],
+                    })
+                }
+                _ => Err(FerrumError::UnknownCommand(format!(
+                    "CONFIG {}",
+                    String::from_utf8_lossy(&sub)
+                ))),
+            }
         }
         _ => Err(FerrumError::UnknownCommand(
             String::from_utf8_lossy(&name).into_owned(),
@@ -998,5 +1048,82 @@ mod frame_tests {
                 section: Some(b"memory".to_vec())
             }
         );
+    }
+
+    #[test]
+    fn parses_config_get_single_param() {
+        assert_eq!(
+            parse_exact(b"*3\r\n$6\r\nCONFIG\r\n$3\r\nGET\r\n$9\r\nmaxmemory\r\n"),
+            Command::Config {
+                sub: b"GET".to_vec(),
+                args: vec![b"maxmemory".to_vec()],
+            }
+        );
+    }
+
+    #[test]
+    fn parses_config_get_wildcard() {
+        assert_eq!(
+            parse_exact(b"*3\r\n$6\r\nCONFIG\r\n$3\r\nGET\r\n$1\r\n*\r\n"),
+            Command::Config {
+                sub: b"GET".to_vec(),
+                args: vec![b"*".to_vec()],
+            }
+        );
+    }
+
+    #[test]
+    fn parses_config_set_param_and_value() {
+        assert_eq!(
+            parse_exact(
+                b"*4\r\n$6\r\nCONFIG\r\n$3\r\nSET\r\n$16\r\nmaxmemory-policy\r\n$11\r\nallkeys-lru\r\n"
+            ),
+            Command::Config {
+                sub: b"SET".to_vec(),
+                args: vec![b"maxmemory-policy".to_vec(), b"allkeys-lru".to_vec()],
+            }
+        );
+    }
+
+    #[test]
+    fn config_without_subcommand_is_wrong_arity() {
+        let err = match parse_frame(b"*1\r\n$6\r\nCONFIG\r\n").unwrap() {
+            FrameParse::Invalid { error, .. } => error,
+            other => panic!("expected Invalid, got {other:?}"),
+        };
+        assert!(matches!(err, FerrumError::WrongArity { cmd: "CONFIG" }));
+    }
+
+    #[test]
+    fn config_get_with_extra_arg_is_wrong_arity() {
+        let err = match parse_frame(
+            b"*4\r\n$6\r\nCONFIG\r\n$3\r\nGET\r\n$9\r\nmaxmemory\r\n$6\r\nmemory\r\n",
+        )
+        .unwrap()
+        {
+            FrameParse::Invalid { error, .. } => error,
+            other => panic!("expected Invalid, got {other:?}"),
+        };
+        assert!(matches!(err, FerrumError::WrongArity { cmd: "CONFIG GET" }));
+    }
+
+    #[test]
+    fn config_set_without_value_is_wrong_arity() {
+        let err =
+            match parse_frame(b"*3\r\n$6\r\nCONFIG\r\n$3\r\nSET\r\n$9\r\nmaxmemory\r\n").unwrap() {
+                FrameParse::Invalid { error, .. } => error,
+                other => panic!("expected Invalid, got {other:?}"),
+            };
+        assert!(matches!(err, FerrumError::WrongArity { cmd: "CONFIG SET" }));
+    }
+
+    #[test]
+    fn config_unknown_subcommand_is_rejected() {
+        let err =
+            match parse_frame(b"*3\r\n$6\r\nCONFIG\r\n$3\r\nFOO\r\n$9\r\nmaxmemory\r\n").unwrap() {
+                FrameParse::Invalid { error, .. } => error,
+                other => panic!("expected Invalid, got {other:?}"),
+            };
+        assert!(matches!(err, FerrumError::UnknownCommand(_)));
     }
 }
