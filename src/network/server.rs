@@ -14,6 +14,7 @@ use crate::network::shutdown::Shutdown;
 use crate::protocol::encoder;
 use crate::protocol::parser::{self, Command, FrameParse};
 use crate::storage::engine::{KvEngine, TtlStatus, current_epoch_ms};
+use crate::storage::eviction::EvictionPolicy;
 
 /// Initial capacity of each per-connection read buffer.
 ///
@@ -372,6 +373,16 @@ pub fn execute_command(cmd: Command, engine: &KvEngine, out: &mut Vec<u8>) {
             let body = render_info(engine, section.as_deref());
             encoder::encode_bulk_string(out, body.as_bytes());
         }
+        Command::Config { sub, args } => {
+            if sub.eq_ignore_ascii_case(b"GET") {
+                config_get(engine, &args[0], out);
+            } else if sub.eq_ignore_ascii_case(b"SET") {
+                config_set(engine, &args[0], &args[1], out);
+            } else {
+                // Unreachable: the parser only emits `GET`/`SET` subs.
+                encoder::encode_error(out, "ERR unknown config subcommand");
+            }
+        }
     }
 }
 
@@ -431,6 +442,118 @@ fn render_info(engine: &KvEngine, section: Option<&[u8]>) -> String {
         out.push_str("\r\n");
     }
     out
+}
+
+/// Produces the reply for `CONFIG GET <param|*>`.
+///
+/// Mirrors Redis' flat-array layout: every matched parameter is emitted as a
+/// pair of bulk strings `(name, value)`, interleaved in the same array.
+/// `CONFIG GET *` returns every recognised parameter; a specific name returns
+/// just that pair, or an empty array (`*0`) when the name is unknown — matching
+/// Redis' behaviour so clients that probe for an unsupported parameter get a
+/// clean "nothing matched" rather than an error.
+fn config_get(engine: &KvEngine, pattern: &[u8], out: &mut Vec<u8>) {
+    let cfg = match engine.eviction_config() {
+        Ok(c) => c,
+        Err(e) => return write_ferrum_error(out, &e),
+    };
+    // (name, value) pairs in display order. Only the eviction-related
+    // parameters are mutable at runtime, so those are the only ones exposed.
+    let pairs: [(&str, String); 3] = [
+        ("maxmemory", cfg.max_memory.to_string()),
+        ("maxmemory-policy", cfg.policy.name().to_string()),
+        ("maxmemory-samples", cfg.samples.to_string()),
+    ];
+    if pattern.eq_ignore_ascii_case(b"*") {
+        encoder::encode_array_header(out, pairs.len() * 2);
+        for (name, value) in &pairs {
+            encoder::encode_bulk_string(out, name.as_bytes());
+            encoder::encode_bulk_string(out, value.as_bytes());
+        }
+        return;
+    }
+    let requested = match std::str::from_utf8(pattern) {
+        Ok(s) => s,
+        Err(_) => return encoder::encode_array_header(out, 0),
+    };
+    if let Some((name, value)) = pairs
+        .iter()
+        .find(|(n, _)| n.eq_ignore_ascii_case(requested))
+    {
+        encoder::encode_array_header(out, 2);
+        encoder::encode_bulk_string(out, name.as_bytes());
+        encoder::encode_bulk_string(out, value.as_bytes());
+    } else {
+        encoder::encode_array_header(out, 0);
+    }
+}
+
+/// Applies `CONFIG SET <param> <value>` to the live engine configuration.
+///
+/// The change is validated and, on success, installed via
+/// [`KvEngine::set_eviction_config`] so it takes effect for all subsequent
+/// writes. Only the eviction-related parameters are mutable; unknown
+/// parameters and malformed values are rejected with a Redis-style
+/// `-ERR Unknown parameter '…'` / `-ERR Invalid argument …` reply. The runtime
+/// change is not persisted to the AOF (consistent with Redis' semantics for
+/// the parameters we support).
+fn config_set(engine: &KvEngine, param: &[u8], value: &[u8], out: &mut Vec<u8>) {
+    let name = match std::str::from_utf8(param) {
+        Ok(s) => s.to_ascii_lowercase(),
+        Err(_) => {
+            return encoder::encode_error(out, "ERR Unknown parameter (non-UTF8 parameter name)");
+        }
+    };
+    let value_str = match std::str::from_utf8(value) {
+        Ok(s) => s,
+        Err(_) => return encoder::encode_error(out, "ERR Invalid argument (non-UTF8 value)"),
+    };
+
+    let mut cfg = match engine.eviction_config() {
+        Ok(c) => c,
+        Err(e) => return write_ferrum_error(out, &e),
+    };
+
+    match name.as_str() {
+        "maxmemory" => match crate::config::file::parse_bytes(value_str, "maxmemory") {
+            Ok(bytes) => cfg.max_memory = bytes,
+            Err(msg) => return encoder::encode_error(out, &format!("ERR {msg}")),
+        },
+        "maxmemory-policy" => match EvictionPolicy::from_name(&value_str.to_ascii_lowercase()) {
+            Some(p) => cfg.policy = p,
+            None => {
+                return encoder::encode_error(
+                    out,
+                    &format!(
+                        "ERR Invalid argument '{value_str}' for CONFIG SET 'maxmemory-policy'"
+                    ),
+                );
+            }
+        },
+        "maxmemory-samples" => match value_str.trim().parse::<usize>() {
+            Ok(s) if s > 0 => cfg.samples = s,
+            Ok(_) => {
+                return encoder::encode_error(
+                    out,
+                    "ERR Invalid argument for CONFIG SET 'maxmemory-samples' (must be > 0)",
+                );
+            }
+            Err(_) => {
+                return encoder::encode_error(
+                    out,
+                    "ERR Invalid argument for CONFIG SET 'maxmemory-samples' (not an integer)",
+                );
+            }
+        },
+        _ => {
+            return encoder::encode_error(out, &format!("ERR Unknown parameter '{name}'"));
+        }
+    }
+
+    match engine.set_eviction_config(cfg) {
+        Ok(()) => encoder::encode_simple_string(out, "OK"),
+        Err(e) => write_ferrum_error(out, &e),
+    }
 }
 
 /// Converts an `EXPIRE` second delta to milliseconds, saturating on overflow.

@@ -117,7 +117,7 @@ AHE's differentiation from AdaptiveClimb: **AHE incorporates TTL as a first-clas
 
 | ID | Feature | Effort | Rationale |
 |----|---------|--------|-----------|
-| F-01 | CONFIG SET/GET | 3 days | Runtime config. Blocks all operational maturity. |
+| ✅ F-01 | CONFIG SET/GET | 3 days | Runtime config. Blocks all operational maturity. **(done v0.5.1)** |
 | F-02 | AUTH requirepass | 1 day | Security baseline. |
 | F-03 | SLOWLOG | 2 days | Latency observability. |
 | F-04 | AOF REWRITE | 5 days | AOF compaction. Critical for any non-toy AOF user. |
@@ -257,7 +257,7 @@ FerrumKV occupies the **bottom-left** quadrant: embedded library, but optimized 
 
 1. ✅ ~~Version bump to 0.5.0-dev~~ (done)
 2. ✅ ~~Create FERRUM-006/007/008~~ (done)
-3. **Implement F-01 (CONFIG SET/GET)** — highest leverage, lowest risk
+3. ✅ ~~Implement F-01 (CONFIG SET/GET)~~ (done) — supports `maxmemory`, `maxmemory-policy`, `maxmemory-samples` over RESP; `CONFIG GET *` and single-param lookups.
 4. **Implement F-02 (AUTH)** — security baseline, one day
 5. **Begin F-07 (WriteGuard refactor)** — foundation for E-04 (EvictionPolicy trait)
 6. **Read SIEVE paper thoroughly** (NSDI'24) — the implementation is ~20 lines, but understand the design decisions

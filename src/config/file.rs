@@ -244,7 +244,10 @@ fn strip_quotes(raw: &str) -> &str {
 /// Parses byte sizes in Redis-friendly form: a bare integer, or an integer
 /// followed by one of the suffixes `b`, `k`, `kb`, `m`, `mb`, `g`, `gb`
 /// (case-insensitive, no space between number and suffix).
-fn parse_bytes(raw: &str, name: &str) -> Result<u64, String> {
+///
+/// `pub(crate)` so the network layer can reuse the exact same grammar for
+/// `CONFIG SET maxmemory` without duplicating the suffix table.
+pub(crate) fn parse_bytes(raw: &str, name: &str) -> Result<u64, String> {
     let lower = raw.trim().to_ascii_lowercase();
     let (num, factor): (&str, u64) = if let Some(stripped) = lower.strip_suffix("gb") {
         (stripped, 1024 * 1024 * 1024)
