@@ -45,6 +45,14 @@ pub enum EvictionPolicy {
     AllKeysSieveS,
     /// SIEVE-S restricted to keys with a TTL.
     VolatileSieveS,
+    /// AdaptiveClimb (Berend et al., arXiv:2511.21235): a self-tuning
+    /// CLIMB variant. Holds the keyspace in an ordered MRU→LRU list and a
+    /// single adaptive `jump` scalar — no per-item counters. See
+    /// [`crate::storage::adaptive_climb`] for the state and the porting
+    /// notes that map the paper's fixed-size `K` onto a memory cap.
+    AllKeysAdaptiveClimb,
+    /// AdaptiveClimb restricted to keys with a TTL.
+    VolatileAdaptiveClimb,
 }
 
 impl EvictionPolicy {
@@ -65,6 +73,8 @@ impl EvictionPolicy {
             "volatile-sieve" => Some(Self::VolatileSieve),
             "allkeys-sieves" => Some(Self::AllKeysSieveS),
             "volatile-sieves" => Some(Self::VolatileSieveS),
+            "allkeys-adaptiveclimb" => Some(Self::AllKeysAdaptiveClimb),
+            "volatile-adaptiveclimb" => Some(Self::VolatileAdaptiveClimb),
             _ => None,
         }
     }
@@ -85,6 +95,8 @@ impl EvictionPolicy {
             Self::VolatileSieve => "volatile-sieve",
             Self::AllKeysSieveS => "allkeys-sieves",
             Self::VolatileSieveS => "volatile-sieves",
+            Self::AllKeysAdaptiveClimb => "allkeys-adaptiveclimb",
+            Self::VolatileAdaptiveClimb => "volatile-adaptiveclimb",
         }
     }
 
@@ -96,14 +108,16 @@ impl EvictionPolicy {
             | Self::AllKeysRandom
             | Self::AllKeysAhe
             | Self::AllKeysSieve
-            | Self::AllKeysSieveS => EvictionScope::AllKeys,
+            | Self::AllKeysSieveS
+            | Self::AllKeysAdaptiveClimb => EvictionScope::AllKeys,
             Self::VolatileLru
             | Self::VolatileLfu
             | Self::VolatileRandom
             | Self::VolatileTtl
             | Self::VolatileAhe
             | Self::VolatileSieve
-            | Self::VolatileSieveS => EvictionScope::Volatile,
+            | Self::VolatileSieveS
+            | Self::VolatileAdaptiveClimb => EvictionScope::Volatile,
         }
     }
 
@@ -113,6 +127,16 @@ impl EvictionPolicy {
         matches!(
             self,
             Self::AllKeysSieve | Self::VolatileSieve | Self::AllKeysSieveS | Self::VolatileSieveS
+        )
+    }
+
+    /// Whether this policy is the stateful AdaptiveClimb variant, which
+    /// consults the engine's ordered MRU→LRU list rather than a sampled
+    /// candidate set.
+    pub fn is_adaptive_climb(self) -> bool {
+        matches!(
+            self,
+            Self::AllKeysAdaptiveClimb | Self::VolatileAdaptiveClimb
         )
     }
 }
@@ -206,14 +230,16 @@ pub fn pick_victim(policy: EvictionPolicy, candidates: Vec<Candidate>) -> Option
         EvictionPolicy::AllKeysAhe | EvictionPolicy::VolatileAhe => {
             pick_victim_ahe(AHE_DEFAULT_ALPHA, candidates)
         }
-        // SIEVE selects its victim from the engine's FIFO queue, not from a
+        // SIEVE select its victim from the engine's FIFO queue, not from a
         // sampled candidate set, so this function cannot serve it. Callers
-        // (`enforce_memory_limit`) special-case SIEVE and never reach this
-        // branch for these variants.
+        // (`enforce_memory_limit`) special-case SIEVE and AdaptiveClimb and
+        // never reach this branch for these variants.
         EvictionPolicy::AllKeysSieve
         | EvictionPolicy::VolatileSieve
         | EvictionPolicy::AllKeysSieveS
-        | EvictionPolicy::VolatileSieveS => None,
+        | EvictionPolicy::VolatileSieveS
+        | EvictionPolicy::AllKeysAdaptiveClimb
+        | EvictionPolicy::VolatileAdaptiveClimb => None,
     }
 }
 
@@ -490,6 +516,8 @@ mod tests {
             "volatile-sieve",
             "allkeys-sieves",
             "volatile-sieves",
+            "allkeys-adaptiveclimb",
+            "volatile-adaptiveclimb",
         ] {
             let p = EvictionPolicy::from_name(name).unwrap();
             assert_eq!(p.name(), name);

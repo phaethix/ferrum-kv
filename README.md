@@ -37,7 +37,7 @@
 ## Features
 
 - **Original AHE Algorithm** — FerrumKV's own *Adaptive Hybrid Eviction* blends recency, frequency, and TTL into one score and tunes its own weights from live hit-ratio feedback. No tuning required. [Read the paper →](docs/reference/ahe.md)
-- **14 Eviction Policies** — LRU, LFU, Random, TTL, SIEVE (NSDI'24), and AHE. Swap at runtime, exactly like Redis' `maxmemory-policy`.
+- **16 Eviction Policies** — LRU, LFU, Random, TTL, SIEVE (NSDI'24), AdaptiveClimb (arXiv:2511.21235), and AHE. Swap at runtime, exactly like Redis' `maxmemory-policy`.
 - **Built-in Web Dashboard** — Key browser, inline editor, live stats, command console. Zero config, no extra dependencies.
 - **RESP2 Compatible** — Works with any Redis client (`redis-cli`, Redis Insight, etc.).
 - **Readable Codebase** — ~8,500 lines of layered, well-commented Rust. No macro magic, no custom allocators — built to be read.
@@ -48,7 +48,7 @@ There are many mature KV stores. FerrumKV does **not** try to replace Redis in p
 
 - **A self-tuning eviction algorithm.** `AHE` (Adaptive Hybrid Eviction) fuses recency, frequency, and TTL into a single *Eviction Priority Score* and self-tunes its weights from live hit-ratio feedback — an experimental design you can read, benchmark, and compare against LRU/LFU/SIEVE rather than a drop-in clone of an existing policy. [Paper →](docs/reference/ahe.md)
 - **Readable end-to-end.** ~8,500 lines of layered Rust with no macro magic and no custom allocators. From TCP → RESP2 parsing → engine → eviction → AOF → Tokio async, the whole pipeline is followable in an afternoon.
-- **Self-contained and Redis-flavoured.** A single static binary, RESP2-compatible, driven by `redis-cli`/`redis-benchmark`, with a zero-dependency web dashboard and 14 eviction policies (10 Redis-style + AHE and SIEVE-S originals) you can swap at runtime.
+- **Self-contained and Redis-flavoured.** A single static binary, RESP2-compatible, driven by `redis-cli`/`redis-benchmark`, with a zero-dependency web dashboard and 16 eviction policies (10 Redis-style + AHE, SIEVE-S, and AdaptiveClimb originals) you can swap at runtime.
 
 In short: the shortest path from *"I use Redis"* to *"I understand how a Redis-like KV store actually works."*
 
@@ -104,6 +104,7 @@ Open **http://127.0.0.1:6381** for the built-in dashboard.
 | `volatile-ttl` | TTL | | | x | |
 | `allkeys-sieve` / `volatile-sieve` | SIEVE (NSDI'24) | x | | | |
 | **`allkeys-sieves`** / **`volatile-sieves`** | SIEVE-S (FerrumKV) | x | | x | |
+| **`allkeys-adaptiveclimb`** / **`volatile-adaptiveclimb`** | AdaptiveClimb (arXiv:2511.21235) | x | x | | x |
 | **`allkeys-ahe`** / **`volatile-ahe`** | Adaptive | x | x | x | x |
 
 [AHE](./docs/reference/ahe.md) (Adaptive Hybrid Eviction) blends recency, frequency, and TTL urgency into a self-tuning *Eviction Priority Score*.
