@@ -67,6 +67,8 @@ enum Policy {
     Lfu,
     Ahe,
     Random,
+    Sieve,
+    SieveS,
 }
 
 impl Policy {
@@ -76,6 +78,8 @@ impl Policy {
             Policy::Lfu => "allkeys-lfu",
             Policy::Ahe => "allkeys-ahe",
             Policy::Random => "allkeys-random",
+            Policy::Sieve => "allkeys-sieve",
+            Policy::SieveS => "allkeys-sieves",
         }
     }
 }
@@ -470,6 +474,8 @@ fn parse_policies(s: &str) -> Vec<Policy> {
             "lfu" => Policy::Lfu,
             "ahe" => Policy::Ahe,
             "random" => Policy::Random,
+            "sieve" => Policy::Sieve,
+            "sieves" => Policy::SieveS,
             other => panic!("unknown policy: {other}"),
         })
         .collect()
@@ -531,7 +537,7 @@ fn print_help() {
         "usage: hit_ratio_bench [--working-set N] [--capacity N] [--ops N] \
          [--pace-ms F] [--value-size B] [--seed N] [--epochs N] \
          [--zipf-s F] [--hot-frac F] [--durable-frac F] [--base-port P] \
-         [--patterns zipf,shift,mixed,scan,ttl] [--policies lru,lfu,ahe,random]"
+         [--patterns zipf,shift,mixed,scan,ttl] [--policies lru,lfu,ahe,random,sieve,sieves]"
     );
 }
 
