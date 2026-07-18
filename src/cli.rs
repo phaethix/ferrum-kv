@@ -736,14 +736,14 @@ mod tests {
 
     #[test]
     fn requirepass_config_file_directive_is_parsed() {
-        let conf = TempConf::new("auth", "requirepass hunter2\n");
+        let conf = TempConf::new("auth-file", "requirepass hunter2\n");
         let args = parse_run(&["--config", conf.path.to_str().unwrap()]);
         assert_eq!(args.requirepass(), Some(b"hunter2".to_vec()));
     }
 
     #[test]
     fn requirepass_cli_overrides_config_file() {
-        let conf = TempConf::new("auth", "requirepass filepw\n");
+        let conf = TempConf::new("auth-override", "requirepass filepw\n");
         let args = parse_run(&[
             "--config",
             conf.path.to_str().unwrap(),
