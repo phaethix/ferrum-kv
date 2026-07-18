@@ -265,8 +265,8 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for conventions and review process.
 
 | Version | Focus |
 |---------|-------|
-| v0.5 | CONFIG SET/GET, AUTH, SLOWLOG, AOF REWRITE |
-| v0.5.1 | SIEVE (NSDI'24), SIEVE-S, benchmark suite, EvictionPolicy trait |
+| v0.5.1 | CONFIG SET/GET (F-01), AUTH requirepass (F-02); SIEVE (NSDI'24), SIEVE-S, benchmark suite, EvictionPolicy trait |
+| v0.5.2 | SLOWLOG (F-03), AOF REWRITE (F-04), MONITOR (F-05), INFO expansion (F-06) |
 | v0.6 | RESP3 protocol, typed replies, client-side caching |
 | v0.7 | List, Hash, Set data types |
 

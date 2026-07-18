@@ -118,7 +118,7 @@ AHE's differentiation from AdaptiveClimb: **AHE incorporates TTL as a first-clas
 | ID | Feature | Effort | Rationale |
 |----|---------|--------|-----------|
 | ✅ F-01 | CONFIG SET/GET | 3 days | Runtime config. Blocks all operational maturity. **(done v0.5.1)** |
-| F-02 | AUTH requirepass | 1 day | Security baseline. |
+| ✅ F-02 | AUTH requirepass | 1 day | Security baseline. `AUTH` + `requirepass` via CLI flag, config file, and runtime `CONFIG SET`. **(done v0.5.1)** |
 | F-03 | SLOWLOG | 2 days | Latency observability. |
 | F-04 | AOF REWRITE | 5 days | AOF compaction. Critical for any non-toy AOF user. |
 | F-05 | MONITOR command | 1 day | Debugging tool. |
@@ -258,7 +258,7 @@ FerrumKV occupies the **bottom-left** quadrant: embedded library, but optimized 
 1. ✅ ~~Version bump to 0.5.0-dev~~ (done)
 2. ✅ ~~Create FERRUM-006/007/008~~ (done)
 3. ✅ ~~Implement F-01 (CONFIG SET/GET)~~ (done) — supports `maxmemory`, `maxmemory-policy`, `maxmemory-samples` over RESP; `CONFIG GET *` and single-param lookups.
-4. **Implement F-02 (AUTH)** — security baseline, one day
+4. ✅ ~~Implement F-02 (AUTH)~~ (done) — `AUTH password`, `requirepass` via `--requirepass` flag, `requirepass` config-file directive, and runtime `CONFIG SET requirepass`. Unauthenticated commands are gated with `-NOAUTH`; wrong passwords return `-WRONGPASS`.
 5. **Begin F-07 (WriteGuard refactor)** — foundation for E-04 (EvictionPolicy trait)
 6. **Read SIEVE paper thoroughly** (NSDI'24) — the implementation is ~20 lines, but understand the design decisions
 7. **Read AdaptiveClimb paper** (arXiv:2511.21235) — understand how it differs from AHE

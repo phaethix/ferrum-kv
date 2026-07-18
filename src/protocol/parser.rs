@@ -61,6 +61,12 @@ pub enum Command {
     /// `sub` is the verb (`SET`/`GET`, already upper-cased at parse time) and
     /// `args` holds the parameter name, plus its value for `SET`.
     Config { sub: Vec<u8>, args: Vec<Vec<u8>> },
+    /// `AUTH password` — authenticates a connection when `requirepass`
+    /// is configured. The server rejects every other command with
+    /// `-NOAUTH` until a successful `AUTH` is seen. The password is
+    /// kept as raw bytes so it survives binary-safe, matching the
+    /// value encoding of every other command.
+    Auth { password: Vec<u8> },
 }
 
 /// Outcome of attempting to parse a single RESP2 frame from a byte buffer.
@@ -508,6 +514,14 @@ fn build_command(parts: Vec<Vec<u8>>) -> Result<Command, FerrumError> {
                     String::from_utf8_lossy(&sub)
                 ))),
             }
+        }
+        b"AUTH" => {
+            if args.len() != 1 {
+                return Err(FerrumError::WrongArity { cmd: "AUTH" });
+            }
+            Ok(Command::Auth {
+                password: args.into_iter().next().unwrap(),
+            })
         }
         _ => Err(FerrumError::UnknownCommand(
             String::from_utf8_lossy(&name).into_owned(),
@@ -1125,5 +1139,33 @@ mod frame_tests {
                 other => panic!("expected Invalid, got {other:?}"),
             };
         assert!(matches!(err, FerrumError::UnknownCommand(_)));
+    }
+
+    #[test]
+    fn parses_auth_command() {
+        assert_eq!(
+            parse_exact(b"*2\r\n$4\r\nAUTH\r\n$6\r\nsecret\r\n"),
+            Command::Auth {
+                password: b"secret".to_vec()
+            }
+        );
+    }
+
+    #[test]
+    fn auth_without_arg_is_wrong_arity() {
+        let err = match parse_frame(b"*1\r\n$4\r\nAUTH\r\n").unwrap() {
+            FrameParse::Invalid { error, .. } => error,
+            other => panic!("expected Invalid, got {other:?}"),
+        };
+        assert!(matches!(err, FerrumError::WrongArity { cmd: "AUTH" }));
+    }
+
+    #[test]
+    fn auth_with_extra_arg_is_wrong_arity() {
+        let err = match parse_frame(b"*3\r\n$4\r\nAUTH\r\n$3\r\nabc\r\n$3\r\ndef\r\n").unwrap() {
+            FrameParse::Invalid { error, .. } => error,
+            other => panic!("expected Invalid, got {other:?}"),
+        };
+        assert!(matches!(err, FerrumError::WrongArity { cmd: "AUTH" }));
     }
 }

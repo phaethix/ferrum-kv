@@ -148,6 +148,14 @@ async fn handle_client(
     let mut chunk = [0u8; READ_CHUNK];
     let mut outbuf: Vec<u8> = Vec::with_capacity(256);
 
+    // Per-connection authentication flag. Starts `false`; a successful `AUTH`
+    // flips it, after which every other command runs. We keep this state in the
+    // connection handler (it is connection-local) while the configured password
+    // itself lives in the shared engine. Declared once, outside the read loop,
+    // so that authentication survives across packet boundaries and pipelined
+    // commands.
+    let mut authed = false;
+
     loop {
         if shutdown.is_triggered() {
             break;
@@ -182,7 +190,18 @@ async fn handle_client(
             match parser::parse_frame(&inbuf) {
                 Ok(FrameParse::Complete { command, consumed }) => {
                     outbuf.clear();
-                    execute_command(command, &engine, &mut outbuf);
+                    // When a password is configured, every command except
+                    // `AUTH` is rejected until the connection authenticates.
+                    let requires_auth = engine.requirepass().map(|p| p.is_some()).unwrap_or(false);
+                    if let Command::Auth { password } = &command {
+                        if auth_reply(&engine, password, &mut outbuf) {
+                            authed = true;
+                        }
+                    } else if requires_auth && !authed {
+                        encoder::encode_error(&mut outbuf, "NOAUTH Authentication required.");
+                    } else {
+                        execute_command(command, &engine, &mut outbuf);
+                    }
                     if let Err(e) = stream.write_all(&outbuf).await {
                         error!("write failed for {peer}: {e}");
                         return Err(e.into());
@@ -383,6 +402,12 @@ pub fn execute_command(cmd: Command, engine: &KvEngine, out: &mut Vec<u8>) {
                 encoder::encode_error(out, "ERR unknown config subcommand");
             }
         }
+        Command::Auth { .. } => {
+            // Handled in `handle_client` so it can maintain the
+            // per-connection `authenticated` flag; this arm exists only
+            // to keep the command match exhaustive.
+            encoder::encode_error(out, "ERR internal: AUTH handled by connection layer");
+        }
     }
 }
 
@@ -457,18 +482,22 @@ fn config_get(engine: &KvEngine, pattern: &[u8], out: &mut Vec<u8>) {
         Ok(c) => c,
         Err(e) => return write_ferrum_error(out, &e),
     };
+    // The configured password (or empty when none is set), cloned
+    // once so the pairs array below can own its bytes.
+    let requirepass = engine.requirepass().unwrap_or_default().unwrap_or_default();
     // (name, value) pairs in display order. Only the eviction-related
-    // parameters are mutable at runtime, so those are the only ones exposed.
-    let pairs: [(&str, String); 3] = [
-        ("maxmemory", cfg.max_memory.to_string()),
-        ("maxmemory-policy", cfg.policy.name().to_string()),
-        ("maxmemory-samples", cfg.samples.to_string()),
+    // parameters and `requirepass` are exposed.
+    let pairs: Vec<(&str, Vec<u8>)> = vec![
+        ("maxmemory", cfg.max_memory.to_string().into_bytes()),
+        ("maxmemory-policy", cfg.policy.name().as_bytes().to_vec()),
+        ("maxmemory-samples", cfg.samples.to_string().into_bytes()),
+        ("requirepass", requirepass),
     ];
     if pattern.eq_ignore_ascii_case(b"*") {
         encoder::encode_array_header(out, pairs.len() * 2);
         for (name, value) in &pairs {
             encoder::encode_bulk_string(out, name.as_bytes());
-            encoder::encode_bulk_string(out, value.as_bytes());
+            encoder::encode_bulk_string(out, value);
         }
         return;
     }
@@ -482,7 +511,7 @@ fn config_get(engine: &KvEngine, pattern: &[u8], out: &mut Vec<u8>) {
     {
         encoder::encode_array_header(out, 2);
         encoder::encode_bulk_string(out, name.as_bytes());
-        encoder::encode_bulk_string(out, value.as_bytes());
+        encoder::encode_bulk_string(out, value);
     } else {
         encoder::encode_array_header(out, 0);
     }
@@ -508,6 +537,15 @@ fn config_set(engine: &KvEngine, param: &[u8], value: &[u8], out: &mut Vec<u8>) 
         Ok(s) => s,
         Err(_) => return encoder::encode_error(out, "ERR Invalid argument (non-UTF8 value)"),
     };
+
+    // `requirepass` is stored separately from the eviction config, so it
+    // gets its own early return and never falls through to the eviction path.
+    if name == "requirepass" {
+        match engine.set_requirepass(Some(value_str.as_bytes().to_vec())) {
+            Ok(()) => return encoder::encode_simple_string(out, "OK"),
+            Err(e) => return write_ferrum_error(out, &e),
+        }
+    }
 
     let mut cfg = match engine.eviction_config() {
         Ok(c) => c,
@@ -553,6 +591,31 @@ fn config_set(engine: &KvEngine, param: &[u8], value: &[u8], out: &mut Vec<u8>) 
     match engine.set_eviction_config(cfg) {
         Ok(()) => encoder::encode_simple_string(out, "OK"),
         Err(e) => write_ferrum_error(out, &e),
+    }
+}
+
+/// Runs an `AUTH` attempt and writes the RESP reply.
+///
+/// Returns `true` when authentication succeeded so the connection
+/// handler can flip its per-connection "authenticated" flag. The
+/// password is compared as raw bytes so binary-safe secrets work.
+fn auth_reply(engine: &KvEngine, password: &[u8], out: &mut Vec<u8>) -> bool {
+    match engine.authenticate(password) {
+        Ok(true) => {
+            encoder::encode_simple_string(out, "OK");
+            true
+        }
+        Ok(false) => {
+            encoder::encode_error(
+                out,
+                "WRONGPASS invalid username-password pair or user is disabled.",
+            );
+            false
+        }
+        Err(e) => {
+            write_ferrum_error(out, &e);
+            false
+        }
     }
 }
 

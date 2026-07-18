@@ -129,6 +129,13 @@ pub struct KvEngine {
     /// order; maintained on every insert / access / remove so a runtime
     /// switch to an AdaptiveClimb policy is immediately consistent.
     pub(crate) ac: Arc<Mutex<AdaptiveClimbState>>,
+    /// Optional connection password (`requirepass`). When `Some`, every
+    /// freshly accepted connection must issue a successful `AUTH` before
+    /// any other command runs. Shared via `Arc` so a runtime
+    /// `CONFIG SET requirepass` is visible to already-accepted
+    /// connections; the per-connection "already authed" flag lives in
+    /// the network layer, not here, because it is connection-local.
+    pub(crate) auth_password: Arc<RwLock<Option<Vec<u8>>>>,
     /// Seed for the per-call PRNG used to drive probabilistic LFU
     /// increments and random-policy tie breaks. Xorshift32 is plenty for
     /// sampling purposes and keeps the engine free of `rand` as a
@@ -155,6 +162,9 @@ impl KvEngine {
             ahe: Arc::new(Mutex::new(AdaptiveHybridState::default())),
             sieve: Arc::new(Mutex::new(SieveState::new())),
             ac: Arc::new(Mutex::new(AdaptiveClimbState::new())),
+            // No password by default: authentication is opt-in, matching
+            // Redis' `requirepass` semantics (absent = open access).
+            auth_password: Arc::new(RwLock::new(None)),
             // Seed the PRNG from the system clock so two engines started
             // in the same second don't share a sequence. The seed is
             // never exposed, so predictability is not a concern.
@@ -213,6 +223,42 @@ impl KvEngine {
     /// Returns a copy of the current eviction configuration.
     pub fn eviction_config(&self) -> Result<EvictionConfig, FerrumError> {
         Ok(*self.eviction.read()?)
+    }
+
+    /// Replaces the `requirepass` password.
+    ///
+    /// `None` disables authentication (the default); `Some(bytes)` enables
+    /// it for every connection that has not yet authenticated. Already
+    /// authenticated connections stay authenticated even if the password is
+    /// later changed or cleared. The change is runtime-only and is not
+    /// persisted to the AOF, consistent with Redis.
+    pub fn set_requirepass(&self, pw: Option<Vec<u8>>) -> Result<(), FerrumError> {
+        let mut guard = self.auth_password.write()?;
+        *guard = pw;
+        Ok(())
+    }
+
+    /// Returns a copy of the current `requirepass` password, if any.
+    pub fn requirepass(&self) -> Result<Option<Vec<u8>>, FerrumError> {
+        Ok(self.auth_password.read()?.clone())
+    }
+
+    /// Verifies an `AUTH` attempt against the configured password.
+    ///
+    /// Returns `Ok(true)` when the password matches, `Ok(false)` when a
+    /// password is configured but the attempt does not match, and `Err` when
+    /// no password is configured at all (Redis replies
+    /// `ERR Client sent AUTH, but no password is set`). The caller maps
+    /// these onto `+OK` / `-WRONGPASS` / `-ERR` replies and tracks
+    /// the per-connection authenticated flag.
+    pub fn authenticate(&self, provided: &[u8]) -> Result<bool, FerrumError> {
+        let guard = self.auth_password.read()?;
+        match guard.as_deref() {
+            Some(expected) => Ok(provided == expected),
+            None => Err(FerrumError::ParseError(
+                "Client sent AUTH, but no password is set".into(),
+            )),
+        }
     }
 
     /// Sets a key-value pair and returns the previous value, if any.

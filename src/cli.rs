@@ -30,6 +30,7 @@ pub const USAGE: &str = concat!(
     "                 [--client-timeout SECONDS] [--maxclients N]\n",
     "                 [--maxmemory BYTES] [--maxmemory-policy POLICY]\n",
     "                 [--maxmemory-samples N] [--io-threads N]\n",
+    "                 [--requirepass PASSWORD]\n",
     "                 [--dashboard-addr ADDR|off]\n",
     "                 [--loglevel off|error|warn|info|debug|trace]"
 );
@@ -40,7 +41,9 @@ pub const USAGE: &str = concat!(
 /// decides whether to print usage and exit.
 #[derive(Debug)]
 pub enum Invocation {
-    Run(CliArgs),
+    /// `CliArgs` is boxed because it is by far the largest variant;
+    /// leaving it inline trips `clippy::large_enum_variant`.
+    Run(Box<CliArgs>),
     Help,
 }
 
@@ -66,6 +69,11 @@ pub struct CliArgs {
     max_memory_policy: Option<EvictionPolicy>,
     /// How many random candidates each eviction round considers.
     max_memory_samples: Option<usize>,
+    /// Connection password for the `AUTH` command. `None` disables
+    /// authentication (the default); `Some(pw)` requires every new
+    /// connection to issue a successful `AUTH` before any other
+    /// command runs.
+    requirepass: Option<String>,
     /// Number of tokio worker threads; `0` (unset) asks tokio for the
     /// default (usually one per logical CPU).
     io_threads: Option<usize>,
@@ -94,6 +102,7 @@ struct RawFlags {
     max_memory: Option<u64>,
     max_memory_policy: Option<EvictionPolicy>,
     max_memory_samples: Option<usize>,
+    requirepass: Option<String>,
     io_threads: Option<usize>,
     /// Bind address for the built-in web dashboard. `None` means "use the
     /// default address"; the literals `off` / `disabled` / `none` disable it.
@@ -119,7 +128,7 @@ impl CliArgs {
         };
 
         let merged = merge(raw, file_cfg.as_ref())?;
-        Ok(Invocation::Run(merged))
+        Ok(Invocation::Run(Box::new(merged)))
     }
 
     /// Returns the AOF configuration if the user enabled persistence.
@@ -179,6 +188,13 @@ impl CliArgs {
             policy: self.max_memory_policy.unwrap_or(default.policy),
             samples: self.max_memory_samples.unwrap_or(default.samples),
         }
+    }
+
+    /// Returns the `requirepass` password bytes, if authentication is
+    /// enabled via `--requirepass` or the config file's `requirepass`
+    /// directive. `None` means connections are open (no `AUTH` needed).
+    pub fn requirepass(&self) -> Option<Vec<u8>> {
+        self.requirepass.as_ref().map(|s| s.as_bytes().to_vec())
     }
 }
 
@@ -253,6 +269,10 @@ fn scan_argv<I: IntoIterator<Item = String>>(args: I) -> Result<ScanOutcome, Str
                 raw.max_memory_samples = Some(value.parse().map_err(|_| {
                     format!("invalid --maxmemory-samples: '{value}' is not a non-negative integer")
                 })?);
+            }
+            "--requirepass" => {
+                let value = take_value(&mut iter, "--requirepass")?;
+                raw.requirepass = Some(value);
             }
             "--io-threads" => {
                 let value = take_value(&mut iter, "--io-threads")?;
@@ -336,6 +356,11 @@ fn merge(raw: RawFlags, file: Option<&FileConfig>) -> Result<CliArgs, String> {
     let dashboard_addr = raw
         .dashboard_addr
         .or_else(|| file.and_then(|f| f.dashboard_addr.clone()));
+    // CLI wins for the password; the file's `requirepass` is the
+    // fallback so operators can ship a config without a flag.
+    let requirepass = raw
+        .requirepass
+        .or_else(|| file.and_then(|f| f.requirepass.clone()));
 
     Ok(CliArgs {
         addr,
@@ -347,6 +372,7 @@ fn merge(raw: RawFlags, file: Option<&FileConfig>) -> Result<CliArgs, String> {
         max_memory,
         max_memory_policy,
         max_memory_samples,
+        requirepass,
         io_threads,
         dashboard_addr,
     })
@@ -455,7 +481,7 @@ mod tests {
 
     fn parse_run(args: &[&str]) -> CliArgs {
         match parse(args).unwrap() {
-            Invocation::Run(a) => a,
+            Invocation::Run(a) => *a,
             Invocation::Help => panic!("expected Run, got Help"),
         }
     }
@@ -700,6 +726,31 @@ mod tests {
     fn maxmemory_samples_flag_is_parsed() {
         let args = parse_run(&["--maxmemory-samples", "20"]);
         assert_eq!(args.eviction_config().samples, 20);
+    }
+
+    #[test]
+    fn requirepass_flag_is_parsed() {
+        let args = parse_run(&["--requirepass", "s3cret"]);
+        assert_eq!(args.requirepass(), Some(b"s3cret".to_vec()));
+    }
+
+    #[test]
+    fn requirepass_config_file_directive_is_parsed() {
+        let conf = TempConf::new("auth", "requirepass hunter2\n");
+        let args = parse_run(&["--config", conf.path.to_str().unwrap()]);
+        assert_eq!(args.requirepass(), Some(b"hunter2".to_vec()));
+    }
+
+    #[test]
+    fn requirepass_cli_overrides_config_file() {
+        let conf = TempConf::new("auth", "requirepass filepw\n");
+        let args = parse_run(&[
+            "--config",
+            conf.path.to_str().unwrap(),
+            "--requirepass",
+            "cliflag",
+        ]);
+        assert_eq!(args.requirepass(), Some(b"cliflag".to_vec()));
     }
 
     #[test]
