@@ -243,7 +243,8 @@ fn scan_argv<I: IntoIterator<Item = String>>(args: I) -> Result<ScanOutcome, Str
                              allkeys-lru, volatile-lru, allkeys-lfu, volatile-lfu, \
                              allkeys-random, volatile-random, volatile-ttl, \
                              allkeys-ahe, volatile-ahe, allkeys-sieve, volatile-sieve, \
-                             allkeys-sieves, volatile-sieves)"
+                             allkeys-sieves, volatile-sieves, allkeys-adaptiveclimb, \
+                             volatile-adaptiveclimb)"
                         )
                     })?);
             }

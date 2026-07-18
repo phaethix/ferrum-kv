@@ -37,6 +37,7 @@ use std::time::{Duration, Instant};
 
 use crate::error::FerrumError;
 use crate::persistence::AofWriter;
+use crate::storage::adaptive_climb::AdaptiveClimbState;
 use crate::storage::engine::entry::{ValueEntry, live_payload};
 use crate::storage::engine::util::{
     deadline_to_epoch_ms, log_aof_result, rng_seed, sample_candidates, validate_key,
@@ -122,6 +123,12 @@ pub struct KvEngine {
     /// policy (via [`KvEngine::set_eviction_config`]) is immediately
     /// consistent without replaying the whole keyspace.
     pub(crate) sieve: Arc<Mutex<SieveState>>,
+    /// AdaptiveClimb eviction state (arXiv:2511.21235) — an ordered
+    /// MRU→LRU list plus a single self-tuning `jump` scalar. Like
+    /// [`KvEngine::sieve`] it is shared so every engine clone sees the same
+    /// order; maintained on every insert / access / remove so a runtime
+    /// switch to an AdaptiveClimb policy is immediately consistent.
+    pub(crate) ac: Arc<Mutex<AdaptiveClimbState>>,
     /// Seed for the per-call PRNG used to drive probabilistic LFU
     /// increments and random-policy tie breaks. Xorshift32 is plenty for
     /// sampling purposes and keeps the engine free of `rand` as a
@@ -147,6 +154,7 @@ impl KvEngine {
             misses: Arc::new(AtomicU64::new(0)),
             ahe: Arc::new(Mutex::new(AdaptiveHybridState::default())),
             sieve: Arc::new(Mutex::new(SieveState::new())),
+            ac: Arc::new(Mutex::new(AdaptiveClimbState::new())),
             // Seed the PRNG from the system clock so two engines started
             // in the same second don't share a sequence. The seed is
             // never exposed, so predictability is not a concern.
@@ -171,13 +179,31 @@ impl KvEngine {
     /// the algorithm has accurate state at once; when leaving SIEVE the queue
     /// is cleared so it does not retain stale entries.
     pub fn set_eviction_config(&self, cfg: EvictionConfig) -> Result<(), FerrumError> {
-        if cfg.policy.is_sieve() {
-            let store = self.store.read()?;
-            let mut sieve = self.sieve.lock()?;
-            sieve.rebuild(&store, cfg.policy.scope());
-        } else {
-            let mut sieve = self.sieve.lock()?;
-            sieve.clear();
+        // When leaving a stateful policy, clear its structure; when entering
+        // one, (re)build it from the live keyspace so the algorithm has
+        // accurate state at once. Only one stateful policy is active at a
+        // time, so the other is always cleared.
+        match cfg.policy {
+            p if p.is_sieve() => {
+                let store = self.store.read()?;
+                let mut sieve = self.sieve.lock()?;
+                sieve.rebuild(&store, cfg.policy.scope());
+                let mut ac = self.ac.lock()?;
+                ac.clear();
+            }
+            p if p.is_adaptive_climb() => {
+                let store = self.store.read()?;
+                let mut ac = self.ac.lock()?;
+                ac.rebuild(&store, cfg.policy.scope());
+                let mut sieve = self.sieve.lock()?;
+                sieve.clear();
+            }
+            _ => {
+                let mut sieve = self.sieve.lock()?;
+                sieve.clear();
+                let mut ac = self.ac.lock()?;
+                ac.clear();
+            }
         }
         let mut guard = self.eviction.write()?;
         *guard = cfg;
@@ -243,6 +269,38 @@ impl KvEngine {
     #[inline]
     fn sieve_notify_clear(&self) {
         if let Ok(mut s) = self.sieve.lock() {
+            s.clear();
+        }
+    }
+
+    /// Mirrors a (re)insertion into the AdaptiveClimb ordered list.
+    #[inline]
+    fn ac_notify_insert(&self, key: &[u8]) {
+        if let Ok(mut s) = self.ac.lock() {
+            s.observe_insert(key);
+        }
+    }
+
+    /// Mirrors a hit into the AdaptiveClimb promotion rule.
+    #[inline]
+    fn ac_notify_access(&self, key: &[u8]) {
+        if let Ok(mut s) = self.ac.lock() {
+            s.observe_access(key);
+        }
+    }
+
+    /// Mirrors a removal from the AdaptiveClimb ordered list.
+    #[inline]
+    fn ac_notify_remove(&self, key: &[u8]) {
+        if let Ok(mut s) = self.ac.lock() {
+            s.observe_remove(key);
+        }
+    }
+
+    /// Clears the AdaptiveClimb ordered list (used by `FLUSHDB`).
+    #[inline]
+    fn ac_notify_clear(&self) {
+        if let Ok(mut s) = self.ac.lock() {
             s.clear();
         }
     }
@@ -854,6 +912,7 @@ impl KvEngine {
             .unwrap_or(0);
         self.apply_delta(incoming as i64 - outgoing as i64);
         self.sieve_notify_insert(&key);
+        self.ac_notify_insert(&key);
         previous
     }
 
@@ -914,6 +973,9 @@ impl KvEngine {
                     );
                     self.evict_sieve(store, cfg.policy.scope(), ttl_aware)?
                 }
+                EvictionPolicy::AllKeysAdaptiveClimb | EvictionPolicy::VolatileAdaptiveClimb => {
+                    self.evict_ac(store, cfg.policy.scope())?
+                }
                 _ => eviction::pick_victim(
                     cfg.policy,
                     sample_candidates(store, cfg.policy.scope(), cfg.samples),
@@ -962,6 +1024,7 @@ impl KvEngine {
             let r = self.next_rand01();
             entry.touch(r);
             self.sieve_notify_access(key);
+            self.ac_notify_access(key);
         }
     }
 
@@ -977,6 +1040,19 @@ impl KvEngine {
     ) -> Result<Option<Vec<u8>>, FerrumError> {
         let mut sieve = self.sieve.lock()?;
         Ok(sieve.evict_one(store, scope, ttl_aware, Instant::now()))
+    }
+
+    /// Runs one AdaptiveClimb sweep and returns the LRU-end key to evict, or
+    /// `None` when no eligible victim exists. The store is consulted read-only
+    /// for scope / tombstone checks; the list mutation happens inside
+    /// [`AdaptiveClimbState::evict_one`].
+    fn evict_ac(
+        &self,
+        store: &HashMap<Vec<u8>, ValueEntry>,
+        scope: EvictionScope,
+    ) -> Result<Option<Vec<u8>>, FerrumError> {
+        let mut ac = self.ac.lock()?;
+        Ok(ac.evict_one(store, scope))
     }
 
     /// Convenience wrapper: computes the net byte increase that writing
@@ -1114,6 +1190,7 @@ impl KvEngine {
             self.apply_delta(-(util::entry_bytes(key, entry) as i64));
         }
         self.sieve_notify_remove(key);
+        self.ac_notify_remove(key);
         removed
     }
 
@@ -1121,6 +1198,7 @@ impl KvEngine {
     fn track_clear(&self, store: &mut HashMap<Vec<u8>, ValueEntry>) {
         store.clear();
         self.sieve_notify_clear();
+        self.ac_notify_clear();
         self.used_memory.store(0, Ordering::Relaxed);
     }
 

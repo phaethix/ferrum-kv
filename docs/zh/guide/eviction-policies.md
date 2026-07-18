@@ -13,6 +13,7 @@
 | `allkeys-random` / `volatile-random` | Random | | | x | |
 | `volatile-ttl` | TTL | | | x | |
 | **`allkeys-ahe`** / **`volatile-ahe`** | 自适应 | x | x | x | x |
+| **`allkeys-adaptiveclimb`** / **`volatile-adaptiveclimb`** | AdaptiveClimb（arXiv:2511.21235） | x | x | | x |
 
 ## AHE —— 自适应混合淘汰
 

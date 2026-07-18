@@ -918,6 +918,50 @@ fn zero_max_memory_disables_enforcement() {
 }
 
 #[test]
+fn allkeys_adaptiveclimb_evicts_lru_end() {
+    let engine = KvEngine::new();
+    let max = 2 * (1 + 3 + PER_ENTRY_OVERHEAD);
+    engine
+        .set_eviction_config(EvictionConfig {
+            max_memory: max,
+            policy: EvictionPolicy::AllKeysAdaptiveClimb,
+            samples: 5,
+        })
+        .unwrap();
+    engine.set(b"a".to_vec(), b"AAA".to_vec()).unwrap();
+    engine.set(b"b".to_vec(), b"BBB".to_vec()).unwrap();
+    // Third insert overflows; with no hits the oldest key (a, now at the
+    // LRU end) is evicted.
+    engine.set(b"c".to_vec(), b"CCC".to_vec()).unwrap();
+    assert_eq!(engine.get(b"a").unwrap(), None, "a should be evicted");
+    assert!(engine.exists(b"b").unwrap());
+    assert!(engine.exists(b"c").unwrap());
+    assert_eq!(engine.dbsize().unwrap(), 2);
+}
+
+#[test]
+fn allkeys_adaptiveclimb_hit_protects_key() {
+    let engine = KvEngine::new();
+    let max = 2 * (1 + 3 + PER_ENTRY_OVERHEAD);
+    engine
+        .set_eviction_config(EvictionConfig {
+            max_memory: max,
+            policy: EvictionPolicy::AllKeysAdaptiveClimb,
+            samples: 5,
+        })
+        .unwrap();
+    engine.set(b"a".to_vec(), b"AAA".to_vec()).unwrap();
+    engine.set(b"b".to_vec(), b"BBB".to_vec()).unwrap();
+    // Access `a` so it is promoted toward the MRU end.
+    engine.get(b"a").unwrap();
+    // Now the overflow evicts the LRU end (b), leaving the promoted `a`.
+    engine.set(b"c".to_vec(), b"CCC".to_vec()).unwrap();
+    assert!(engine.exists(b"a").unwrap());
+    assert_eq!(engine.get(b"b").unwrap(), None, "b should be evicted");
+    assert!(engine.exists(b"c").unwrap());
+}
+
+#[test]
 fn scan_keys_glob_filtering() {
     let engine = KvEngine::new();
     engine.set(b"user:1".to_vec(), b"a".to_vec()).unwrap();

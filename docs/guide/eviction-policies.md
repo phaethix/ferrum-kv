@@ -15,6 +15,7 @@ Policies come in two families:
 | `volatile-ttl` | TTL | | | x | |
 | `allkeys-sieve` / `volatile-sieve` | SIEVE (NSDI'24) | x | | | |
 | **`allkeys-sieves`** / **`volatile-sieves`** | SIEVE-S (FerrumKV) | x | | x | |
+| **`allkeys-adaptiveclimb`** / **`volatile-adaptiveclimb`** | AdaptiveClimb (arXiv:2511.21235) | x | x | | x |
 | **`allkeys-ahe`** / **`volatile-ahe`** | Adaptive | x | x | x | x |
 
 ## SIEVE — Simple, Efficient Eviction (NSDI'24)
@@ -44,6 +45,27 @@ Switch at runtime, exactly like any other policy:
 ```text
 CONFIG SET maxmemory-policy allkeys-sieve
 CONFIG SET maxmemory-policy allkeys-sieves
+```
+
+## AdaptiveClimb — Self-Tuning CLIMB (arXiv:2511.21235)
+
+AdaptiveClimb (Berend et al., 2025) is a self-tuning variant of CLIMB. It
+keeps the keyspace in an ordered MRU→LRU list and a **single scalar
+`jump`** that controls how far a hit promotes a key toward the MRU end —
+and needs **no per-item counters**. On a hit it decrements `jump` and
+promotes the key by `jump` positions; on a miss it increments `jump` and
+inserts the new key `jump` positions from the LRU end. Because `jump`
+adapts from the live hit/miss ratio, the policy is self-tuning: more misses
+push `jump` up (new keys enter nearer the LRU end, resisting cache
+pollution), more hits push it down (frequent keys climb and stay protected).
+
+It is the academic cousin of FerrumKV's AHE — both hill-climb a single
+parameter from hit-ratio feedback — but AdaptiveClimb trades TTL-awareness
+for a leaner, counter-free design.
+
+```text
+CONFIG SET maxmemory-policy allkeys-adaptiveclimb
+CONFIG SET maxmemory-policy volatile-adaptiveclimb
 ```
 
 ## AHE — Adaptive Hybrid Eviction

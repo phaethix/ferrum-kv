@@ -3,7 +3,7 @@ layout: home
 
 hero:
   name: FerrumKV
-  text: A readable KV store with 10 eviction policies
+  text: A readable KV store with 16 eviction policies
   actions:
     - theme: brand
       text: Get Started
