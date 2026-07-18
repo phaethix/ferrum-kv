@@ -46,6 +46,24 @@ fn spawn_server() -> ServerGuard {
     }
 }
 
+/// Like [`spawn_server`] but boots the engine with `requirepass` enabled, so
+/// the AUTH-gating behaviour can be exercised end to end.
+fn spawn_server_with_requirepass(password: &[u8]) -> ServerGuard {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+    let addr = listener.local_addr().expect("local_addr").to_string();
+    let engine = KvEngine::new();
+    engine
+        .set_requirepass(Some(password.to_vec()))
+        .expect("set requirepass");
+    let handle = thread::spawn(move || {
+        let _ = server::run_listener(listener, engine, Shutdown::new(), ServerConfig::default());
+    });
+    ServerGuard {
+        addr,
+        _thread: handle,
+    }
+}
+
 /// Opens a TCP connection to the server with sensible read/write timeouts so
 /// that a bug in the server cannot wedge the test suite indefinitely.
 fn connect(addr: &str) -> TcpStream {
@@ -490,13 +508,14 @@ fn config_get_wildcard_returns_all_eviction_params() {
     let mut s = connect(&server.addr);
 
     // Default engine: maxmemory=0, maxmemory-policy=noeviction,
-    // maxmemory-samples=5. `CONFIG GET *` returns a flat array of
-    // (name, value) pairs.
+    // maxmemory-samples=5, requirepass unset (empty). `CONFIG GET *`
+    // returns a flat array of (name, value) pairs — now 4 pairs since
+    // `requirepass` was added as an exposed parameter.
     round_trip(
         &mut s,
         &build_request(&[b"CONFIG", b"GET", b"*"]),
-        b"*6\r\n$9\r\nmaxmemory\r\n$1\r\n0\r\n$16\r\nmaxmemory-policy\r\n$10\r\nnoeviction\
-          \r\n$17\r\nmaxmemory-samples\r\n$1\r\n5\r\n",
+        b"*8\r\n$9\r\nmaxmemory\r\n$1\r\n0\r\n$16\r\nmaxmemory-policy\r\n$10\r\nnoeviction\
+          \r\n$17\r\nmaxmemory-samples\r\n$1\r\n5\r\n$11\r\nrequirepass\r\n$0\r\n\r\n",
     );
 }
 
@@ -601,4 +620,153 @@ fn config_set_invalid_policy_is_rejected() {
         &build_request(&[b"CONFIG", b"SET", b"maxmemory-policy", b"not-a-policy"]),
         b"-ERR Invalid argument 'not-a-policy' for CONFIG SET 'maxmemory-policy'\r\n",
     );
+}
+
+/// Boots a server with `requirepass` configured and returns the shared
+/// password so tests can authenticate against it.
+fn auth_password() -> &'static [u8] {
+    b"secret"
+}
+
+#[test]
+fn auth_blocks_unauthenticated_command_with_noauth() {
+    let server = spawn_server_with_requirepass(auth_password());
+    let mut s = connect(&server.addr);
+
+    // Before AUTH, every command except AUTH is rejected with -NOAUTH.
+    round_trip(
+        &mut s,
+        &build_request(&[b"SET", b"k", b"v"]),
+        b"-NOAUTH Authentication required.\r\n",
+    );
+    // The connection must remain usable after the gatekeeping error.
+    round_trip(
+        &mut s,
+        &build_request(&[b"PING"]),
+        b"-NOAUTH Authentication required.\r\n",
+    );
+}
+
+#[test]
+fn auth_success_unlocks_subsequent_commands() {
+    let server = spawn_server_with_requirepass(auth_password());
+    let mut s = connect(&server.addr);
+
+    round_trip(
+        &mut s,
+        &build_request(&[b"AUTH", auth_password()]),
+        b"+OK\r\n",
+    );
+    // Once authenticated, ordinary commands run normally.
+    round_trip(&mut s, &build_request(&[b"SET", b"k", b"v"]), b"+OK\r\n");
+    round_trip(&mut s, &build_request(&[b"GET", b"k"]), b"$1\r\nv\r\n");
+}
+
+#[test]
+fn auth_wrong_password_keeps_connection_blocked() {
+    let server = spawn_server_with_requirepass(auth_password());
+    let mut s = connect(&server.addr);
+
+    // A mismatched password yields -WRONGPASS and leaves the connection
+    // unauthenticated.
+    round_trip(
+        &mut s,
+        &build_request(&[b"AUTH", b"wrong"]),
+        b"-WRONGPASS invalid username-password pair or user is disabled.\r\n",
+    );
+    // Still blocked, because the failed AUTH did not flip the flag.
+    round_trip(
+        &mut s,
+        &build_request(&[b"GET", b"k"]),
+        b"-NOAUTH Authentication required.\r\n",
+    );
+    // A correct AUTH afterwards succeeds and unlocks the connection.
+    round_trip(
+        &mut s,
+        &build_request(&[b"AUTH", auth_password()]),
+        b"+OK\r\n",
+    );
+    round_trip(&mut s, &build_request(&[b"PING"]), b"+PONG\r\n");
+}
+
+#[test]
+fn auth_without_configured_password_returns_err() {
+    let server = spawn_server();
+    let mut s = connect(&server.addr);
+
+    // On a server with no requirepass, AUTH is itself an error.
+    round_trip(
+        &mut s,
+        &build_request(&[b"AUTH", b"anything"]),
+        b"-ERR Client sent AUTH, but no password is set\r\n",
+    );
+    // The connection is unaffected and ordinary commands work.
+    round_trip(&mut s, &build_request(&[b"PING"]), b"+PONG\r\n");
+}
+
+#[test]
+fn auth_survives_across_pipelined_commands() {
+    let server = spawn_server_with_requirepass(auth_password());
+    let mut s = connect(&server.addr);
+
+    // AUTH and three following commands written in one batch; all must be
+    // processed in order, proving the authenticated flag persists across the
+    // frame-draining loop and survives the read boundary.
+    let mut batched = Vec::new();
+    batched.extend_from_slice(&build_request(&[b"AUTH", auth_password()]));
+    batched.extend_from_slice(&build_request(&[b"SET", b"k", b"v"]));
+    batched.extend_from_slice(&build_request(&[b"GET", b"k"]));
+    batched.extend_from_slice(&build_request(&[b"PING"]));
+    s.write_all(&batched).expect("write batched");
+
+    let expected = b"+OK\r\n+OK\r\n$1\r\nv\r\n+PONG\r\n";
+    let mut reply = vec![0u8; expected.len()];
+    s.read_exact(&mut reply).expect("read batched reply");
+    assert_eq!(&reply[..], &expected[..]);
+}
+
+#[test]
+fn config_get_requirepass_returns_set_password() {
+    let server = spawn_server_with_requirepass(auth_password());
+    let mut s = connect(&server.addr);
+
+    // The server requires auth, so AUTH first, then read the password back.
+    round_trip(
+        &mut s,
+        &build_request(&[b"AUTH", auth_password()]),
+        b"+OK\r\n",
+    );
+    round_trip(
+        &mut s,
+        &build_request(&[b"CONFIG", b"GET", b"requirepass"]),
+        b"*2\r\n$11\r\nrequirepass\r\n$6\r\nsecret\r\n",
+    );
+}
+
+#[test]
+fn config_set_requirepass_enables_auth_mid_connection() {
+    let server = spawn_server();
+    let mut s = connect(&server.addr);
+
+    // With no password initially, AUTH is an error.
+    round_trip(
+        &mut s,
+        &build_request(&[b"AUTH", b"secret"]),
+        b"-ERR Client sent AUTH, but no password is set\r\n",
+    );
+    // Enabling requirepass at runtime starts gating new commands.
+    round_trip(
+        &mut s,
+        &build_request(&[b"CONFIG", b"SET", b"requirepass", b"secret"]),
+        b"+OK\r\n",
+    );
+    // The already-open connection is now gated (config is shared via Arc).
+    round_trip(
+        &mut s,
+        &build_request(&[b"SET", b"k", b"v"]),
+        b"-NOAUTH Authentication required.\r\n",
+    );
+    // Authenticate and confirm the gate opens for this connection.
+    round_trip(&mut s, &build_request(&[b"AUTH", b"secret"]), b"+OK\r\n");
+    round_trip(&mut s, &build_request(&[b"SET", b"k", b"v"]), b"+OK\r\n");
 }

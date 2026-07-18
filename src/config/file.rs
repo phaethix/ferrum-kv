@@ -42,6 +42,9 @@ pub struct FileConfig {
     pub max_memory_policy: Option<EvictionPolicy>,
     /// Number of keys inspected per eviction round.
     pub max_memory_samples: Option<usize>,
+    /// Connection password for the `AUTH` command. `None` disables
+    /// authentication; `Some(pw)` enables it at startup.
+    pub requirepass: Option<String>,
     /// Number of tokio worker threads. `0` (or unset) lets the runtime
     /// pick a sensible default (usually the logical CPU count).
     pub io_threads: Option<usize>,
@@ -187,6 +190,12 @@ fn apply_directive(cfg: &mut FileConfig, key: &str, value: &str) -> Result<(), S
         }
         "maxmemory-samples" => {
             cfg.max_memory_samples = Some(parse_usize(value, "maxmemory-samples")?);
+        }
+        "requirepass" => {
+            // Redis takes the remainder of the line as the password, but our
+            // simple whitespace split already isolated one token; we keep it
+            // verbatim (no quote stripping) so an unusual password survives.
+            cfg.requirepass = Some(value.to_string());
         }
         "io-threads" => {
             cfg.io_threads = Some(parse_usize(value, "io-threads")?);

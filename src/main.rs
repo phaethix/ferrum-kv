@@ -23,7 +23,7 @@ const LOG_ENV: &str = "FERRUM_LOG";
 
 fn main() -> ExitCode {
     let args = match CliArgs::parse(env::args().skip(1)) {
-        Ok(Invocation::Run(args)) => args,
+        Ok(Invocation::Run(args)) => *args,
         Ok(Invocation::Help) => {
             println!("{USAGE}");
             return ExitCode::SUCCESS;
@@ -58,6 +58,18 @@ fn main() -> ExitCode {
             eviction_cfg.policy.name(),
             eviction_cfg.samples,
         );
+    }
+
+    // Apply the optional connection password before we start accepting
+    // clients, so the very first connection is already gated.
+    if let Some(pw) = args.requirepass() {
+        if let Err(e) = engine.set_requirepass(Some(pw)) {
+            error!("failed to apply requirepass: {e}");
+            return ExitCode::FAILURE;
+        }
+        info!("requirepass: enabled");
+    } else {
+        info!("requirepass: disabled");
     }
 
     // Bind the listener up front so that `--addr :0` is resolved before we
