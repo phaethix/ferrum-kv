@@ -474,6 +474,7 @@ mod tests {
     use super::*;
     use std::fs;
     use std::path::Path;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     fn parse(args: &[&str]) -> Result<Invocation, String> {
         CliArgs::parse(args.iter().map(|s| s.to_string()))
@@ -609,6 +610,8 @@ mod tests {
 
     // --- Config file integration tests -------------------------------------
 
+    static NEXT_TEMP_CONF_ID: AtomicU64 = AtomicU64::new(0);
+
     struct TempConf {
         path: PathBuf,
     }
@@ -616,7 +619,11 @@ mod tests {
     impl TempConf {
         fn new(name: &str, body: &str) -> Self {
             let mut dir = std::env::temp_dir();
-            dir.push(format!("ferrum-cli-{name}-{}.conf", std::process::id()));
+            let id = NEXT_TEMP_CONF_ID.fetch_add(1, Ordering::Relaxed);
+            dir.push(format!(
+                "ferrum-cli-{name}-{}-{id}.conf",
+                std::process::id()
+            ));
             fs::write(&dir, body).expect("write temp conf");
             Self { path: dir }
         }
@@ -626,6 +633,16 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_file(&self.path);
         }
+    }
+
+    #[test]
+    fn temp_conf_paths_are_unique_for_reused_names() {
+        let first = TempConf::new("reused", "port 7000\n");
+        let second = TempConf::new("reused", "port 7001\n");
+
+        assert_ne!(first.path, second.path);
+        assert_eq!(fs::read_to_string(&first.path).unwrap(), "port 7000\n");
+        assert_eq!(fs::read_to_string(&second.path).unwrap(), "port 7001\n");
     }
 
     #[test]
