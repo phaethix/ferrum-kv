@@ -16,7 +16,7 @@ PACE_MS="${PACE_MS:-1}"
 WORKING_SET="${WORKING_SET:-100000}"
 CAPACITY="${CAPACITY:-5000}"
 PATTERNS="${PATTERNS:-zipf,shift,mixed,scan}"
-POLICIES="${POLICIES:-lru,lfu,ahe,random}"
+POLICIES="${POLICIES:-lru,lfu,ahe,random,sieve,sieves}"
 
 cd "$(dirname "$0")/.."
 
