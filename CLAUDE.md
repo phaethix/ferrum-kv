@@ -16,7 +16,7 @@
 - **Language**: Rust, edition 2024
 - **Type**: From-scratch RESP2-compatible KV storage server (Redis wire protocol)
 - **Runtime**: Tokio async, `signal-hook`, `indexmap`, zero heavy deps
-- **Versions**: `Cargo.toml` = 0.4.0, README badge = v0.4.0
+- **Versions**: `Cargo.toml` = 0.5.1, README badge = v0.5.1
 
 ## Architecture Quick Reference
 
@@ -25,7 +25,7 @@
 | Entry | `src/main.rs`, `src/cli.rs` | `main`, `build_engine`, `install_signal_handlers` |
 | Network | `src/network/server.rs`, `shutdown.rs` | `run_listener`, `accept_loop`, `handle_client`, `execute_command` |
 | Protocol | `src/protocol/parser.rs`, `encoder.rs` | `parse_frame`, `build_command`, `encode_*` |
-| Storage | `src/storage/engine/` (mod.rs, entry.rs, util.rs, types.rs, tests.rs), `eviction.rs`, `expire.rs` | `KvEngine`, `pick_victim`, `sweep_expired` |
+| Storage | `src/storage/engine/` (mod.rs, entry.rs, util.rs, types.rs, tests.rs), `eviction.rs`, `expire.rs`, `sieve.rs`, `adaptive_climb.rs` | `KvEngine`, `pick_victim` (AHE in `eviction.rs`), `sweep_expired`, `AdaptiveClimb` |
 | Persistence | `src/persistence/writer.rs`, `replay.rs` | `AofWriter`, `replay` |
 | Config | `src/config/file.rs` | Redis-style directive parser |
 | Error | `src/error/kind.rs` | `FerrumError` (unified, 9 variants) |
@@ -34,12 +34,14 @@
 
 ### Code quality gates — run before declaring any task done
 ```bash
-cargo fmt --check                # formatting
-cargo clippy --all-targets -- -D warnings   # zero warnings allowed
-cargo check                      # compiles
-cargo test                       # all unit + integration green
+cargo fmt --all -- --check                          # formatting (matches CI)
+cargo clippy --all-targets --all-features -- -D warnings   # zero warnings allowed
+cargo check --all-features                          # compiles
+cargo test --all-targets --all-features            # all unit + integration green
+cargo bench --no-run --all-features                # benches must compile
 ```
-CI runs all four. Do not push code that fails any of them.
+CI runs these (fmt, clippy, test, bench) on every PR. Do not push code
+that fails any of them.
 
 ### Binary safety is sacred
 Keys and values are `Vec<u8>`, never assume UTF-8. Do not introduce
@@ -236,10 +238,11 @@ GitHub Copilot, Aider, or any other — MUST:
    dependency removals, and deleting branches require explicit user
    approval in the current turn. State the risk and the rollback path
    before executing.
-4. **Run the four CI gates locally before declaring done**: `cargo fmt
-   --check`, `cargo clippy --all-targets -- -D warnings`, `cargo check`,
-   `cargo test --all-targets`. Report results faithfully; never claim a
-   check passed without running it.
+4. **Run the CI gates locally before declaring done**: `cargo fmt --all
+   -- --check`, `cargo clippy --all-targets --all-features -- -D warnings`,
+   `cargo check --all-features`, `cargo test --all-targets --all-features`,
+   `cargo bench --no-run --all-features`. Report results faithfully; never
+   claim a check passed without running it.
 5. **Rebase, don't merge-commit, when syncing with master.** If a feature
    branch falls behind `master`, `git rebase master` and resolve conflicts
    locally rather than creating a merge commit.

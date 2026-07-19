@@ -12,8 +12,10 @@
 >   subject ≤ 72 chars, body wrapped at 72 columns explaining what/why.
 > - PR body must contain: Summary, What changed, Why, Compatibility/risk,
 >   Verification, Issue references.
-> - Run `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
->   `cargo check`, `cargo test --all-targets` before declaring done.
+> - Run `cargo fmt --all -- --check`, `cargo clippy --all-targets
+>   --all-features -- -D warnings`, `cargo check --all-features`,
+>   `cargo test --all-targets --all-features`, `cargo bench --no-run
+>   --all-features` before declaring done.
 > - Keys/values are `Vec<u8>` — binary-safe, never assume UTF-8.
 > - One concern per PR; rebase (don't merge-commit) when syncing with master.
 >
