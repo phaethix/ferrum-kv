@@ -136,12 +136,12 @@ AHE's differentiation from AdaptiveClimb is **real by construction**: **AHE inco
 
 | ID | Feature | Effort | Rationale |
 |----|---------|--------|-----------|
-| E-01 | **SIEVE implementation** | 2 days | The NSDI'24 algorithm that beats LRU/LFU on 45%+ of production traces. One queue + one pointer. Implementation is trivial. |
-| E-02 | **SIEVE-S (SIEVE with TTL)** | 2 days | FerrumKV's contribution: SIEVE + TTL-awareness. Items near expiry get demoted faster. |
-| E-03 | **AdaptiveClimb implementation** | 2 days | The control-theoretic policy from arXiv 2511.21235. Single parameter `jump`. |
-| E-04 | **EvictionPolicy trait** | 2 days | Extract eviction behind a trait so new policies can be added without touching engine internals. Trait methods: `on_hit`, `on_miss`, `pick_victim`, `on_insert`, `on_evict`. |
-| E-05 | **Eviction benchmark suite** | 4 days | Scripted workloads: Zipfian (α=0.7, 0.9, 1.0, 1.2), temporal hotspots, mixed R/W, production traces (MetaCDN, Twitter KV subsets from libCacheSim). Produce a comparison table across all policies. |
-| E-06 | **AHE differentiation paper** | 3 days | Document how AHE differs from AdaptiveClimb: TTL signal in EPS, multi-dimensional scoring, adaptive α via hit-ratio feedback. Benchmarks vs LRU, LFU, SIEVE, AdaptiveClimb. |
+| ✅ E-01 | **SIEVE implementation** | 2 days | The NSDI'24 algorithm that beats LRU/LFU on 45%+ of production traces. One queue + one pointer. Shipped as `allkeys-sieve` / `volatile-sieve`. **(done v0.5.1)** |
+| ✅ E-02 | **SIEVE-S (SIEVE with TTL)** | 2 days | FerrumKV's contribution: SIEVE + TTL-awareness. Items near expiry get demoted faster. Shipped as `allkeys-sieves` / `volatile-sieves`. **(done v0.5.1)** |
+| ✅ E-03 | **AdaptiveClimb implementation** | 2 days | The control-theoretic policy from arXiv 2511.21235. Single parameter `jump`. Shipped as `allkeys-adaptiveclimb` / `volatile-adaptiveclimb`. **(done v0.5.1)** |
+| E-04 | **EvictionPolicy trait** | 2 days | Planned as an open trait (`on_hit`/`on_miss`/`pick_victim`/`on_insert`/`on_evict`). **Not shipped as a trait** — policies are added by extending the `EvictionPolicy` enum + the `pick_victim` match arm, so each new policy still touches engine internals. Re-scoped as a future refactor (see Beyond v0.8). |
+| ✅ E-05 | **Eviction benchmark suite** | 4 days | `examples/hit_ratio_bench.rs` drives a live server under zipf / shift / mixed / scan / opt-in ttl patterns and reports hit ratios across all policies; `docs/reference/benchmarks.md` hosts the comparison table. **(done v0.5.1)** |
+| E-06 | **AHE differentiation paper** | 3 days | The design differentiator (TTL signal in EPS) is documented in `docs/reference/ahe.md`, but the full empirical benchmark paper vs AdaptiveClimb/LRU/LFU/SIEVE is **not yet written** — PR #28 showed AHE only matches, not beats, established policies on the evaluated workloads. Deferred to "Beyond v0.8". |
 
 **This phase is the pivot.** After v0.5.1, FerrumKV's README should lead with the eviction algorithm comparison table, not the command list.
 
@@ -188,8 +188,8 @@ Note: This is *not* about competing with kevy on command count. It's about havin
 
 - Sorted Set (skip-list)
 - Pub/Sub (tokio broadcast)
-- AHE vs AdaptiveClimb formal benchmark paper
-- Pluggable eviction trait with runtime policy switching
+- AHE vs AdaptiveClimb formal benchmark paper _(was E-06)_
+- Pluggable eviction trait with runtime policy switching _(was E-04)_
 - Prometheus metrics endpoint
 - TLS (rustls)
 - Primary-Replica replication (academic exercise)
@@ -226,19 +226,19 @@ FerrumKV occupies the **bottom-left** quadrant: embedded library, but optimized 
 
 | Metric | Baseline (v0.4.1) | v0.5.0 Target | v0.5.1 Target |
 |--------|-------------------|---------------|---------------|
-| Eviction policies | 10 | 10 (unchanged) | **13** (+SIEVE, +SIEVE-S, +AdaptiveClimb) |
-| Eviction benchmark coverage | 0 formal workloads | 0 | **5 workloads** × 13 policies |
+| Eviction policies | 10 | 10 (unchanged) | **16** (10 Redis-style + AHE + SIEVE + SIEVE-S + AdaptiveClimb) |
+| Eviction benchmark coverage | 0 formal workloads | 0 | **5 patterns** (zipf / shift / mixed / scan + opt-in ttl) × 16 policies |
 | Commands | 15 | 22 | 22 |
 | RESP3 support | ❌ | ❌ | ❌ (v0.6) |
 | `redis-benchmark` SET QPS | 62,189 | ≥ 60,000 | ≥ 58,000 (acceptable for eviction overhead) |
 | Binary size (release, stripped) | ~2.0MB | ≤ 2.2MB | ≤ 2.5MB |
 | Test count | 293 | ≥ 350 | ≥ 400 |
-| AHE differentiation documented | ❌ | ❌ | ✅ (paper) |
+| AHE differentiation documented | ❌ | ❌ | ⚠️ design only (ahe.md) — empirical paper deferred |
 
 ### Qualitative
 
 - **Eviction credibility**: A researcher can read `design/whitepaper.md`, reproduce the benchmarks, and understand how AHE differs from AdaptiveClimb.
-- **Library experience**: A developer adds `ferrum-kv = "0.5"` and has an embedded cache with their choice of 13 eviction policies.
+- **Library experience**: A developer adds `ferrum-kv = "0.5"` and has an embedded cache with their choice of 16 eviction policies.
 - **Educational value**: A student can read the codebase from `main.rs` → `parser.rs` → `engine/mod.rs` → `eviction.rs` and understand every layer.
 
 ---
@@ -247,7 +247,7 @@ FerrumKV occupies the **bottom-left** quadrant: embedded library, but optimized 
 
 | # | Risk | Probability | Impact | Mitigation |
 |---|------|------------|--------|------------|
-| R1 | kevy captures the "embedded Rust RESP2 KV" mindshare entirely | High | Medium | **Don't fight it. Pivot hard to eviction lab + education.** kevy can't do 13 eviction policies with reproducible benchmarks. |
+| R1 | kevy captures the "embedded Rust RESP2 KV" mindshare entirely | High | Medium | **Don't fight it. Pivot hard to eviction lab + education.** kevy can't do 16 eviction policies with reproducible benchmarks. |
 | R2 | AHE not sufficiently differentiated from AdaptiveClimb | Medium | High | The TTL-awareness angle is real *by design* (AdaptiveClimb paper explicitly does not handle TTL), but its empirical superiority is unproven (PR #28). Lead with the design differentiator; do not over-claim benchmark wins. |
 | R3 | SIEVE implementation is trivial (one queue + one pointer) — why would anyone use FerrumKV for this? | Low | Medium | The value is the *comparison platform*, not any single algorithm. Plug your own policy, run the benchmark suite, get a comparison table. |
 | R4 | Single-maintainer bus factor | Present | High | Each module now has a design doc. Educational material doubles as onboarding docs for contributors. |

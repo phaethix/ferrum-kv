@@ -20,7 +20,7 @@
 | Commands | **98** (all 5 Redis types + pub/sub + WATCH) | 15 (string only) |
 | Embedded GET latency | **54ns** | ~400μs (network round-trip) |
 | Server throughput (GET, c=50, P=16) | **4.4M ops/s** | ~350K ops/s |
-| Eviction policies | TTL-based only | **10 policies (incl. AHE)** |
+| Eviction policies | TTL-based only | **16 policies (incl. AHE, SIEVE, SIEVE-S, AdaptiveClimb)** |
 | Code readability | Complex (custom syscalls, slab allocators) | **Clean, layered, documented** |
 | Learning value | Low (too optimized) | **High** |
 
@@ -148,7 +148,7 @@ kevy is too optimized to learn from. Redis source is 100K+ lines of C. Dragonfly
 
 ```
 FERRUMKV IS:
-  - An eviction algorithm laboratory (13 policies + benchmark suite)
+  - An eviction algorithm laboratory (16 policies + benchmark suite)
   - The most readable RESP2 server implementation in Rust
   - The home of AHE — the TTL-aware adaptive eviction algorithm
   - An embeddable KV library for Rust applications
