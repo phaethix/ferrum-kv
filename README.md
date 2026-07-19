@@ -243,7 +243,7 @@ engine's internal LFU/LRU sampling RNG is seeded from the wall clock.
 | `--client-timeout SECONDS` | `0` (disabled) | Per-connection idle timeout |
 | `--maxclients N` | *(unlimited)* | Max concurrent client connections |
 | `--maxmemory BYTES` | `0` (unlimited) | Memory cap (`512b` / `64kb` / `256mb` / `1gb`) |
-| `--maxmemory-policy POLICY` | `noeviction` | Any of the 10 policies |
+| `--maxmemory-policy POLICY` | `noeviction` | Any of the 16 policies |
 | `--maxmemory-samples N` | `5` | Keys sampled per eviction round |
 | `--io-threads N` | `0` (auto) | Tokio worker threads |
 | `--loglevel LEVEL` | `info` | `off` / `error` / `warn` / `info` / `debug` / `trace` |
@@ -265,7 +265,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for conventions and review process.
 
 | Version | Focus |
 |---------|-------|
-| v0.5.1 | CONFIG SET/GET (F-01), AUTH requirepass (F-02); SIEVE (NSDI'24), SIEVE-S, benchmark suite, EvictionPolicy trait |
+| v0.5.1 | CONFIG SET/GET (F-01), AUTH requirepass (F-02); SIEVE (NSDI'24), SIEVE-S, AdaptiveClimb (arXiv:2511.21235), AHE TTL-aware eviction, benchmark suite |
 | v0.5.2 | SLOWLOG (F-03), AOF REWRITE (F-04), MONITOR (F-05), INFO expansion (F-06) |
 | v0.6 | RESP3 protocol, typed replies, client-side caching |
 | v0.7 | List, Hash, Set data types |
