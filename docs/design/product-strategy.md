@@ -91,7 +91,9 @@ This is not a consolation prize — it's a **deliberate product decision**. The 
 
 #### Pillar 3: AHE — TTL-Aware Adaptive Eviction
 
-AHE's differentiation from AdaptiveClimb: **AHE incorporates TTL as a first-class signal in the eviction score (EPS)**. AdaptiveClimb only balances recency vs frequency. AHE balances recency + frequency + **time-to-live urgency**. This is the academic hook.
+AHE's differentiation from AdaptiveClimb is **real by construction**: **AHE incorporates TTL as a first-class signal in the eviction score (EPS)**, whereas AdaptiveClimb's paper (arXiv:2511.21235) explicitly balances only recency vs frequency and does not model TTL. TTL-awareness is therefore a genuine design-level differentiator, not a marketing claim.
+
+**Honest status (per PR #28 benchmarks)**: the TTL-aware mode is currently opt-in and deliberately excluded from the default core benchmark matrix, because under the evaluated workloads it converges to LRU/LFU at reasonable cache sizes and loses to LFU under very small caches. In other words, the differentiator is real *by design* but its **empirical edge over established policies is not yet demonstrated**. Closing this gap — a TTL-heavy workload (e.g. short-lived sessions mixed with long-lived keys) where AHE provably pulls ahead — is tracked as future work, not claimed today.
 
 ### What FerrumKV Is NOT (Reaffirmed)
 
@@ -246,7 +248,7 @@ FerrumKV occupies the **bottom-left** quadrant: embedded library, but optimized 
 | # | Risk | Probability | Impact | Mitigation |
 |---|------|------------|--------|------------|
 | R1 | kevy captures the "embedded Rust RESP2 KV" mindshare entirely | High | Medium | **Don't fight it. Pivot hard to eviction lab + education.** kevy can't do 13 eviction policies with reproducible benchmarks. |
-| R2 | AHE not sufficiently differentiated from AdaptiveClimb | Medium | High | The TTL-awareness angle is real (AdaptiveClimb paper explicitly does not handle TTL). Lead with this. |
+| R2 | AHE not sufficiently differentiated from AdaptiveClimb | Medium | High | The TTL-awareness angle is real *by design* (AdaptiveClimb paper explicitly does not handle TTL), but its empirical superiority is unproven (PR #28). Lead with the design differentiator; do not over-claim benchmark wins. |
 | R3 | SIEVE implementation is trivial (one queue + one pointer) — why would anyone use FerrumKV for this? | Low | Medium | The value is the *comparison platform*, not any single algorithm. Plug your own policy, run the benchmark suite, get a comparison table. |
 | R4 | Single-maintainer bus factor | Present | High | Each module now has a design doc. Educational material doubles as onboarding docs for contributors. |
 | R5 | RESP3 adoption accelerates, making RESP2-only servers look legacy | Medium | Medium | v0.6 adds RESP3. Until then, RESP2 is still the universal fallback — every Redis client speaks it. |
