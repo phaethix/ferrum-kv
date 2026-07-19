@@ -6,7 +6,7 @@
 
 <p align="center">
   <b>Eviction algorithm laboratory for RESP2-compatible KV stores.</b><br>
-  <sub>10 cache eviction policies, built-in web dashboard, written in Rust.</sub>
+  <sub>16 cache eviction policies, built-in web dashboard, written in Rust.</sub>
 </p>
 
 <p align="center">
