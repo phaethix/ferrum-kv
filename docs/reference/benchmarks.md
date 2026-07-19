@@ -59,7 +59,15 @@ included). Reproduce with `scripts/bench-hit-ratio.sh`; the harness lives in
   (`--patterns ttl`) and mixes a durable hot set with a short-TTL ephemeral set to exercise
   TTL-aware eviction; in our measurements it converges with LRU/LFU at realistic cache sizes
   and does not reliably beat LFU at very tight caches, so it is opt-in rather than part of the
-  headline matrix above.
+  headline matrix above. The convergence is structural at the harness's default `pace=1ms`:
+  AHE's recency term is normalised against a 600 s horizon, so a ~12 s run flattens it
+  to ~0 and AHE silently collapses to plain LFU (the harness header warns about exactly
+  this). Its `+0.2` TTL penalty then has nothing to differentiate against, and the pattern
+  reports an identical hit ratio for every policy we tried (LRU/LFU/SIEVE/AHE/SIEVE-S/random,
+  to <0.1 pp). The `ttl` pattern gained tunable `--durable-pool` / `--ephemeral-pool` /
+  `--durable-ttl-secs` / `--ephemeral-ttl-secs` knobs (in `examples/hit_ratio_bench.rs`)
+  to explore higher-pace regimes, but AHE's TTL edge remains a design property, not a
+  reproduced benchmark result.
 - Single representative run; figures vary ~±1 pp across runs because the engine's internal
   LFU/LRU sampling RNG is seeded from the wall clock.
 
