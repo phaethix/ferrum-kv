@@ -74,7 +74,7 @@ These are all server-side beasts. FerrumKV does not compete here — and shouldn
 
 #### Pillar 1: Eviction Algorithm Platform
 
-FerrumKV is the only KV that ships **10+ eviction policies** (including SIEVE, AHE, and AdaptiveClimb) as first-class, benchmarked features. You can A/B test eviction policies on your workload, add your own policy by implementing a trait, and see reproducible benchmarks against standard baselines.
+FerrumKV is the only KV that ships **16 eviction policies** (including SIEVE, SIEVE-S, AHE, and AdaptiveClimb) as first-class, benchmarked features. You can A/B test eviction policies on your workload, add your own policy by implementing a trait, and see reproducible benchmarks against standard baselines.
 
 **This is a genuine gap.** No Redis fork, no embedded KV, and no academic simulator offers this combination: production-grade RESP2 server + pluggable eviction algorithms + reproducible benchmark suite.
 
@@ -124,7 +124,7 @@ AHE's differentiation from AdaptiveClimb: **AHE incorporates TTL as a first-clas
 | F-05 | MONITOR command | 1 day | Debugging tool. |
 | F-06 | INFO fields expansion | 1 day | `instantaneous_ops_per_sec`, `evicted_keys`, `expired_keys`, `total_commands_processed`. |
 | F-07 | WriteGuard pipeline refactor | 3 days | Eliminate write-path boilerplate. Foundation for clean eviction integration. |
-| F-08 | Version bump + badge fix | 1 hour | Housekeeping. |
+| ✅ F-08 | Version bump + badge fix | 1 hour | Housekeeping. **(done v0.5.1)** |
 
 **Exit criteria**: All CI green. AOF rewrite tested with 1M keys. No benchmark regression.
 
