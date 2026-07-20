@@ -19,6 +19,7 @@
 pub(crate) mod entry;
 pub mod types;
 pub(crate) mod util;
+pub(crate) mod write_guard;
 
 #[cfg(test)]
 mod tests;
@@ -33,16 +34,16 @@ pub(crate) use util::current_epoch_ms;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use crate::error::FerrumError;
 use crate::persistence::AofWriter;
 use crate::storage::adaptive_climb::AdaptiveClimbState;
-use crate::storage::engine::entry::{ValueEntry, live_payload};
+use crate::storage::engine::entry::ValueEntry;
 use crate::storage::engine::util::{
-    deadline_to_epoch_ms, log_aof_result, rng_seed, sample_candidates, validate_key,
-    validate_value, xorshift32,
+    log_aof_result, rng_seed, sample_candidates, validate_key, validate_value, xorshift32,
 };
+use crate::storage::engine::write_guard::WriteGuard;
 use crate::storage::eviction::{
     self, AdaptiveHybridState, EvictionConfig, EvictionPolicy, EvictionScope,
 };
@@ -270,16 +271,8 @@ impl KvEngine {
     /// Returns [`FerrumError::KeyTooLong`] or [`FerrumError::ValueTooLarge`] if
     /// the configured size limits are exceeded.
     pub fn set(&self, key: Vec<u8>, value: Vec<u8>) -> Result<Option<Vec<u8>>, FerrumError> {
-        validate_key(&key)?;
-        validate_value(&value)?;
-
-        let mut store = self.store.write()?;
-        self.enforce_for_write(&mut store, &key, value.len())?;
-        if let Some(aof) = &self.aof {
-            log_aof_result("SET", aof.append_set(&key, &value));
-        }
-        let previous = self.track_insert(&mut store, key, ValueEntry::new(value));
-        Ok(previous.and_then(live_payload))
+        let mut g = WriteGuard::begin(self)?;
+        g.insert(key, value)
     }
 
     /// Records a (re)insertion in auxiliary eviction structures.
@@ -357,27 +350,8 @@ impl KvEngine {
     /// already set. The AOF records a `SET` only on a successful insert,
     /// mirroring the Redis semantics of `SETNX`.
     pub fn set_nx(&self, key: Vec<u8>, value: Vec<u8>) -> Result<bool, FerrumError> {
-        validate_key(&key)?;
-        validate_value(&value)?;
-
-        let mut store = self.store.write()?;
-        let now = Instant::now();
-        if let Some(entry) = store.get(key.as_slice()) {
-            if !entry.is_expired(now) {
-                return Ok(false);
-            }
-            // The old value has already expired: remove it and proceed as if
-            // the key were absent. We intentionally do not log a DEL because
-            // the subsequent SET, once replayed, overwrites the stale entry
-            // anyway and skipping the DEL keeps the log shorter.
-            self.track_remove(&mut store, key.as_slice());
-        }
-        self.enforce_for_write(&mut store, &key, value.len())?;
-        if let Some(aof) = &self.aof {
-            log_aof_result("SETNX", aof.append_set(&key, &value));
-        }
-        self.track_insert(&mut store, key, ValueEntry::new(value));
-        Ok(true)
+        let mut g = WriteGuard::begin(self)?;
+        g.insert_nx(key, value)
     }
 
     /// Sets every `(key, value)` pair in `pairs` atomically.
@@ -387,22 +361,8 @@ impl KvEngine {
     /// batch in a single write so concurrent appenders never observe a
     /// half-committed MSET.
     pub fn mset(&self, pairs: Vec<(Vec<u8>, Vec<u8>)>) -> Result<(), FerrumError> {
-        for (k, v) in &pairs {
-            validate_key(k)?;
-            validate_value(v)?;
-        }
-
-        let mut store = self.store.write()?;
-        for (k, v) in &pairs {
-            self.enforce_for_write(&mut store, k, v.len())?;
-        }
-        if let Some(aof) = &self.aof {
-            log_aof_result("MSET", aof.append_set_many(&pairs));
-        }
-        for (k, v) in pairs {
-            self.track_insert(&mut store, k, ValueEntry::new(v));
-        }
-        Ok(())
+        let mut g = WriteGuard::begin(self)?;
+        g.insert_many(pairs)
     }
 
     /// Returns the stored value for every key in `keys`, preserving order.
@@ -411,28 +371,10 @@ impl KvEngine {
     /// null bulk strings without ambiguity. Expired entries are dropped in
     /// the same pass so the result reflects live state only.
     pub fn mget(&self, keys: &[Vec<u8>]) -> Result<Vec<Option<Vec<u8>>>, FerrumError> {
-        let mut store = self.store.write()?;
-        let now = Instant::now();
+        let mut g = WriteGuard::begin(self)?;
         let mut out = Vec::with_capacity(keys.len());
         for key in keys {
-            match store.get(key.as_slice()) {
-                Some(entry) if entry.is_expired(now) => {
-                    self.track_remove(&mut store, key.as_slice());
-                    self.log_expire_drop(key);
-                    self.record_miss();
-                    out.push(None);
-                }
-                Some(entry) => {
-                    let data = entry.data.clone();
-                    self.touch_access(&mut store, key.as_slice());
-                    self.record_hit();
-                    out.push(Some(data));
-                }
-                None => {
-                    self.record_miss();
-                    out.push(None);
-                }
-            }
+            out.push(g.fetch_live(key));
         }
         Ok(out)
     }
@@ -450,23 +392,16 @@ impl KvEngine {
     /// The key's existing TTL, if any, is preserved.
     pub fn incr_by(&self, key: Vec<u8>, delta: i64) -> Result<i64, FerrumError> {
         validate_key(&key)?;
-
-        let mut store = self.store.write()?;
-        let now = Instant::now();
-        let (current, existing_deadline) = match store.get(key.as_slice()) {
-            Some(entry) if entry.is_expired(now) => {
-                self.track_remove(&mut store, key.as_slice());
-                self.log_expire_drop(&key);
-                (0i64, None)
-            }
-            Some(entry) => {
-                let text = std::str::from_utf8(&entry.data).map_err(|_| {
+        let mut g = WriteGuard::begin(self)?;
+        let (current, existing_deadline) = match g.read_state(&key) {
+            Some((data, ttl)) => {
+                let text = std::str::from_utf8(&data).map_err(|_| {
                     FerrumError::ParseError("value is not an integer or out of range".into())
                 })?;
                 let n = text.parse::<i64>().map_err(|_| {
                     FerrumError::ParseError("value is not an integer or out of range".into())
                 })?;
-                (n, entry.expire_at)
+                (n, ttl)
             }
             None => (0i64, None),
         };
@@ -475,62 +410,20 @@ impl KvEngine {
             FerrumError::ParseError("value is not an integer or out of range".into())
         })?;
         let serialised = new_value.to_string().into_bytes();
-
-        self.enforce_for_write(&mut store, &key, serialised.len())?;
-        if let Some(aof) = &self.aof {
-            log_aof_result("INCRBY", aof.append_set(&key, &serialised));
-            // INCR preserves TTL: re-emit the existing deadline so replay
-            // converges to the same state regardless of record ordering.
-            if let Some(deadline) = existing_deadline
-                && let Some(abs_ms) = deadline_to_epoch_ms(deadline, now)
-            {
-                log_aof_result("PEXPIREAT", aof.append_pexpireat(&key, abs_ms));
-            }
-        }
-        self.track_insert(
-            &mut store,
-            key,
-            ValueEntry::new_with(serialised, existing_deadline),
-        );
+        g.insert_keep_ttl(key, serialised, existing_deadline)?;
         Ok(new_value)
     }
 
     /// Returns the value for `key`, or `None` if the key does not exist.
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, FerrumError> {
-        let mut store = self.store.write()?;
-        let now = Instant::now();
-        match store.get(key) {
-            Some(entry) if entry.is_expired(now) => {
-                self.track_remove(&mut store, key);
-                self.log_expire_drop(key);
-                self.record_miss();
-                Ok(None)
-            }
-            Some(entry) => {
-                let data = entry.data.clone();
-                self.touch_access(&mut store, key);
-                self.record_hit();
-                Ok(Some(data))
-            }
-            None => {
-                self.record_miss();
-                Ok(None)
-            }
-        }
+        let mut g = WriteGuard::begin(self)?;
+        Ok(g.fetch_live(key))
     }
 
     /// Deletes `key` and returns `true` if it existed.
     pub fn del(&self, key: &[u8]) -> Result<bool, FerrumError> {
-        let mut store = self.store.write()?;
-        let now = Instant::now();
-        let existed = match self.track_remove(&mut store, key) {
-            Some(entry) => !entry.is_expired(now),
-            None => false,
-        };
-        if existed && let Some(aof) = &self.aof {
-            log_aof_result("DEL", aof.append_del(key));
-        }
-        Ok(existed)
+        let mut g = WriteGuard::begin(self)?;
+        Ok(g.remove(key))
     }
 
     /// Deletes every key in `keys` and returns the count of keys that
@@ -545,44 +438,14 @@ impl KvEngine {
         if keys.is_empty() {
             return Ok(0);
         }
-        let mut store = self.store.write()?;
-        let now = Instant::now();
-        let mut removed: Vec<&[u8]> = Vec::with_capacity(keys.len());
-        for key in keys {
-            if let Some(entry) = self.track_remove(&mut store, key.as_slice())
-                && !entry.is_expired(now)
-            {
-                removed.push(key.as_slice());
-            }
-        }
-        if let Some(aof) = &self.aof {
-            for key in &removed {
-                log_aof_result("DEL", aof.append_del(key));
-            }
-        }
-        Ok(removed.len())
+        let mut g = WriteGuard::begin(self)?;
+        Ok(g.remove_many(keys))
     }
 
     /// Returns `true` if `key` exists and has not expired.
     pub fn exists(&self, key: &[u8]) -> Result<bool, FerrumError> {
-        let mut store = self.store.write()?;
-        let now = Instant::now();
-        match store.get(key) {
-            Some(entry) if entry.is_expired(now) => {
-                self.track_remove(&mut store, key);
-                self.log_expire_drop(key);
-                self.record_miss();
-                Ok(false)
-            }
-            Some(_) => {
-                self.record_hit();
-                Ok(true)
-            }
-            None => {
-                self.record_miss();
-                Ok(false)
-            }
-        }
+        let mut g = WriteGuard::begin(self)?;
+        Ok(g.contains_live(key))
     }
 
     /// Counts how many of the given keys currently exist (lazily expiring
@@ -594,23 +457,11 @@ impl KvEngine {
         if keys.is_empty() {
             return Ok(0);
         }
-        let mut store = self.store.write()?;
-        let now = Instant::now();
+        let mut g = WriteGuard::begin(self)?;
         let mut count = 0usize;
         for key in keys {
-            match store.get(key.as_slice()) {
-                Some(entry) if entry.is_expired(now) => {
-                    self.track_remove(&mut store, key.as_slice());
-                    self.log_expire_drop(key.as_slice());
-                    self.record_miss();
-                }
-                Some(_) => {
-                    self.record_hit();
-                    count += 1;
-                }
-                None => {
-                    self.record_miss();
-                }
+            if g.contains_live(key) {
+                count += 1;
             }
         }
         Ok(count)
@@ -690,40 +541,20 @@ impl KvEngine {
     /// of record ordering.
     pub fn append(&self, key: Vec<u8>, suffix: Vec<u8>) -> Result<usize, FerrumError> {
         validate_key(&key)?;
-
-        let mut store = self.store.write()?;
-        let now = Instant::now();
-        let (new_value, existing_deadline) = match store.get(key.as_slice()) {
-            Some(entry) if entry.is_expired(now) => {
-                self.track_remove(&mut store, key.as_slice());
-                self.log_expire_drop(&key);
-                (suffix, None)
-            }
-            Some(entry) => {
-                let mut buf = Vec::with_capacity(entry.data.len() + suffix.len());
-                buf.extend_from_slice(&entry.data);
+        let mut g = WriteGuard::begin(self)?;
+        let (new_value, existing_deadline) = match g.read_state(&key) {
+            Some((data, ttl)) => {
+                let mut buf = Vec::with_capacity(data.len() + suffix.len());
+                buf.extend_from_slice(&data);
                 buf.extend_from_slice(&suffix);
-                (buf, entry.expire_at)
+                (buf, ttl)
             }
             None => (suffix, None),
         };
         validate_value(&new_value)?;
 
-        self.enforce_for_write(&mut store, &key, new_value.len())?;
-        if let Some(aof) = &self.aof {
-            log_aof_result("APPEND", aof.append_set(&key, &new_value));
-            if let Some(deadline) = existing_deadline
-                && let Some(abs_ms) = deadline_to_epoch_ms(deadline, now)
-            {
-                log_aof_result("PEXPIREAT", aof.append_pexpireat(&key, abs_ms));
-            }
-        }
         let new_len = new_value.len();
-        self.track_insert(
-            &mut store,
-            key,
-            ValueEntry::new_with(new_value, existing_deadline),
-        );
+        g.insert_keep_ttl(key, new_value, existing_deadline)?;
         Ok(new_len)
     }
 
@@ -744,12 +575,8 @@ impl KvEngine {
 
     /// Removes all keys from the store.
     pub fn flushdb(&self) -> Result<(), FerrumError> {
-        let mut store = self.store.write()?;
-        self.track_clear(&mut store);
-        if let Some(aof) = &self.aof {
-            log_aof_result("FLUSHDB", aof.append_flushdb());
-        }
-        Ok(())
+        let mut g = WriteGuard::begin(self)?;
+        g.clear()
     }
 
     /// Installs an absolute expiration time on `key`, measured in Unix
@@ -763,39 +590,8 @@ impl KvEngine {
     /// be removed immediately and an accompanying `DEL` to be logged,
     /// keeping the AOF idempotent across replays.
     pub fn expire_at_ms(&self, key: &[u8], abs_epoch_ms: i64) -> Result<bool, FerrumError> {
-        let mut store = self.store.write()?;
-        let now_instant = Instant::now();
-        let now_ms = current_epoch_ms();
-
-        // Drop the entry if it is already expired under its current TTL.
-        if let Some(entry) = store.get(key)
-            && entry.is_expired(now_instant)
-        {
-            self.track_remove(&mut store, key);
-            self.log_expire_drop(key);
-        }
-
-        if !store.contains_key(key) {
-            return Ok(false);
-        }
-
-        if abs_epoch_ms <= now_ms {
-            self.track_remove(&mut store, key);
-            if let Some(aof) = &self.aof {
-                log_aof_result("DEL", aof.append_del(key));
-            }
-            return Ok(true);
-        }
-
-        let delta_ms = (abs_epoch_ms - now_ms) as u64;
-        let deadline = now_instant + Duration::from_millis(delta_ms);
-        if let Some(entry) = store.get_mut(key) {
-            entry.expire_at = Some(deadline);
-        }
-        if let Some(aof) = &self.aof {
-            log_aof_result("PEXPIREAT", aof.append_pexpireat(key, abs_epoch_ms));
-        }
-        Ok(true)
+        let mut g = WriteGuard::begin(self)?;
+        g.expire_at(key, abs_epoch_ms)
     }
 
     /// Removes any TTL from `key`.
@@ -803,28 +599,8 @@ impl KvEngine {
     /// Returns `true` only when the key existed **and** had a TTL before
     /// the call — matching Redis' `PERSIST` return semantics.
     pub fn persist(&self, key: &[u8]) -> Result<bool, FerrumError> {
-        let mut store = self.store.write()?;
-        let now = Instant::now();
-
-        if let Some(entry) = store.get(key)
-            && entry.is_expired(now)
-        {
-            self.track_remove(&mut store, key);
-            self.log_expire_drop(key);
-            return Ok(false);
-        }
-
-        let Some(entry) = store.get_mut(key) else {
-            return Ok(false);
-        };
-        if entry.expire_at.is_none() {
-            return Ok(false);
-        }
-        entry.expire_at = None;
-        if let Some(aof) = &self.aof {
-            log_aof_result("PERSIST", aof.append_persist(key));
-        }
-        Ok(true)
+        let mut g = WriteGuard::begin(self)?;
+        g.persist(key)
     }
 
     /// Returns the remaining TTL for `key` in milliseconds.
@@ -833,23 +609,8 @@ impl KvEngine {
     /// * `Ok(TtlStatus::NoExpire)` — key exists without a TTL (Redis `-1`).
     /// * `Ok(TtlStatus::Millis(n))` — `n` milliseconds remaining.
     pub fn ttl_ms(&self, key: &[u8]) -> Result<TtlStatus, FerrumError> {
-        let mut store = self.store.write()?;
-        let now = Instant::now();
-        match store.get(key) {
-            None => Ok(TtlStatus::Missing),
-            Some(entry) if entry.is_expired(now) => {
-                self.track_remove(&mut store, key);
-                self.log_expire_drop(key);
-                Ok(TtlStatus::Missing)
-            }
-            Some(entry) => match entry.expire_at {
-                None => Ok(TtlStatus::NoExpire),
-                Some(deadline) => {
-                    let remaining = deadline.saturating_duration_since(now);
-                    Ok(TtlStatus::Millis(remaining.as_millis() as i64))
-                }
-            },
-        }
+        let mut g = WriteGuard::begin(self)?;
+        Ok(g.ttl_of(key))
     }
 
     /// Proactively removes up to `sample` expired entries.
@@ -899,7 +660,7 @@ impl KvEngine {
     ///
     /// Kept separate from `del()` so call sites stay terse; callers must
     /// already hold the write lock.
-    fn log_expire_drop(&self, key: &[u8]) {
+    pub(crate) fn log_expire_drop(&self, key: &[u8]) {
         if let Some(aof) = &self.aof {
             log_aof_result("DEL", aof.append_del(key));
         }
@@ -923,28 +684,14 @@ impl KvEngine {
     /// single-entry contribution that `used_memory()` would shed if the
     /// key were removed.
     pub fn memory_usage(&self, key: &[u8]) -> Result<Option<u64>, FerrumError> {
-        let mut store = self.store.write()?;
-        let now = Instant::now();
-        match store.get(key) {
-            Some(entry) if entry.is_expired(now) => {
-                // Surface the expiration through the normal lazy path so
-                // both MEMORY USAGE and GET agree on the key being gone.
-                let removed = store.remove(key);
-                if let Some(entry) = removed {
-                    self.untrack(key, &entry);
-                }
-                self.log_expire_drop(key);
-                Ok(None)
-            }
-            Some(entry) => Ok(Some(util::entry_bytes(key, entry))),
-            None => Ok(None),
-        }
+        let mut g = WriteGuard::begin(self)?;
+        g.memory_of(key)
     }
 
     /// Inserts `entry` into `store` and updates the memory counter,
     /// returning the old entry (if any) so callers can reason about
     /// overwrite semantics.
-    fn track_insert(
+    pub(crate) fn track_insert(
         &self,
         store: &mut HashMap<Vec<u8>, ValueEntry>,
         key: Vec<u8>,
@@ -1065,7 +812,7 @@ impl KvEngine {
     /// Used by read paths to give the LRU policy some accuracy without
     /// forcing the caller to touch `ValueEntry` internals. Also advances
     /// the Morris LFU counter probabilistically.
-    fn touch_access(&self, store: &mut HashMap<Vec<u8>, ValueEntry>, key: &[u8]) {
+    pub(crate) fn touch_access(&self, store: &mut HashMap<Vec<u8>, ValueEntry>, key: &[u8]) {
         if let Some(entry) = store.get_mut(key) {
             let r = self.next_rand01();
             entry.touch(r);
@@ -1104,7 +851,7 @@ impl KvEngine {
     /// Convenience wrapper: computes the net byte increase that writing
     /// `(key, value_len)` would introduce and forwards it to
     /// [`Self::enforce_memory_limit`].
-    fn enforce_for_write(
+    pub(crate) fn enforce_for_write(
         &self,
         store: &mut HashMap<Vec<u8>, ValueEntry>,
         key: &[u8],
@@ -1226,7 +973,7 @@ impl KvEngine {
 
     /// Removes `key` from `store`, updates the memory counter, and
     /// returns the evicted entry. A no-op when the key is absent.
-    fn track_remove(
+    pub(crate) fn track_remove(
         &self,
         store: &mut HashMap<Vec<u8>, ValueEntry>,
         key: &[u8],
@@ -1241,7 +988,7 @@ impl KvEngine {
     }
 
     /// Clears every entry, resetting the memory counter to zero.
-    fn track_clear(&self, store: &mut HashMap<Vec<u8>, ValueEntry>) {
+    pub(crate) fn track_clear(&self, store: &mut HashMap<Vec<u8>, ValueEntry>) {
         store.clear();
         self.sieve_notify_clear();
         self.ac_notify_clear();
@@ -1250,7 +997,7 @@ impl KvEngine {
 
     /// Untracks an entry that was already removed by some other path
     /// (e.g. a caller that held onto the returned `Option<ValueEntry>`).
-    fn untrack(&self, key: &[u8], entry: &ValueEntry) {
+    pub(crate) fn untrack(&self, key: &[u8], entry: &ValueEntry) {
         self.apply_delta(-(util::entry_bytes(key, entry) as i64));
     }
 
