@@ -306,7 +306,7 @@ pub fn execute_command(
     };
     // SLOWLOG is a meta/observability command; it must not pollute its
     // own ring (a RESET would otherwise re-log itself and never clear).
-    let is_slowlog_meta = matches!(cmd, Command::SlowLog { .. });
+    let is_slowlog_meta = matches!(cmd, Command::SlowLog { .. } | Command::RewriteAof);
     let start = Instant::now();
     match cmd {
         Command::Set { key, value } => match engine.set(key, value) {
@@ -458,6 +458,10 @@ pub fn execute_command(
             // to keep the command match exhaustive.
             encoder::encode_error(out, "ERR internal: AUTH handled by connection layer");
         }
+        Command::RewriteAof => match engine.rewrite_aof() {
+            Ok(()) => encoder::encode_simple_string(out, "OK"),
+            Err(e) => write_ferrum_error(out, &e),
+        },
     }
     // Slow-log: record the command only if it crossed the threshold. The
     // snapshot is `None` (and no clock was read) when logging is disabled.

@@ -71,6 +71,10 @@ pub enum Command {
     /// `sub` is the verb (`GET`/`LEN`/`RESET`, upper-cased at parse
     /// time) and `args` holds the optional `count` for `GET`.
     SlowLog { sub: Vec<u8>, args: Vec<Vec<u8>> },
+    /// `BGREWRITEAOF` — rewrite the AOF in a background thread, returning
+    /// `+OK` immediately. Only meaningful when AOF persistence is enabled;
+    /// takes no arguments.
+    RewriteAof,
 }
 
 impl Command {
@@ -166,6 +170,7 @@ impl Command {
                 v.extend(args.iter().cloned());
                 v
             }
+            Command::RewriteAof => vec![b"BGREWRITEAOF".to_vec()],
         }
     }
 }
@@ -669,6 +674,12 @@ fn build_command(parts: Vec<Vec<u8>>) -> Result<Command, FerrumError> {
                     String::from_utf8_lossy(&sub)
                 ))),
             }
+        }
+        b"BGREWRITEAOF" => {
+            if !args.is_empty() {
+                return Err(FerrumError::WrongArity { cmd: "BGREWRITEAOF" });
+            }
+            Ok(Command::RewriteAof)
         }
         _ => Err(FerrumError::UnknownCommand(
             String::from_utf8_lossy(&name).into_owned(),

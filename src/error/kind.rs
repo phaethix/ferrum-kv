@@ -31,6 +31,9 @@ pub enum FerrumError {
 
     /// Reports AOF write, fsync, or replay failures.
     PersistenceError(String),
+    /// Reports that an AOF-dependent command was issued while AOF persistence
+    /// is not enabled on the engine.
+    AofNotEnabled,
 }
 
 impl fmt::Display for FerrumError {
@@ -54,6 +57,9 @@ impl fmt::Display for FerrumError {
                 write!(f, "command not allowed when used memory > maxmemory")
             }
             FerrumError::PersistenceError(msg) => write!(f, "persistence error: {msg}"),
+            FerrumError::AofNotEnabled => {
+                write!(f, "BGREWRITEAOF cannot be issued when AOF is not enabled")
+            }
         }
     }
 }

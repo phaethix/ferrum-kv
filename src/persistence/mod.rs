@@ -7,7 +7,7 @@
 
 pub mod config;
 pub mod replay;
-mod resp;
+pub(crate) mod resp;
 mod writer;
 
 pub use replay::{ReplayStats, replay};
