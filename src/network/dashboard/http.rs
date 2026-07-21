@@ -297,7 +297,7 @@ fn run_command(engine: &KvEngine, body: &[u8]) -> Response {
     };
 
     let mut out = Vec::new();
-    execute_command(parsed, engine, &mut out);
+    execute_command(parsed, engine, None, &mut out);
     let response = decode_resp(&out);
     Response::ok_json(format!(
         "{{\"ok\":true,\"response\":{}}}",

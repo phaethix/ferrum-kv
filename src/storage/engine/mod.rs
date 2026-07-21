@@ -31,10 +31,11 @@ mod tests;
 pub use types::{SweepStats, TtlStatus};
 pub(crate) use util::current_epoch_ms;
 
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::collections::{HashMap, VecDeque};
+use std::net::SocketAddr;
+use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::error::FerrumError;
 use crate::persistence::AofWriter;
@@ -142,6 +143,43 @@ pub struct KvEngine {
     /// sampling purposes and keeps the engine free of `rand` as a
     /// runtime dependency.
     pub(crate) rng: Arc<AtomicU32>,
+    /// Slow-log tuning: a command is recorded only when its execution time
+    /// (microseconds) strictly exceeds `slowlog_slower_than_us`.
+    ///
+    /// `-1` means "log everything"; `0` disables logging. Held as a
+    /// `Lock`-free atomic so the per-command hot path can read it without
+    /// touching any engine lock. Default 10_000µs (10ms), matching
+    /// Redis' `slowlog-log-slower-than`.
+    pub(crate) slowlog_slower_than_us: Arc<AtomicI64>,
+    /// Maximum number of entries retained in the slow-log ring. When the
+    /// ring overflows, the oldest entry is dropped. Default 128, matching
+    /// Redis' `slowlog-max-len`. Lock-free atomic for the same reason as
+    /// the threshold above.
+    pub(crate) slowlog_max_len: Arc<AtomicU64>,
+    /// The global slow-log ring. Guarded by a `Mutex` because entries are
+    /// appended from many concurrent connection tasks; a `Mutex` is ample
+    /// since only genuinely-slow commands ever touch it.
+    pub(crate) slowlog: Arc<Mutex<VecDeque<SlowLogEntry>>>,
+    /// Monotonic source for slow-log entry ids, so every recorded command
+    /// gets a stable, ever-increasing identifier regardless of which
+    /// connection logged it.
+    pub(crate) slowlog_seq: Arc<AtomicU64>,
+}
+
+/// One recorded slow command.
+///
+/// Mirrors Redis' slow-log entry shape: a monotonic `id`, the execution
+/// `duration_us`, the reconstructed `args` (so operators see exactly what
+/// was sent), the client `peer` address, and the server `ts_secs`. The
+/// client name is intentionally omitted — FerrumKV has no `CLIENT
+/// SETNAME` yet (YAGNI for v0.5).
+#[derive(Clone)]
+pub(crate) struct SlowLogEntry {
+    pub(crate) id: u64,
+    pub(crate) ts_secs: u64,
+    pub(crate) duration_us: u64,
+    pub(crate) args: Vec<Vec<u8>>,
+    pub(crate) peer: SocketAddr,
 }
 
 impl Default for KvEngine {
@@ -170,6 +208,11 @@ impl KvEngine {
             // in the same second don't share a sequence. The seed is
             // never exposed, so predictability is not a concern.
             rng: Arc::new(AtomicU32::new(rng_seed())),
+            // Slow-log defaults mirror Redis: 10ms threshold, 128-entry cap.
+            slowlog_slower_than_us: Arc::new(AtomicI64::new(10_000)),
+            slowlog_max_len: Arc::new(AtomicU64::new(128)),
+            slowlog: Arc::new(Mutex::new(VecDeque::new())),
+            slowlog_seq: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -242,6 +285,105 @@ impl KvEngine {
     /// Returns a copy of the current `requirepass` password, if any.
     pub fn requirepass(&self) -> Result<Option<Vec<u8>>, FerrumError> {
         Ok(self.auth_password.read()?.clone())
+    }
+
+    // === Slow-log (F-03) ====================================================
+    //
+    // A bounded, global ring of the server's slowest commands. The tunables
+    // (`slowlog_slower_than_us`, `slowlog_max_len`) are lock-free atomics so
+    // the per-command hot path reads them without touching any engine lock.
+
+    /// True when the slow-log can record anything: logging is forced on with
+    /// a negative threshold, or a positive threshold is configured. A `0`
+    /// threshold means disabled, and the caller skips the `args()` snapshot
+    /// entirely so the disabled hot path stays allocation-free.
+    pub(crate) fn slowlog_active(&self) -> bool {
+        self.slowlog_slower_than_us.load(Ordering::Relaxed) != 0
+    }
+
+    /// Records `command_args` as a slow entry when its `duration_us` crosses
+    /// the configured threshold. A no-op (and no lock taken) when logging is
+    /// disabled, or when the command is fast enough.
+    pub(crate) fn maybe_push_slowlog(
+        &self,
+        command_args: Vec<Vec<u8>>,
+        peer: Option<SocketAddr>,
+        duration_us: u64,
+    ) {
+        let threshold = self.slowlog_slower_than_us.load(Ordering::Relaxed);
+        // `0` disables logging; `> 0` requires *strictly* exceeding the
+        // threshold (matching Redis); `< 0` logs everything.
+        let log_it = match threshold {
+            0 => false,
+            n if n < 0 => true,
+            n => duration_us > n as u64,
+        };
+        if !log_it {
+            return;
+        }
+        let id = self.slowlog_seq.fetch_add(1, Ordering::Relaxed) + 1;
+        let ts_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let entry = SlowLogEntry {
+            id,
+            ts_secs,
+            duration_us,
+            args: command_args,
+            peer: peer.unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0))),
+        };
+        let max_len = self.slowlog_max_len.load(Ordering::Relaxed) as usize;
+        let mut ring = match self.slowlog.lock() {
+            Ok(g) => g,
+            // Poisoned: drop this sample rather than panic the connection.
+            Err(_) => return,
+        };
+        ring.push_back(entry);
+        // Trim from the front (oldest) down to the cap.
+        while ring.len() > max_len.max(1) {
+            ring.pop_front();
+        }
+    }
+
+    /// Returns up to `count` slow-log entries, newest-first. `None` returns
+    /// the whole ring (which the encoder will serialise in the same order).
+    pub(crate) fn slowlog_get(&self, count: Option<usize>) -> Vec<SlowLogEntry> {
+        let ring = match self.slowlog.lock() {
+            Ok(g) => g,
+            Err(_) => return Vec::new(),
+        };
+        let mut entries: Vec<SlowLogEntry> = ring.iter().rev().cloned().collect();
+        if let Some(n) = count {
+            entries.truncate(n);
+        }
+        entries
+    }
+
+    /// Number of entries currently retained in the slow-log ring.
+    pub(crate) fn slowlog_len(&self) -> usize {
+        self.slowlog.lock().map(|g| g.len()).unwrap_or(0)
+    }
+
+    /// Clears the slow-log ring.
+    pub(crate) fn slowlog_reset(&self) {
+        if let Ok(mut g) = self.slowlog.lock() {
+            g.clear();
+        }
+    }
+
+    /// Slow-log tunables surfaced to `CONFIG GET/SET`.
+    pub(crate) fn slowlog_threshold_us(&self) -> i64 {
+        self.slowlog_slower_than_us.load(Ordering::Relaxed)
+    }
+    pub(crate) fn slowlog_max_len(&self) -> u64 {
+        self.slowlog_max_len.load(Ordering::Relaxed)
+    }
+    pub(crate) fn set_slowlog_threshold_us(&self, v: i64) {
+        self.slowlog_slower_than_us.store(v, Ordering::Relaxed);
+    }
+    pub(crate) fn set_slowlog_max_len(&self, v: u64) {
+        self.slowlog_max_len.store(v, Ordering::Relaxed);
     }
 
     /// Verifies an `AUTH` attempt against the configured password.
@@ -1090,5 +1232,131 @@ impl KvEngine {
         if let Ok(mut g) = self.ahe.lock() {
             g.observe(hits, misses);
         }
+    }
+}
+
+#[cfg(test)]
+mod slowlog_tests {
+    use super::*;
+    use std::net::SocketAddr;
+
+    /// A deterministic `SocketAddr` for tests (loopback:6391).
+    fn peer() -> SocketAddr {
+        SocketAddr::from(([127, 0, 0, 1], 6391))
+    }
+
+    /// Builds a `SET k v` arg vector as the slow-log records it.
+    fn set_args() -> Vec<Vec<u8>> {
+        vec![b"SET".to_vec(), b"k".to_vec(), b"v".to_vec()]
+    }
+
+    #[test]
+    fn disabled_threshold_logs_nothing() {
+        let e = KvEngine::new();
+        e.set_slowlog_threshold_us(0);
+        e.maybe_push_slowlog(set_args(), Some(peer()), 1_000_000);
+        assert_eq!(e.slowlog_len(), 0);
+    }
+
+    #[test]
+    fn equal_to_threshold_is_not_logged() {
+        let e = KvEngine::new();
+        e.set_slowlog_threshold_us(10_000);
+        e.maybe_push_slowlog(set_args(), Some(peer()), 10_000);
+        assert_eq!(e.slowlog_len(), 0, "exactly-at-threshold must not log");
+    }
+
+    #[test]
+    fn strictly_exceeding_threshold_is_logged() {
+        let e = KvEngine::new();
+        e.set_slowlog_threshold_us(10_000);
+        e.maybe_push_slowlog(set_args(), Some(peer()), 10_001);
+        assert_eq!(e.slowlog_len(), 1);
+    }
+
+    #[test]
+    fn negative_threshold_logs_everything() {
+        let e = KvEngine::new();
+        e.set_slowlog_threshold_us(-1);
+        // duration 0 is still logged when threshold is forced on.
+        e.maybe_push_slowlog(set_args(), None, 0);
+        assert_eq!(e.slowlog_len(), 1);
+    }
+
+    #[test]
+    fn ids_are_monotonic_and_newest_first() {
+        let e = KvEngine::new();
+        e.set_slowlog_threshold_us(-1);
+        for _ in 0..3 {
+            e.maybe_push_slowlog(set_args(), Some(peer()), 0);
+        }
+        let entries = e.slowlog_get(None);
+        assert_eq!(entries.len(), 3);
+        // Newest-first: the last push (id 3) comes first.
+        assert_eq!(entries[0].id, 3);
+        assert_eq!(entries[1].id, 2);
+        assert_eq!(entries[2].id, 1);
+    }
+
+    #[test]
+    fn ring_trims_to_max_len_dropping_oldest() {
+        let e = KvEngine::new();
+        e.set_slowlog_threshold_us(-1);
+        e.set_slowlog_max_len(2);
+        for _ in 0..5 {
+            e.maybe_push_slowlog(set_args(), Some(peer()), 0);
+        }
+        assert_eq!(e.slowlog_len(), 2, "ring must cap at max_len");
+        // Newest-first: surviving ids are the last two pushes (4, 5).
+        let entries = e.slowlog_get(None);
+        assert_eq!(entries[0].id, 5);
+        assert_eq!(entries[1].id, 4);
+    }
+
+    #[test]
+    fn get_returns_newest_first_and_respects_count() {
+        let e = KvEngine::new();
+        e.set_slowlog_threshold_us(-1);
+        for _ in 0..3 {
+            e.maybe_push_slowlog(set_args(), Some(peer()), 0);
+        }
+        let all = e.slowlog_get(None);
+        assert_eq!(all.len(), 3);
+        assert_eq!(all[0].id, 3);
+        assert_eq!(all[2].id, 1);
+        let limited = e.slowlog_get(Some(2));
+        assert_eq!(limited.len(), 2);
+        assert_eq!(limited[0].id, 3);
+    }
+
+    #[test]
+    fn reset_clears_ring() {
+        let e = KvEngine::new();
+        e.set_slowlog_threshold_us(-1);
+        e.maybe_push_slowlog(set_args(), Some(peer()), 0);
+        assert_eq!(e.slowlog_len(), 1);
+        e.slowlog_reset();
+        assert_eq!(e.slowlog_len(), 0);
+    }
+
+    #[test]
+    fn recorded_entry_captures_args_and_peer() {
+        let e = KvEngine::new();
+        e.set_slowlog_threshold_us(-1);
+        e.maybe_push_slowlog(set_args(), Some(peer()), 42);
+        let entries = e.slowlog_get(None);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].args, set_args());
+        assert_eq!(entries[0].duration_us, 42);
+        assert_eq!(entries[0].peer, peer());
+    }
+
+    #[test]
+    fn missing_peer_falls_back_to_unspecified() {
+        let e = KvEngine::new();
+        e.set_slowlog_threshold_us(-1);
+        e.maybe_push_slowlog(set_args(), None, 1);
+        let entries = e.slowlog_get(None);
+        assert_eq!(entries[0].peer, SocketAddr::from(([0, 0, 0, 0], 0)));
     }
 }
