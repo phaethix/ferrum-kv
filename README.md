@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/phaethix/ferrum-kv/releases"><img src="https://img.shields.io/badge/release-v0.5.1-blue" alt="Release" /></a>
+  <a href="https://github.com/phaethix/ferrum-kv/releases"><img src="https://img.shields.io/badge/release-v0.5.2-blue" alt="Release" /></a>
   <a href="./LICENSE"><img src="https://img.shields.io/badge/license-MIT-green" alt="License" /></a>
   <a href="https://github.com/phaethix/ferrum-kv/actions/workflows/ci.yml"><img src="https://github.com/phaethix/ferrum-kv/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
   <img src="https://img.shields.io/badge/rust-1.85%2B-orange" alt="Rust 1.85+" />
@@ -266,7 +266,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for conventions and review process.
 | Version | Focus |
 |---------|-------|
 | v0.5.1 | CONFIG SET/GET (F-01), AUTH requirepass (F-02); SIEVE (NSDI'24), SIEVE-S, AdaptiveClimb (arXiv:2511.21235), AHE TTL-aware eviction, benchmark suite |
-| v0.5.2 | SLOWLOG (F-03), AOF REWRITE (F-04), MONITOR (F-05), INFO expansion (F-06) |
+| v0.5.2 | SLOWLOG (F-03), AOF REWRITE / BGREWRITEAOF (F-04) |
 | v0.6 | RESP3 protocol, typed replies, client-side caching |
 | v0.7 | List, Hash, Set data types |
 

@@ -16,7 +16,7 @@
 - **Language**: Rust, edition 2024
 - **Type**: From-scratch RESP2-compatible KV storage server (Redis wire protocol)
 - **Runtime**: Tokio async, `signal-hook`, `indexmap`, zero heavy deps
-- **Versions**: `Cargo.toml` = 0.5.1, README badge = v0.5.1
+- **Versions**: `Cargo.toml` = 0.5.2, README badge = v0.5.2
 
 ## Architecture Quick Reference
 

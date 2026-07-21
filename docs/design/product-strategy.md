@@ -122,7 +122,7 @@ AHE's differentiation from AdaptiveClimb is **real by construction**: **AHE inco
 | ✅ F-01 | CONFIG SET/GET | 3 days | Runtime config. Blocks all operational maturity. **(done v0.5.1)** |
 | ✅ F-02 | AUTH requirepass | 1 day | Security baseline. `AUTH` + `requirepass` via CLI flag, config file, and runtime `CONFIG SET`. **(done v0.5.1)** |
 | F-03 | SLOWLOG | 2 days | Latency observability. |
-| F-04 | AOF REWRITE | 5 days | AOF compaction. Critical for any non-toy AOF user. |
+| ✅ F-04 | AOF REWRITE | 5 days | AOF compaction. Critical for any non-toy AOF user. **(done v0.5.2)** |
 | F-05 | MONITOR command | 1 day | Debugging tool. |
 | F-06 | INFO fields expansion | 1 day | `instantaneous_ops_per_sec`, `evicted_keys`, `expired_keys`, `total_commands_processed`. |
 | F-07 | WriteGuard pipeline refactor | 3 days | Eliminate write-path boilerplate. Foundation for clean eviction integration. |
