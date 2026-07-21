@@ -1,7 +1,7 @@
-use std::net::TcpListener as StdTcpListener;
+use std::net::{SocketAddr, TcpListener as StdTcpListener};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use log::{debug, error, info, warn};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -13,7 +13,7 @@ use crate::error::FerrumError;
 use crate::network::shutdown::Shutdown;
 use crate::protocol::encoder;
 use crate::protocol::parser::{self, Command, FrameParse};
-use crate::storage::engine::{KvEngine, TtlStatus, current_epoch_ms};
+use crate::storage::engine::{KvEngine, SlowLogEntry, TtlStatus, current_epoch_ms};
 use crate::storage::eviction::EvictionPolicy;
 
 /// Initial capacity of each per-connection read buffer.
@@ -200,7 +200,7 @@ async fn handle_client(
                     } else if requires_auth && !authed {
                         encoder::encode_error(&mut outbuf, "NOAUTH Authentication required.");
                     } else {
-                        execute_command(command, &engine, &mut outbuf);
+                        execute_command(command, &engine, Some(peer), &mut outbuf);
                     }
                     if let Err(e) = stream.write_all(&outbuf).await {
                         error!("write failed for {peer}: {e}");
@@ -289,7 +289,25 @@ async fn read_with_optional_timeout(
 /// - `PING` (no arg)                          → `+PONG`
 /// - `PING msg`                               → bulk string echoing `msg`
 /// - engine/persistence failures              → `-ERR` / `-OOM`
-pub fn execute_command(cmd: Command, engine: &KvEngine, out: &mut Vec<u8>) {
+pub fn execute_command(
+    cmd: Command,
+    engine: &KvEngine,
+    client: Option<SocketAddr>,
+    out: &mut Vec<u8>,
+) {
+    // Snapshot the command's RESP args *before* the consuming `match` (NLL
+    // lets a borrow precede the move), and time the whole dispatch. The
+    // snapshot is taken only when the slow-log is active, so a disabled log
+    // leaves the hot path allocation-free.
+    let slow_args = if engine.slowlog_active() {
+        Some(cmd.args())
+    } else {
+        None
+    };
+    // SLOWLOG is a meta/observability command; it must not pollute its
+    // own ring (a RESET would otherwise re-log itself and never clear).
+    let is_slowlog_meta = matches!(cmd, Command::SlowLog { .. });
+    let start = Instant::now();
     match cmd {
         Command::Set { key, value } => match engine.set(key, value) {
             Ok(_) => encoder::encode_simple_string(out, "OK"),
@@ -402,12 +420,76 @@ pub fn execute_command(cmd: Command, engine: &KvEngine, out: &mut Vec<u8>) {
                 encoder::encode_error(out, "ERR unknown config subcommand");
             }
         }
+        Command::SlowLog { sub, args } => {
+            if sub.eq_ignore_ascii_case(b"GET") {
+                // Optional `count` argument; parse it exactly like INCRBY's
+                // delta so a non-integer yields the Redis-standard error.
+                let count = if args.is_empty() {
+                    None
+                } else {
+                    match std::str::from_utf8(&args[0])
+                        .ok()
+                        .and_then(|s| s.trim().parse::<usize>().ok())
+                    {
+                        Some(n) => Some(n),
+                        None => {
+                            encoder::encode_error(
+                                out,
+                                "ERR value is not an integer or out of range",
+                            );
+                            return;
+                        }
+                    }
+                };
+                let entries = engine.slowlog_get(count);
+                encode_slowlog_entries(out, &entries);
+            } else if sub.eq_ignore_ascii_case(b"LEN") {
+                encoder::encode_integer(out, engine.slowlog_len() as i64);
+            } else if sub.eq_ignore_ascii_case(b"RESET") {
+                engine.slowlog_reset();
+                encoder::encode_simple_string(out, "OK");
+            } else {
+                encoder::encode_error(out, "ERR unknown slowlog subcommand");
+            }
+        }
         Command::Auth { .. } => {
             // Handled in `handle_client` so it can maintain the
             // per-connection `authenticated` flag; this arm exists only
             // to keep the command match exhaustive.
             encoder::encode_error(out, "ERR internal: AUTH handled by connection layer");
         }
+    }
+    // Slow-log: record the command only if it crossed the threshold. The
+    // snapshot is `None` (and no clock was read) when logging is disabled.
+    // SLOWLOG never observes itself.
+    if let Some(args) = slow_args
+        && !is_slowlog_meta
+    {
+        let elapsed_us = start.elapsed().as_micros() as u64;
+        engine.maybe_push_slowlog(args, client, elapsed_us);
+    }
+}
+
+/// Serialises a list of slow-log entries (already newest-first) into the
+/// RESP2 reply for `SLOWLOG GET`.
+///
+/// Each entry is a 6-element array: `(id, ts_secs, duration_us, args[],
+/// client_addr, client_name)`. The `args` sub-array mirrors the wire frame;
+/// `client_name` is an empty bulk because FerrumKV has no `CLIENT
+/// SETNAME` yet (YAGNI for v0.5).
+fn encode_slowlog_entries(out: &mut Vec<u8>, entries: &[SlowLogEntry]) {
+    encoder::encode_array_header(out, entries.len());
+    for e in entries {
+        encoder::encode_array_header(out, 6);
+        encoder::encode_integer(out, e.id as i64);
+        encoder::encode_integer(out, e.ts_secs as i64);
+        encoder::encode_integer(out, e.duration_us as i64);
+        encoder::encode_array_header(out, e.args.len());
+        for arg in &e.args {
+            encoder::encode_bulk_string(out, arg);
+        }
+        encoder::encode_bulk_string(out, e.peer.to_string().as_bytes());
+        encoder::encode_bulk_string(out, b"");
     }
 }
 
@@ -492,6 +574,14 @@ fn config_get(engine: &KvEngine, pattern: &[u8], out: &mut Vec<u8>) {
         ("maxmemory-policy", cfg.policy.name().as_bytes().to_vec()),
         ("maxmemory-samples", cfg.samples.to_string().into_bytes()),
         ("requirepass", requirepass),
+        (
+            "slowlog-log-slower-than",
+            engine.slowlog_threshold_us().to_string().into_bytes(),
+        ),
+        (
+            "slowlog-max-len",
+            engine.slowlog_max_len().to_string().into_bytes(),
+        ),
     ];
     if pattern.eq_ignore_ascii_case(b"*") {
         encoder::encode_array_header(out, pairs.len() * 2);
@@ -583,6 +673,39 @@ fn config_set(engine: &KvEngine, param: &[u8], value: &[u8], out: &mut Vec<u8>) 
                 );
             }
         },
+        // Slow-log tunables live on their own atomics, not `cfg`, so they
+        // get their own early `OK` return and never fall through to the
+        // eviction path.
+        "slowlog-log-slower-than" => {
+            match value_str.trim().parse::<i64>() {
+                Ok(v) => engine.set_slowlog_threshold_us(v),
+                Err(_) => {
+                    return encoder::encode_error(
+                        out,
+                        "ERR Invalid argument for CONFIG SET 'slowlog-log-slower-than' (not an integer)",
+                    );
+                }
+            }
+            return encoder::encode_simple_string(out, "OK");
+        }
+        "slowlog-max-len" => {
+            match value_str.trim().parse::<u64>() {
+                Ok(v) if v > 0 => engine.set_slowlog_max_len(v),
+                Ok(_) => {
+                    return encoder::encode_error(
+                        out,
+                        "ERR Invalid argument for CONFIG SET 'slowlog-max-len' (must be > 0)",
+                    );
+                }
+                Err(_) => {
+                    return encoder::encode_error(
+                        out,
+                        "ERR Invalid argument for CONFIG SET 'slowlog-max-len' (not an integer)",
+                    );
+                }
+            }
+            return encoder::encode_simple_string(out, "OK");
+        }
         _ => {
             return encoder::encode_error(out, &format!("ERR Unknown parameter '{name}'"));
         }

@@ -67,6 +67,107 @@ pub enum Command {
     /// kept as raw bytes so it survives binary-safe, matching the
     /// value encoding of every other command.
     Auth { password: Vec<u8> },
+    /// `SLOWLOG GET [count] | LEN | RESET` — latency observability.
+    /// `sub` is the verb (`GET`/`LEN`/`RESET`, upper-cased at parse
+    /// time) and `args` holds the optional `count` for `GET`.
+    SlowLog { sub: Vec<u8>, args: Vec<Vec<u8>> },
+}
+
+impl Command {
+    /// Reconstructs the RESP argument vector (`*N\r\n$..\r\n..`) for this
+    /// command.
+    ///
+    /// Used by the slow-log to record what was executed without retaining
+    /// the raw parse buffer: the server snapshots `args()` (a borrow) right
+    /// before the consuming `match` in `execute_command`, then logs it only
+    /// when the command crosses the latency threshold.
+    pub(crate) fn args(&self) -> Vec<Vec<u8>> {
+        match self {
+            Command::Set { key, value } => vec![b"SET".to_vec(), key.clone(), value.clone()],
+            Command::SetNx { key, value } => vec![b"SETNX".to_vec(), key.clone(), value.clone()],
+            Command::MSet { pairs } => {
+                let mut v = vec![b"MSET".to_vec()];
+                for (k, val) in pairs {
+                    v.push(k.clone());
+                    v.push(val.clone());
+                }
+                v
+            }
+            Command::MGet { keys } => {
+                let mut v = vec![b"MGET".to_vec()];
+                v.extend(keys.iter().cloned());
+                v
+            }
+            Command::IncrBy { key, delta } => {
+                vec![
+                    b"INCRBY".to_vec(),
+                    key.clone(),
+                    delta.to_string().into_bytes(),
+                ]
+            }
+            Command::Get { key } => vec![b"GET".to_vec(), key.clone()],
+            Command::Del { keys } => {
+                let mut v = vec![b"DEL".to_vec()];
+                v.extend(keys.iter().cloned());
+                v
+            }
+            Command::Exists { keys } => {
+                let mut v = vec![b"EXISTS".to_vec()];
+                v.extend(keys.iter().cloned());
+                v
+            }
+            Command::Ping { msg } => match msg {
+                None => vec![b"PING".to_vec()],
+                Some(m) => vec![b"PING".to_vec(), m.clone()],
+            },
+            Command::Append { key, value } => vec![b"APPEND".to_vec(), key.clone(), value.clone()],
+            Command::StrLen { key } => vec![b"STRLEN".to_vec(), key.clone()],
+            Command::DbSize => vec![b"DBSIZE".to_vec()],
+            Command::FlushDb => vec![b"FLUSHDB".to_vec()],
+            Command::Expire { key, seconds } => {
+                vec![
+                    b"EXPIRE".to_vec(),
+                    key.clone(),
+                    seconds.to_string().into_bytes(),
+                ]
+            }
+            Command::PExpire { key, millis } => {
+                vec![
+                    b"PEXPIRE".to_vec(),
+                    key.clone(),
+                    millis.to_string().into_bytes(),
+                ]
+            }
+            Command::PExpireAt { key, abs_epoch_ms } => {
+                vec![
+                    b"PEXPIREAT".to_vec(),
+                    key.clone(),
+                    abs_epoch_ms.to_string().into_bytes(),
+                ]
+            }
+            Command::Persist { key } => vec![b"PERSIST".to_vec(), key.clone()],
+            Command::Ttl { key } => vec![b"TTL".to_vec(), key.clone()],
+            Command::PTtl { key } => vec![b"PTTL".to_vec(), key.clone()],
+            Command::MemoryUsage { key } => {
+                vec![b"MEMORY".to_vec(), b"USAGE".to_vec(), key.clone()]
+            }
+            Command::Info { section } => match section {
+                None => vec![b"INFO".to_vec()],
+                Some(s) => vec![b"INFO".to_vec(), s.clone()],
+            },
+            Command::Config { sub, args } => {
+                let mut v = vec![b"CONFIG".to_vec(), sub.clone()];
+                v.extend(args.iter().cloned());
+                v
+            }
+            Command::Auth { password } => vec![b"AUTH".to_vec(), password.clone()],
+            Command::SlowLog { sub, args } => {
+                let mut v = vec![b"SLOWLOG".to_vec(), sub.clone()];
+                v.extend(args.iter().cloned());
+                v
+            }
+        }
+    }
 }
 
 /// Outcome of attempting to parse a single RESP2 frame from a byte buffer.
@@ -522,6 +623,52 @@ fn build_command(parts: Vec<Vec<u8>>) -> Result<Command, FerrumError> {
             Ok(Command::Auth {
                 password: args.into_iter().next().unwrap(),
             })
+        }
+        b"SLOWLOG" => {
+            // `GET [count]` | `LEN` | `RESET`. The optional `count` is
+            // passed through verbatim; it is parsed (and range-checked) by
+            // the engine when the `GET` subcommand is executed.
+            if args.is_empty() {
+                return Err(FerrumError::WrongArity { cmd: "SLOWLOG" });
+            }
+            let mut it = args.into_iter();
+            let sub = it.next().unwrap();
+            match ascii_uppercase(&sub).as_slice() {
+                b"GET" => {
+                    let count = it.next();
+                    if it.next().is_some() {
+                        return Err(FerrumError::WrongArity { cmd: "SLOWLOG GET" });
+                    }
+                    Ok(Command::SlowLog {
+                        sub: b"GET".to_vec(),
+                        args: count.into_iter().collect(),
+                    })
+                }
+                b"LEN" => {
+                    if it.next().is_some() {
+                        return Err(FerrumError::WrongArity { cmd: "SLOWLOG LEN" });
+                    }
+                    Ok(Command::SlowLog {
+                        sub: b"LEN".to_vec(),
+                        args: vec![],
+                    })
+                }
+                b"RESET" => {
+                    if it.next().is_some() {
+                        return Err(FerrumError::WrongArity {
+                            cmd: "SLOWLOG RESET",
+                        });
+                    }
+                    Ok(Command::SlowLog {
+                        sub: b"RESET".to_vec(),
+                        args: vec![],
+                    })
+                }
+                _ => Err(FerrumError::UnknownCommand(format!(
+                    "SLOWLOG {}",
+                    String::from_utf8_lossy(&sub)
+                ))),
+            }
         }
         _ => Err(FerrumError::UnknownCommand(
             String::from_utf8_lossy(&name).into_owned(),
@@ -1167,5 +1314,122 @@ mod frame_tests {
             other => panic!("expected Invalid, got {other:?}"),
         };
         assert!(matches!(err, FerrumError::WrongArity { cmd: "AUTH" }));
+    }
+
+    #[test]
+    fn parses_slowlog_get_len_reset() {
+        assert_eq!(
+            parse_exact(b"*2\r\n$7\r\nSLOWLOG\r\n$3\r\nGET\r\n"),
+            Command::SlowLog {
+                sub: b"GET".to_vec(),
+                args: vec![],
+            }
+        );
+        assert_eq!(
+            parse_exact(b"*3\r\n$7\r\nSLOWLOG\r\n$3\r\nGET\r\n$1\r\n5\r\n"),
+            Command::SlowLog {
+                sub: b"GET".to_vec(),
+                args: vec![b"5".to_vec()],
+            }
+        );
+        assert_eq!(
+            parse_exact(b"*2\r\n$7\r\nSLOWLOG\r\n$3\r\nLEN\r\n"),
+            Command::SlowLog {
+                sub: b"LEN".to_vec(),
+                args: vec![],
+            }
+        );
+        assert_eq!(
+            parse_exact(b"*2\r\n$7\r\nSLOWLOG\r\n$5\r\nRESET\r\n"),
+            Command::SlowLog {
+                sub: b"RESET".to_vec(),
+                args: vec![],
+            }
+        );
+    }
+
+    #[test]
+    fn slowlog_get_with_extra_arg_is_wrong_arity() {
+        let err = match parse_frame(b"*4\r\n$7\r\nSLOWLOG\r\n$3\r\nGET\r\n$1\r\n5\r\n$1\r\n6\r\n")
+            .unwrap()
+        {
+            FrameParse::Invalid { error, .. } => error,
+            other => panic!("expected Invalid, got {other:?}"),
+        };
+        assert!(matches!(
+            err,
+            FerrumError::WrongArity { cmd: "SLOWLOG GET" }
+        ));
+    }
+
+    #[test]
+    fn slowlog_without_subcommand_is_wrong_arity() {
+        let err = match parse_frame(b"*1\r\n$7\r\nSLOWLOG\r\n").unwrap() {
+            FrameParse::Invalid { error, .. } => error,
+            other => panic!("expected Invalid, got {other:?}"),
+        };
+        assert!(matches!(err, FerrumError::WrongArity { cmd: "SLOWLOG" }));
+    }
+
+    #[test]
+    fn slowlog_unknown_subcommand_is_rejected() {
+        let err = match parse_frame(b"*2\r\n$7\r\nSLOWLOG\r\n$4\r\nFOOO\r\n").unwrap() {
+            FrameParse::Invalid { error, .. } => error,
+            other => panic!("expected Invalid, got {other:?}"),
+        };
+        assert!(matches!(err, FerrumError::UnknownCommand(_)));
+    }
+
+    #[test]
+    fn command_args_reconstructs_resp_vector() {
+        // SET -> ["SET", "k", "v"]
+        assert_eq!(
+            Command::Set {
+                key: b"k".to_vec(),
+                value: b"v".to_vec()
+            }
+            .args(),
+            vec![b"SET".to_vec(), b"k".to_vec(), b"v".to_vec()]
+        );
+        // MSET -> ["MSET", "a", "1", "b", "2"]
+        assert_eq!(
+            Command::MSet {
+                pairs: vec![
+                    (b"a".to_vec(), b"1".to_vec()),
+                    (b"b".to_vec(), b"2".to_vec())
+                ]
+            }
+            .args(),
+            vec![
+                b"MSET".to_vec(),
+                b"a".to_vec(),
+                b"1".to_vec(),
+                b"b".to_vec(),
+                b"2".to_vec()
+            ]
+        );
+        // INCRBY -> ["INCRBY", "k", "10"]
+        assert_eq!(
+            Command::IncrBy {
+                key: b"k".to_vec(),
+                delta: 10
+            }
+            .args(),
+            vec![b"INCRBY".to_vec(), b"k".to_vec(), b"10".to_vec()]
+        );
+        // MEMORY USAGE -> ["MEMORY", "USAGE", "k"]
+        assert_eq!(
+            Command::MemoryUsage { key: b"k".to_vec() }.args(),
+            vec![b"MEMORY".to_vec(), b"USAGE".to_vec(), b"k".to_vec()]
+        );
+        // SLOWLOG GET -> ["SLOWLOG", "GET"] (no count)
+        assert_eq!(
+            Command::SlowLog {
+                sub: b"GET".to_vec(),
+                args: vec![]
+            }
+            .args(),
+            vec![b"SLOWLOG".to_vec(), b"GET".to_vec()]
+        );
     }
 }
