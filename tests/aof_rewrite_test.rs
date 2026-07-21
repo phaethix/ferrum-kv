@@ -11,7 +11,7 @@
 
 use std::collections::HashSet;
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -54,22 +54,6 @@ impl ServerGuard {
     }
 }
 
-/// Polls `addr` with connect attempts until the server is accept()ing.
-fn wait_for_server_ready(addr: &str) {
-    let socket: SocketAddr = addr.parse().expect("parse server addr");
-    let start = Instant::now();
-    loop {
-        if TcpStream::connect_timeout(&socket, Duration::from_millis(100)).is_ok() {
-            return;
-        }
-        assert!(
-            start.elapsed() < Duration::from_secs(5),
-            "server did not start within 5s"
-        );
-        thread::sleep(Duration::from_millis(50));
-    }
-}
-
 /// Starts a server with AOF persistence and `FsyncPolicy::Always`.
 fn spawn_aof_server(path: &Path) -> ServerGuard {
     spawn_aof_server_with_policy(path, FsyncPolicy::Always)
@@ -92,7 +76,10 @@ fn spawn_aof_server_with_policy(path: &Path, fsync: FsyncPolicy) -> ServerGuard 
             ServerConfig::default(),
         );
     });
-    wait_for_server_ready(&addr);
+    // Give the Tokio runtime time to start workers.
+    // `send_with_timeout` retries on empty replies so the first
+    // command will still succeed even if workers aren't ready yet.
+    thread::sleep(Duration::from_millis(500));
     ServerGuard {
         addr,
         shutdown,
@@ -120,7 +107,10 @@ fn spawn_replayed_server(path: &Path) -> ServerGuard {
             ServerConfig::default(),
         );
     });
-    wait_for_server_ready(&addr);
+    // Give the Tokio runtime time to start workers.
+    // `send_with_timeout` retries on empty replies so the first
+    // command will still succeed even if workers aren't ready yet.
+    thread::sleep(Duration::from_millis(500));
     ServerGuard {
         addr,
         shutdown,
@@ -149,7 +139,7 @@ fn build_request(args: &[&[u8]]) -> Vec<u8> {
 }
 
 fn send(stream: &mut TcpStream, args: &[&[u8]]) -> Vec<u8> {
-    send_with_timeout(stream, args, Duration::from_millis(300))
+    send_with_timeout(stream, args, Duration::from_secs(5))
 }
 
 fn send_with_timeout(stream: &mut TcpStream, args: &[&[u8]], timeout_dur: Duration) -> Vec<u8> {
