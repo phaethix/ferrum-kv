@@ -33,6 +33,7 @@ pub(crate) use util::current_epoch_ms;
 
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -745,6 +746,31 @@ impl KvEngine {
         g.persist(key)
     }
 
+    /// Triggers a background AOF rewrite (the `BGREWRITEAOF` command).
+    ///
+    /// Returns `+OK` to the caller immediately; the heavy compaction runs on a
+    /// dedicated `ferrum-aof-rewrite` OS thread so the server never pauses. If
+    /// AOF is not enabled the caller is told so. A rewrite already in progress
+    /// is a no-op (Redis returns `+OK` and ignores the second request), which
+    /// keeps the delta-buffer invariant intact.
+    pub fn rewrite_aof(&self) -> Result<(), FerrumError> {
+        let Some(writer) = self.aof.as_ref() else {
+            return Err(FerrumError::AofNotEnabled);
+        };
+        if writer.is_rewriting() {
+            return Ok(());
+        }
+        let writer = Arc::clone(writer);
+        let engine = self.clone();
+        std::thread::Builder::new()
+            .name("ferrum-aof-rewrite".to_string())
+            .spawn(move || perform_aof_rewrite(engine, writer))
+            .map_err(|e| {
+                FerrumError::Internal(format!("failed to spawn aof rewrite thread: {e}"))
+            })?;
+        Ok(())
+    }
+
     /// Returns the remaining TTL for `key` in milliseconds.
     ///
     /// * `Ok(TtlStatus::Missing)` — key does not exist (Redis reports `-2`).
@@ -1235,6 +1261,96 @@ impl KvEngine {
     }
 }
 
+/// Background AOF rewrite worker.
+///
+/// Snapshots the live keyspace, serialises a compact final-state AOF to a temp
+/// file, then atomically swaps it in and replays any writes that landed during
+/// the rewrite (buffered in [`AofWriter`]'s delta). Runs on the dedicated
+/// `ferrum-aof-rewrite` OS thread; it never blocks the connection that issued
+/// `BGREWRITEAOF`.
+fn perform_aof_rewrite(engine: KvEngine, writer: Arc<AofWriter>) {
+    writer.begin_rewrite();
+
+    // Snapshot live entries: (key, value, optional absolute-TTL epoch ms).
+    // Holding only the read lock keeps the writer pause brief.
+    let snapshot: Vec<(Vec<u8>, Vec<u8>, Option<i64>)> = {
+        let store = match engine.store.read() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let now = Instant::now();
+        let mut out = Vec::with_capacity(store.len());
+        for (k, entry) in store.iter() {
+            if entry.is_expired(now) {
+                continue;
+            }
+            let ttl = entry
+                .expire_at
+                .and_then(|d| util::deadline_to_epoch_ms(d, now));
+            out.push((k.clone(), entry.data.clone(), ttl));
+        }
+        out
+    };
+
+    // The rewrite may have been aborted (delta overflow) while we held the
+    // read lock; the old AOF is intact, so there is nothing left to do.
+    if !writer.is_rewriting() {
+        return;
+    }
+
+    let temp = writer.rewrite_temp_path();
+    if let Err(e) = serialise_compact_aof(&temp, &snapshot) {
+        log::warn!("aof rewrite aborted: {e}");
+        let _ = std::fs::remove_file(&temp);
+        writer.abort_rewrite();
+        return;
+    }
+
+    if let Err(e) = writer.finish_rewrite(&temp) {
+        log::warn!("aof rewrite finish failed: {e}");
+        let _ = std::fs::remove_file(&temp);
+    }
+}
+
+/// Serialises the compact final-state AOF for `snapshot` into `temp`.
+///
+/// Each live key becomes exactly one `SET`, plus a `PEXPIREAT` when it carries
+/// a TTL. The bytes are identical to the wire protocol (方案 A：记最终态), so
+/// the existing `replay` loader consumes them unchanged.
+fn serialise_compact_aof(
+    temp: &Path,
+    snapshot: &[(Vec<u8>, Vec<u8>, Option<i64>)],
+) -> Result<(), FerrumError> {
+    use std::io::Write;
+
+    let mut f = std::fs::File::create(temp).map_err(|e| {
+        FerrumError::PersistenceError(format!("aof rewrite create temp failed: {e}"))
+    })?;
+    let mut buf: Vec<u8> = Vec::new();
+    for (k, v, ttl) in snapshot {
+        buf.extend_from_slice(&crate::persistence::resp::encode_command(&[
+            b"SET",
+            k.as_slice(),
+            v.as_slice(),
+        ]));
+        if let Some(abs_ms) = ttl {
+            let ts = abs_ms.to_string();
+            buf.extend_from_slice(&crate::persistence::resp::encode_command(&[
+                b"PEXPIREAT",
+                k.as_slice(),
+                ts.as_bytes(),
+            ]));
+        }
+    }
+    f.write_all(&buf).map_err(|e| {
+        FerrumError::PersistenceError(format!("aof rewrite write temp failed: {e}"))
+    })?;
+    f.sync_all().map_err(|e| {
+        FerrumError::PersistenceError(format!("aof rewrite fsync temp failed: {e}"))
+    })?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod slowlog_tests {
     use super::*;
@@ -1358,5 +1474,273 @@ mod slowlog_tests {
         e.maybe_push_slowlog(set_args(), None, 1);
         let entries = e.slowlog_get(None);
         assert_eq!(entries[0].peer, SocketAddr::from(([0, 0, 0, 0], 0)));
+    }
+}
+
+#[cfg(test)]
+mod aof_rewrite_tests {
+    use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::thread;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    use crate::persistence::AofWriter;
+    use crate::persistence::config::{AofConfig, FsyncPolicy};
+    use crate::persistence::replay;
+    use crate::storage::engine::TtlStatus;
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn tmp_path(label: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        std::env::temp_dir().join(format!("ferrum-rewrite-{label}-{nanos}-{n}.aof"))
+    }
+
+    /// Waits for an in-progress rewrite to finish.
+    ///
+    /// Callers that need to wait for the rewrite to *start* as well (to handle
+    /// the spawn/start race) should poll `is_rewriting()` before calling this.
+    /// In very fast environments the rewrite may already be done when the
+    /// caller arrives; the downstream file-content assertions serve as the
+    /// ultimate correctness check in that case.
+    fn wait_for_rewrite(writer: &AofWriter, timeout: Duration) -> bool {
+        let start = Instant::now();
+        while writer.is_rewriting() {
+            if start.elapsed() > timeout {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        true
+    }
+
+    /// Extracts every `SET` key from a compact/raw AOF byte stream.
+    fn parse_set_keys(bytes: &[u8]) -> Vec<Vec<u8>> {
+        let prefix = b"*3\r\n$3\r\nSET\r\n";
+        let mut keys = Vec::new();
+        let mut i = 0usize;
+        while i + prefix.len() <= bytes.len() {
+            if &bytes[i..i + prefix.len()] == prefix {
+                let mut j = i + prefix.len();
+                let mut num = 0usize;
+                j += 1; // skip '$'
+                while bytes[j] != b'\r' {
+                    num = num * 10 + (bytes[j] - b'0') as usize;
+                    j += 1;
+                }
+                j += 2; // skip CRLF
+                keys.push(bytes[j..j + num].to_vec());
+                i = j + num + 2;
+            } else {
+                i += 1;
+            }
+        }
+        keys
+    }
+
+    fn count_set_records(bytes: &[u8]) -> usize {
+        bytes
+            .windows(b"*3\r\n$3\r\nSET\r\n".len())
+            .filter(|w| *w == b"*3\r\n$3\r\nSET\r\n")
+            .count()
+    }
+
+    #[test]
+    fn rewrite_compacts_aof_to_one_set_per_key() {
+        let path = tmp_path("compact");
+        let cfg = AofConfig::new(path.clone(), FsyncPolicy::Always);
+        let writer = Arc::new(AofWriter::open(&cfg).unwrap());
+        let engine = KvEngine::new().with_aof(Arc::clone(&writer));
+
+        for i in 0..40u32 {
+            engine
+                .set(format!("k{i}").into_bytes(), format!("v{i}").into_bytes())
+                .unwrap();
+        }
+        // Overwrite a prefix to guarantee pre-rewrite redundancy on disk.
+        for i in 0..10u32 {
+            engine
+                .set(format!("k{i}").into_bytes(), b"new".to_vec())
+                .unwrap();
+        }
+
+        engine.rewrite_aof().unwrap();
+        // Wait for the rewrite to start and finish. In fast environments
+        // the rewrite may complete before we reach here; the file-content
+        // assertions below are the ultimate correctness check.
+        let start = Instant::now();
+        while !writer.is_rewriting() && start.elapsed() < Duration::from_secs(5) {
+            thread::sleep(Duration::from_millis(1));
+        }
+        if writer.is_rewriting() {
+            assert!(
+                wait_for_rewrite(&writer, Duration::from_secs(5)),
+                "rewrite did not finish"
+            );
+        }
+
+        let bytes = fs::read(&path).unwrap();
+        let keys = parse_set_keys(&bytes);
+        assert_eq!(
+            keys.len(),
+            40,
+            "compact AOF must contain exactly one SET per live key"
+        );
+        let distinct: std::collections::HashSet<Vec<u8>> = keys.iter().cloned().collect();
+        assert_eq!(
+            distinct.len(),
+            40,
+            "no redundant duplicate SET frames for the same key"
+        );
+
+        // Replaying the compact file must restore the full keyspace.
+        drop(engine);
+        drop(writer);
+        let restored = KvEngine::new();
+        replay(&path, &restored).unwrap();
+        for i in 0..40u32 {
+            assert_eq!(
+                restored.get(format!("k{i}").as_bytes()).unwrap(),
+                if i < 10 {
+                    Some(b"new".to_vec())
+                } else {
+                    Some(format!("v{i}").into_bytes())
+                }
+            );
+        }
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn rewrite_preserves_ttl_as_pexpireat_and_drops_expired() {
+        let path = tmp_path("ttl");
+        let cfg = AofConfig::new(path.clone(), FsyncPolicy::Always);
+        let writer = Arc::new(AofWriter::open(&cfg).unwrap());
+        let engine = KvEngine::new().with_aof(Arc::clone(&writer));
+
+        for i in 0..5u32 {
+            engine
+                .set(format!("k{i}").into_bytes(), format!("v{i}").into_bytes())
+                .unwrap();
+        }
+        // k0 gets a TTL; k1 gets a TTL that is already in the past (expired).
+        engine
+            .expire_at_ms(b"k0", current_epoch_ms() + 60_000)
+            .unwrap();
+        engine
+            .expire_at_ms(b"k1", current_epoch_ms() - 1_000)
+            .unwrap();
+
+        engine.rewrite_aof().unwrap();
+        // Wait for the rewrite to start and finish. In fast environments
+        // the rewrite may complete before we reach here; the file-content
+        // assertions below are the ultimate correctness check.
+        let start = Instant::now();
+        while !writer.is_rewriting() && start.elapsed() < Duration::from_secs(5) {
+            thread::sleep(Duration::from_millis(1));
+        }
+        if writer.is_rewriting() {
+            assert!(
+                wait_for_rewrite(&writer, Duration::from_secs(5)),
+                "rewrite did not finish"
+            );
+        }
+
+        let bytes = fs::read(&path).unwrap();
+        // One SET per live key (k1 expired and must be excluded).
+        assert_eq!(count_set_records(&bytes), 4);
+        // Exactly one PEXPIREAT, for the live TTL key k0.
+        let pexpireat = bytes
+            .windows(b"$9\r\nPEXPIREAT\r\n".len())
+            .filter(|w| *w == b"$9\r\nPEXPIREAT\r\n")
+            .count();
+        assert_eq!(pexpireat, 1, "exactly one PEXPIREAT for the live TTL key");
+
+        drop(engine);
+        drop(writer);
+        let restored = KvEngine::new();
+        replay(&path, &restored).unwrap();
+        assert!(matches!(
+            restored.ttl_ms(b"k0").unwrap(),
+            TtlStatus::Millis(_)
+        ));
+        assert_eq!(restored.get(b"k1").unwrap(), None, "expired key dropped");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn writes_during_rewrite_survive_restart() {
+        let path = tmp_path("during");
+        let cfg = AofConfig::new(path.clone(), FsyncPolicy::Always);
+        let writer = Arc::new(AofWriter::open(&cfg).unwrap());
+        let engine = KvEngine::new().with_aof(Arc::clone(&writer));
+
+        for i in 0..500u32 {
+            engine
+                .set(format!("k{i}").into_bytes(), format!("v{i}").into_bytes())
+                .unwrap();
+        }
+
+        engine.rewrite_aof().unwrap();
+
+        // Wait for the rewrite to start, then issue a write that must land in
+        // the delta buffer (or, if it finished first, as a normal post-rewrite
+        // append — both survive replay). A larger keyspace keeps the rewrite
+        // window open long enough for the in-flight write to be captured.
+        let wait = Instant::now();
+        while !writer.is_rewriting() && wait.elapsed() < Duration::from_secs(5) {
+            thread::sleep(Duration::from_millis(5));
+        }
+        let mut wrote_during = false;
+        for _ in 0..400 {
+            if !writer.is_rewriting() {
+                break;
+            }
+            engine.set(b"during".to_vec(), b"yes".to_vec()).unwrap();
+            wrote_during = true;
+            thread::sleep(Duration::from_millis(1));
+        }
+        if !wrote_during {
+            engine.set(b"during".to_vec(), b"yes".to_vec()).unwrap();
+        }
+
+        // The rewrite may have already finished while we were writing
+        // "during" keys. Only wait if it is still in progress.
+        if writer.is_rewriting() {
+            // At this point we already observed is_rewriting==true earlier,
+            // so the rewrite has started; just wait for it to finish.
+            let wait_start = Instant::now();
+            while writer.is_rewriting() {
+                assert!(
+                    wait_start.elapsed() < Duration::from_secs(5),
+                    "rewrite did not complete in time"
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
+
+        drop(engine);
+        drop(writer);
+        let restored = KvEngine::new();
+        replay(&path, &restored).unwrap();
+        for i in 0..500u32 {
+            assert_eq!(
+                restored.get(format!("k{i}").as_bytes()).unwrap(),
+                Some(format!("v{i}").into_bytes())
+            );
+        }
+        assert_eq!(
+            restored.get(b"during").unwrap(),
+            Some(b"yes".to_vec()),
+            "write issued during the rewrite must be preserved after restart"
+        );
+        let _ = fs::remove_file(&path);
     }
 }

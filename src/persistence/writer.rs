@@ -10,7 +10,7 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
@@ -23,11 +23,30 @@ use crate::error::FerrumError;
 use super::config::{AofConfig, FsyncPolicy};
 use super::resp::encode_command;
 
+/// Maximum size of the in-memory delta buffer used during an AOF rewrite.
+///
+/// Writes that occur while a rewrite is in flight are copied here so they can
+/// be replayed onto the compact snapshot after the atomic swap. If the buffer
+/// would exceed this cap the rewrite is aborted and the original AOF is kept.
+const DEFAULT_DELTA_CAP: usize = 64 * 1024 * 1024;
+
 /// Writes mutating commands to the AOF log with a configurable fsync policy.
 pub struct AofWriter {
     inner: Arc<Mutex<BufWriter<File>>>,
     policy: FsyncPolicy,
     flusher: Option<BackgroundFlusher>,
+    /// On-disk path of the AOF, retained so a rewrite can reopen the handle
+    /// after the atomic rename+swap.
+    path: PathBuf,
+    /// Set while a rewrite is capturing the keyspace. Gates delta buffering.
+    rewriting: AtomicBool,
+    /// Writes that land during a rewrite, replayed onto the compact snapshot.
+    delta: Mutex<Vec<u8>>,
+    /// Upper bound on `delta`'s byte length (see [`DEFAULT_DELTA_CAP`]).
+    delta_cap: usize,
+    /// Serialises `append_*` against the rename+swap so no command is in
+    /// flight across the moment the file handle is replaced.
+    rewrite_lock: Arc<Mutex<()>>,
 }
 
 impl AofWriter {
@@ -56,7 +75,24 @@ impl AofWriter {
             inner,
             policy: config.fsync,
             flusher,
+            path: config.path().to_path_buf(),
+            rewriting: AtomicBool::new(false),
+            delta: Mutex::new(Vec::new()),
+            delta_cap: DEFAULT_DELTA_CAP,
+            rewrite_lock: Arc::new(Mutex::new(())),
         })
+    }
+
+    /// Opens a writer with a custom delta-buffer cap.
+    ///
+    /// Exposed for tests so the overflow-abort path can be exercised without
+    /// materialising 64 MiB of in-flight writes. Production code always uses
+    /// [`AofWriter::open`] (the default 64 MiB cap).
+    #[cfg(test)]
+    pub(crate) fn open_with_delta_cap(config: &AofConfig, cap: usize) -> Result<Self, FerrumError> {
+        let mut w = Self::open(config)?;
+        w.delta_cap = cap;
+        Ok(w)
     }
 
     /// Appends a `SET key value` entry to the log.
@@ -114,6 +150,10 @@ impl AofWriter {
     }
 
     fn write_bytes(&self, bytes: &[u8]) -> Result<(), FerrumError> {
+        // Hold `rewrite_lock` across the write so the rename+swap in
+        // `finish_rewrite` can never observe a command split between the old
+        // file and the delta buffer.
+        let _rk = self.rewrite_lock.lock()?;
         let mut guard = self.inner.lock()?;
         guard
             .write_all(bytes)
@@ -135,6 +175,108 @@ impl AofWriter {
             }
         }
 
+        // While a rewrite is in flight, mirror these bytes into the delta so
+        // they can be replayed onto the compact snapshot. If the buffer would
+        // overflow its cap, abort the rewrite (the old AOF is kept intact).
+        if self.rewriting.load(Ordering::SeqCst) {
+            let mut d = self.delta.lock()?;
+            if d.len() + bytes.len() > self.delta_cap {
+                warn!(
+                    "aof rewrite delta exceeded {} bytes; aborting rewrite (old AOF kept)",
+                    self.delta_cap
+                );
+                self.rewriting.store(false, Ordering::SeqCst);
+                d.clear();
+            } else {
+                d.extend_from_slice(bytes);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Marks a rewrite as started: clears the delta buffer and flips the
+    /// `rewriting` flag so subsequent `append_*` calls buffer into `delta`.
+    pub fn begin_rewrite(&self) {
+        if let Ok(mut d) = self.delta.lock() {
+            d.clear();
+        }
+        self.rewriting.store(true, Ordering::SeqCst);
+    }
+
+    /// Aborts an in-flight rewrite: drops the buffered delta and clears the
+    /// `rewriting` flag so the old AOF keeps receiving live appends.
+    pub fn abort_rewrite(&self) {
+        if let Ok(mut d) = self.delta.lock() {
+            d.clear();
+        }
+        self.rewriting.store(false, Ordering::SeqCst);
+    }
+
+    /// True when a rewrite is currently capturing the keyspace.
+    pub fn is_rewriting(&self) -> bool {
+        self.rewriting.load(Ordering::SeqCst)
+    }
+
+    /// Path of the temp file a rewrite should serialise into. Sits alongside
+    /// the live AOF (`.aof` → `.rewrite.tmp`) so it inherits the same
+    /// directory and permissions.
+    pub(crate) fn rewrite_temp_path(&self) -> PathBuf {
+        self.path.with_extension("rewrite.tmp")
+    }
+
+    /// Completes a rewrite by atomically swapping the compact snapshot in and
+    /// replaying any buffered delta onto it.
+    ///
+    /// Must be called after the temp file has been fully written and fsync'd.
+    /// If the rewrite was aborted (delta overflow) before this point, the temp
+    /// file is discarded and the original AOF is left untouched.
+    pub fn finish_rewrite(&self, temp: &Path) -> Result<(), FerrumError> {
+        if !self.rewriting.load(Ordering::SeqCst) {
+            // Aborted mid-flight: keep the old AOF, drop the temp file.
+            let _ = std::fs::remove_file(temp);
+            return Ok(());
+        }
+
+        // Atomically replace the live AOF with the compact snapshot.
+        std::fs::rename(temp, &self.path).map_err(|e| {
+            FerrumError::PersistenceError(format!(
+                "aof rename '{}' -> '{}' failed: {e}",
+                temp.display(),
+                self.path.display()
+            ))
+        })?;
+
+        // Serialise against appenders: no command may be in flight across the
+        // swap of the file handle.
+        let _rk = self.rewrite_lock.lock()?;
+        let mut inner = self.inner.lock()?;
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .map_err(|e| FerrumError::PersistenceError(format!("aof reopen failed: {e}")))?;
+        // The background flusher keeps working because it shares this same
+        // `Arc<Mutex<BufWriter<File>>>`.
+        let _old = std::mem::replace(&mut *inner, BufWriter::new(file));
+
+        // Replay buffered in-flight writes onto the compact snapshot.
+        let mut delta_guard = self.delta.lock()?;
+        if !delta_guard.is_empty() {
+            inner.write_all(&delta_guard).map_err(|e| {
+                FerrumError::PersistenceError(format!("aof rewrite delta replay failed: {e}"))
+            })?;
+            inner.flush().map_err(|e| {
+                FerrumError::PersistenceError(format!("aof rewrite delta flush failed: {e}"))
+            })?;
+            inner.get_ref().sync_data().map_err(|e| {
+                FerrumError::PersistenceError(format!("aof rewrite delta fsync failed: {e}"))
+            })?;
+        }
+        delta_guard.clear();
+        drop(delta_guard);
+
+        self.rewriting.store(false, Ordering::SeqCst);
         Ok(())
     }
 }
@@ -358,6 +500,100 @@ mod tests {
         let bytes = fs::read(&path).unwrap();
         let text = String::from_utf8(bytes).unwrap();
         assert_eq!(text.matches("*3\r\n$3\r\nSET\r\n").count(), 16);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn delta_captures_appends_issued_during_rewrite() {
+        let path = tmp_path("delta-capture");
+        let cfg = AofConfig::new(path.clone(), FsyncPolicy::Always);
+        let writer = AofWriter::open(&cfg).unwrap();
+
+        writer.begin_rewrite();
+        assert!(writer.is_rewriting());
+        writer.append_set(b"k", b"v").unwrap();
+
+        let d = writer.delta.lock().unwrap();
+        assert_eq!(
+            &d[..],
+            b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n",
+            "append during rewrite must be mirrored into the delta buffer"
+        );
+        drop(d);
+        writer.abort_rewrite();
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn bounded_delta_overflow_aborts_rewrite_and_keeps_old_aof() {
+        let path = tmp_path("delta-overflow");
+        let cfg = AofConfig::new(path.clone(), FsyncPolicy::Always);
+        // Tiny cap so a single large SET overflows it.
+        let writer = AofWriter::open_with_delta_cap(&cfg, 50).unwrap();
+
+        // Seed the old AOF with a record that must survive the aborted rewrite.
+        writer.append_set(b"keep", b"me").unwrap();
+
+        writer.begin_rewrite();
+        // This SET is larger than the 50-byte cap, so the rewrite aborts and
+        // the old AOF keeps receiving live appends.
+        writer.append_set(b"bigkey", &[b'x'; 200]).unwrap();
+
+        assert!(
+            !writer.is_rewriting(),
+            "overflow must abort the rewrite in flight"
+        );
+        let d = writer.delta.lock().unwrap();
+        assert!(d.is_empty(), "delta must be cleared on abort");
+        drop(d);
+
+        // The old AOF is intact (the pre-rewrite "keep" record is still there).
+        let bytes = fs::read(&path).unwrap();
+        assert!(
+            bytes
+                .windows(b"$4\r\nkeep\r\n".len())
+                .any(|w| w == b"$4\r\nkeep\r\n"),
+            "aborted rewrite must leave the old AOF untouched"
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn finish_rewrite_swaps_handle_and_replays_delta() {
+        let path = tmp_path("finish-swap");
+        let cfg = AofConfig::new(path.clone(), FsyncPolicy::Always);
+        let writer = AofWriter::open(&cfg).unwrap();
+
+        // Pre-rewrite record lands in the old file (not in the delta).
+        writer.append_set(b"orig", b"1").unwrap();
+
+        // Begin the rewrite and issue an in-flight write that must be preserved.
+        writer.begin_rewrite();
+        writer.append_set(b"delta", b"2").unwrap();
+
+        // Simulate the compact snapshot: a fresh file containing only "orig".
+        let temp = writer.rewrite_temp_path();
+        fs::write(&temp, b"*3\r\n$3\r\nSET\r\n$4\r\norig\r\n$1\r\n1\r\n").unwrap();
+
+        writer.finish_rewrite(&temp).unwrap();
+        assert!(!writer.is_rewriting());
+        assert!(!temp.exists(), "temp file must be renamed away");
+
+        // The live AOF must now hold BOTH the compact "orig" and the replayed
+        // "delta" write — nothing lost across the swap.
+        let bytes = fs::read(&path).unwrap();
+        assert!(
+            bytes
+                .windows(b"$4\r\norig\r\n".len())
+                .any(|w| w == b"$4\r\norig\r\n"),
+            "compact snapshot must survive the swap"
+        );
+        assert!(
+            bytes
+                .windows(b"$5\r\ndelta\r\n".len())
+                .any(|w| w == b"$5\r\ndelta\r\n"),
+            "in-flight delta write must be replayed onto the new file"
+        );
         let _ = fs::remove_file(&path);
     }
 }
