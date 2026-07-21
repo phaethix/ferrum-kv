@@ -62,19 +62,16 @@ impl ServerGuard {
 fn wait_for_server_ready(addr: &str) {
     let start = Instant::now();
     loop {
-        match TcpStream::connect_timeout(
+        if let Ok(mut s) = TcpStream::connect_timeout(
             &addr.parse::<SocketAddr>().expect("parse server addr"),
             Duration::from_millis(100),
         ) {
-            Ok(mut s) => {
-                let _ = s.set_read_timeout(Some(Duration::from_millis(200)));
-                let _ = s.write_all(b"*1\r\n$4\r\nPING\r\n");
-                let mut buf = [0u8; 32];
-                if s.read(&mut buf).is_ok() && buf.starts_with(b"+PONG") {
-                    return;
-                }
+            let _ = s.set_read_timeout(Some(Duration::from_millis(200)));
+            let _ = s.write_all(b"*1\r\n$4\r\nPING\r\n");
+            let mut buf = [0u8; 32];
+            if s.read(&mut buf).is_ok() && buf.starts_with(b"+PONG") {
+                return;
             }
-            Err(_) => {}
         }
         assert!(
             start.elapsed() < Duration::from_secs(5),
