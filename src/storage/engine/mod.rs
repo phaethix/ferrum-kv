@@ -1503,17 +1503,15 @@ mod aof_rewrite_tests {
         std::env::temp_dir().join(format!("ferrum-rewrite-{label}-{nanos}-{n}.aof"))
     }
 
-    /// Waits for a rewrite to *start* and then *finish* (handles the
-    /// spawn/start race where `rewrite_aof` returns before the worker has
-    /// flipped `is_rewriting`).
+    /// Waits for an in-progress rewrite to finish.
+    ///
+    /// Callers that need to wait for the rewrite to *start* as well (to handle
+    /// the spawn/start race) should poll `is_rewriting()` before calling this.
+    /// In very fast environments the rewrite may already be done when the
+    /// caller arrives; the downstream file-content assertions serve as the
+    /// ultimate correctness check in that case.
     fn wait_for_rewrite(writer: &AofWriter, timeout: Duration) -> bool {
         let start = Instant::now();
-        while !writer.is_rewriting() {
-            if start.elapsed() > timeout {
-                return false;
-            }
-            thread::sleep(Duration::from_millis(5));
-        }
         while writer.is_rewriting() {
             if start.elapsed() > timeout {
                 return false;
@@ -1574,7 +1572,19 @@ mod aof_rewrite_tests {
         }
 
         engine.rewrite_aof().unwrap();
-        assert!(wait_for_rewrite(&writer, Duration::from_secs(5)));
+        // Wait for the rewrite to start and finish. In fast environments
+        // the rewrite may complete before we reach here; the file-content
+        // assertions below are the ultimate correctness check.
+        let start = Instant::now();
+        while !writer.is_rewriting() && start.elapsed() < Duration::from_secs(5) {
+            thread::sleep(Duration::from_millis(1));
+        }
+        if writer.is_rewriting() {
+            assert!(
+                wait_for_rewrite(&writer, Duration::from_secs(5)),
+                "rewrite did not finish"
+            );
+        }
 
         let bytes = fs::read(&path).unwrap();
         let keys = parse_set_keys(&bytes);
@@ -1629,7 +1639,19 @@ mod aof_rewrite_tests {
             .unwrap();
 
         engine.rewrite_aof().unwrap();
-        assert!(wait_for_rewrite(&writer, Duration::from_secs(5)));
+        // Wait for the rewrite to start and finish. In fast environments
+        // the rewrite may complete before we reach here; the file-content
+        // assertions below are the ultimate correctness check.
+        let start = Instant::now();
+        while !writer.is_rewriting() && start.elapsed() < Duration::from_secs(5) {
+            thread::sleep(Duration::from_millis(1));
+        }
+        if writer.is_rewriting() {
+            assert!(
+                wait_for_rewrite(&writer, Duration::from_secs(5)),
+                "rewrite did not finish"
+            );
+        }
 
         let bytes = fs::read(&path).unwrap();
         // One SET per live key (k1 expired and must be excluded).
