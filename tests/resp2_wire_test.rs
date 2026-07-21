@@ -508,14 +508,14 @@ fn config_get_wildcard_returns_all_eviction_params() {
     let mut s = connect(&server.addr);
 
     // Default engine: maxmemory=0, maxmemory-policy=noeviction,
-    // maxmemory-samples=5, requirepass unset (empty). `CONFIG GET *`
-    // returns a flat array of (name, value) pairs — now 4 pairs since
-    // `requirepass` was added as an exposed parameter.
+    // maxmemory-samples=5, requirepass unset (empty), plus the two
+    // slow-log tunables. `CONFIG GET *` returns a flat array of
+    // (name, value) pairs — 6 pairs since F-03 added the slowlog
+    // parameters alongside the eviction ones.
     round_trip(
         &mut s,
         &build_request(&[b"CONFIG", b"GET", b"*"]),
-        b"*8\r\n$9\r\nmaxmemory\r\n$1\r\n0\r\n$16\r\nmaxmemory-policy\r\n$10\r\nnoeviction\
-          \r\n$17\r\nmaxmemory-samples\r\n$1\r\n5\r\n$11\r\nrequirepass\r\n$0\r\n\r\n",
+        b"*12\r\n$9\r\nmaxmemory\r\n$1\r\n0\r\n$16\r\nmaxmemory-policy\r\n$10\r\nnoeviction\r\n$17\r\nmaxmemory-samples\r\n$1\r\n5\r\n$11\r\nrequirepass\r\n$0\r\n\r\n$23\r\nslowlog-log-slower-than\r\n$5\r\n10000\r\n$15\r\nslowlog-max-len\r\n$3\r\n128\r\n",
     );
 }
 
