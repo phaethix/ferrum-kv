@@ -54,24 +54,13 @@ impl ServerGuard {
     }
 }
 
-/// Sends a PING to `addr` and waits for the PONG until the server is ready.
-/// The Tokio runtime inside `run_listener` may take a moment to initialise,
-/// especially in CI. Unlike a raw connect, this exercises the full
-/// accept→parse→reply pipeline so the TCP handshake does not leak an
-/// unconsumed connection handler that could starve the real test traffic.
+/// Polls `addr` with connect attempts until the server is accept()ing.
 fn wait_for_server_ready(addr: &str) {
+    let socket: SocketAddr = addr.parse().expect("parse server addr");
     let start = Instant::now();
     loop {
-        if let Ok(mut s) = TcpStream::connect_timeout(
-            &addr.parse::<SocketAddr>().expect("parse server addr"),
-            Duration::from_millis(100),
-        ) {
-            let _ = s.set_read_timeout(Some(Duration::from_millis(200)));
-            let _ = s.write_all(b"*1\r\n$4\r\nPING\r\n");
-            let mut buf = [0u8; 32];
-            if s.read(&mut buf).is_ok() && buf.starts_with(b"+PONG") {
-                return;
-            }
+        if TcpStream::connect_timeout(&socket, Duration::from_millis(100)).is_ok() {
+            return;
         }
         assert!(
             start.elapsed() < Duration::from_secs(5),
@@ -165,8 +154,21 @@ fn send(stream: &mut TcpStream, args: &[&[u8]]) -> Vec<u8> {
 
 fn send_with_timeout(stream: &mut TcpStream, args: &[&[u8]], timeout_dur: Duration) -> Vec<u8> {
     let req = build_request(args);
-    stream.write_all(&req).expect("write request");
-    read_reply_timeout(stream, timeout_dur)
+    let deadline = Instant::now() + timeout_dur;
+    loop {
+        stream.write_all(&req).expect("write request");
+        let reply = read_reply_timeout(stream, timeout_dur);
+        if !reply.is_empty() {
+            return reply;
+        }
+        // Server not ready yet; retry until the deadline.
+        assert!(
+            Instant::now() < deadline,
+            "server did not reply within {:?}",
+            timeout_dur
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
 }
 
 fn read_reply_timeout(stream: &mut TcpStream, timeout_dur: Duration) -> Vec<u8> {
