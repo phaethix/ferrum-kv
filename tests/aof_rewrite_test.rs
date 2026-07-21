@@ -20,9 +20,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ferrum_kv::network::server::{self, ServerConfig};
 use ferrum_kv::network::shutdown::Shutdown;
+use ferrum_kv::persistence::AofWriter;
 use ferrum_kv::persistence::config::{AofConfig, FsyncPolicy};
 use ferrum_kv::persistence::replay;
-use ferrum_kv::persistence::AofWriter;
 use ferrum_kv::protocol::encoder;
 use ferrum_kv::storage::engine::KvEngine;
 
@@ -256,7 +256,10 @@ fn bgrewriteaof_produces_compact_aof_and_restores_on_restart() {
         for i in 0..KEY_COUNT {
             let val = format!("v{pass}-{i}");
             assert_eq!(
-                send(&mut s, &[b"SET", format!("k{i}").as_bytes(), val.as_bytes()]),
+                send(
+                    &mut s,
+                    &[b"SET", format!("k{i}").as_bytes(), val.as_bytes()]
+                ),
                 b"+OK\r\n"
             );
         }
@@ -289,10 +292,7 @@ fn bgrewriteaof_produces_compact_aof_and_restores_on_restart() {
         let reply = send(&mut s2, &[b"GET", format!("k{i}").as_bytes()]);
         // Last pass used value "v1-{i}".
         let expected = format!("v1-{i}");
-        assert_eq!(
-            reply,
-            bulk_bytes(expected.as_bytes())
-        );
+        assert_eq!(reply, bulk_bytes(expected.as_bytes()));
     }
     server2.shutdown();
     let _ = std::fs::remove_file(&path);
@@ -306,7 +306,14 @@ fn write_during_rewrite_survives_restart() {
 
     for i in 0..KEY_COUNT {
         assert_eq!(
-            send(&mut s, &[b"SET", format!("k{i}").as_bytes(), format!("v{i}").as_bytes()]),
+            send(
+                &mut s,
+                &[
+                    b"SET",
+                    format!("k{i}").as_bytes(),
+                    format!("v{i}").as_bytes()
+                ]
+            ),
             b"+OK\r\n"
         );
     }
@@ -327,10 +334,7 @@ fn write_during_rewrite_survives_restart() {
         if compact_now {
             break;
         }
-        assert_eq!(
-            send(&mut s, &[b"SET", b"during", b"yes"]),
-            b"+OK\r\n"
-        );
+        assert_eq!(send(&mut s, &[b"SET", b"during", b"yes"]), b"+OK\r\n");
         wrote_during = true;
     }
     if !wrote_during {
@@ -351,10 +355,7 @@ fn write_during_rewrite_survives_restart() {
 
     let server2 = spawn_replayed_server(&path);
     let mut s2 = connect(&server2.addr);
-    assert_eq!(
-        send(&mut s2, &[b"GET", b"during"]),
-        bulk_bytes(b"yes")
-    );
+    assert_eq!(send(&mut s2, &[b"GET", b"during"]), bulk_bytes(b"yes"));
     for i in 0..KEY_COUNT {
         assert_eq!(
             send(&mut s2, &[b"GET", format!("k{i}").as_bytes()]),
@@ -387,7 +388,11 @@ fn rewrite_with_1m_keys_stays_correct() {
         assert_eq!(
             send_with_timeout(
                 &mut s,
-                &[b"SET", format!("k{i}").as_bytes(), format!("v{i}").as_bytes()],
+                &[
+                    b"SET",
+                    format!("k{i}").as_bytes(),
+                    format!("v{i}").as_bytes()
+                ],
                 scale_timeout,
             ),
             b"+OK\r\n"
@@ -397,7 +402,10 @@ fn rewrite_with_1m_keys_stays_correct() {
         }
     }
     eprintln!("seeding complete ({n} keys), triggering BGREWRITEAOF");
-    assert_eq!(send_with_timeout(&mut s, &[b"BGREWRITEAOF"], scale_timeout), b"+OK\r\n");
+    assert_eq!(
+        send_with_timeout(&mut s, &[b"BGREWRITEAOF"], scale_timeout),
+        b"+OK\r\n"
+    );
     assert!(
         wait_for_compact(&path, n as usize, Duration::from_secs(60)),
         "1M-key rewrite did not compact within the timeout"
@@ -412,10 +420,7 @@ fn rewrite_with_1m_keys_stays_correct() {
         "compact AOF must replay exactly one command per key"
     );
     assert_eq!(restored.dbsize().unwrap(), n as usize);
-    assert_eq!(
-        restored.get(b"k0").unwrap(),
-        Some(b"v0".to_vec())
-    );
+    assert_eq!(restored.get(b"k0").unwrap(), Some(b"v0".to_vec()));
     assert_eq!(
         restored.get(format!("k{}", n - 1).as_bytes()).unwrap(),
         Some(format!("v{}", n - 1).into_bytes())

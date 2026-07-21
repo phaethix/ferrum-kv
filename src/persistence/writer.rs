@@ -550,7 +550,9 @@ mod tests {
         // The old AOF is intact (the pre-rewrite "keep" record is still there).
         let bytes = fs::read(&path).unwrap();
         assert!(
-            bytes.windows(b"$4\r\nkeep\r\n".len()).any(|w| w == b"$4\r\nkeep\r\n"),
+            bytes
+                .windows(b"$4\r\nkeep\r\n".len())
+                .any(|w| w == b"$4\r\nkeep\r\n"),
             "aborted rewrite must leave the old AOF untouched"
         );
         let _ = fs::remove_file(&path);
@@ -581,11 +583,15 @@ mod tests {
         // "delta" write — nothing lost across the swap.
         let bytes = fs::read(&path).unwrap();
         assert!(
-            bytes.windows(b"$4\r\norig\r\n".len()).any(|w| w == b"$4\r\norig\r\n"),
+            bytes
+                .windows(b"$4\r\norig\r\n".len())
+                .any(|w| w == b"$4\r\norig\r\n"),
             "compact snapshot must survive the swap"
         );
         assert!(
-            bytes.windows(b"$5\r\ndelta\r\n".len()).any(|w| w == b"$5\r\ndelta\r\n"),
+            bytes
+                .windows(b"$5\r\ndelta\r\n".len())
+                .any(|w| w == b"$5\r\ndelta\r\n"),
             "in-flight delta write must be replayed onto the new file"
         );
         let _ = fs::remove_file(&path);

@@ -677,7 +677,9 @@ fn build_command(parts: Vec<Vec<u8>>) -> Result<Command, FerrumError> {
         }
         b"BGREWRITEAOF" => {
             if !args.is_empty() {
-                return Err(FerrumError::WrongArity { cmd: "BGREWRITEAOF" });
+                return Err(FerrumError::WrongArity {
+                    cmd: "BGREWRITEAOF",
+                });
             }
             Ok(Command::RewriteAof)
         }

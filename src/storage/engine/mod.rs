@@ -1342,10 +1342,12 @@ fn serialise_compact_aof(
             ]));
         }
     }
-    f.write_all(&buf)
-        .map_err(|e| FerrumError::PersistenceError(format!("aof rewrite write temp failed: {e}")))?;
-    f.sync_all()
-        .map_err(|e| FerrumError::PersistenceError(format!("aof rewrite fsync temp failed: {e}")))?;
+    f.write_all(&buf).map_err(|e| {
+        FerrumError::PersistenceError(format!("aof rewrite write temp failed: {e}"))
+    })?;
+    f.sync_all().map_err(|e| {
+        FerrumError::PersistenceError(format!("aof rewrite fsync temp failed: {e}"))
+    })?;
     Ok(())
 }
 
@@ -1485,9 +1487,9 @@ mod aof_rewrite_tests {
     use std::thread;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+    use crate::persistence::AofWriter;
     use crate::persistence::config::{AofConfig, FsyncPolicy};
     use crate::persistence::replay;
-    use crate::persistence::AofWriter;
     use crate::storage::engine::TtlStatus;
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -1546,7 +1548,8 @@ mod aof_rewrite_tests {
     }
 
     fn count_set_records(bytes: &[u8]) -> usize {
-        bytes.windows(b"*3\r\n$3\r\nSET\r\n".len())
+        bytes
+            .windows(b"*3\r\n$3\r\nSET\r\n".len())
             .filter(|w| *w == b"*3\r\n$3\r\nSET\r\n")
             .count()
     }
@@ -1565,7 +1568,9 @@ mod aof_rewrite_tests {
         }
         // Overwrite a prefix to guarantee pre-rewrite redundancy on disk.
         for i in 0..10u32 {
-            engine.set(format!("k{i}").into_bytes(), b"new".to_vec()).unwrap();
+            engine
+                .set(format!("k{i}").into_bytes(), b"new".to_vec())
+                .unwrap();
         }
 
         engine.rewrite_aof().unwrap();
@@ -1579,7 +1584,11 @@ mod aof_rewrite_tests {
             "compact AOF must contain exactly one SET per live key"
         );
         let distinct: std::collections::HashSet<Vec<u8>> = keys.iter().cloned().collect();
-        assert_eq!(distinct.len(), 40, "no redundant duplicate SET frames for the same key");
+        assert_eq!(
+            distinct.len(),
+            40,
+            "no redundant duplicate SET frames for the same key"
+        );
 
         // Replaying the compact file must restore the full keyspace.
         drop(engine);
@@ -1612,8 +1621,12 @@ mod aof_rewrite_tests {
                 .unwrap();
         }
         // k0 gets a TTL; k1 gets a TTL that is already in the past (expired).
-        engine.expire_at_ms(b"k0", current_epoch_ms() + 60_000).unwrap();
-        engine.expire_at_ms(b"k1", current_epoch_ms() - 1_000).unwrap();
+        engine
+            .expire_at_ms(b"k0", current_epoch_ms() + 60_000)
+            .unwrap();
+        engine
+            .expire_at_ms(b"k1", current_epoch_ms() - 1_000)
+            .unwrap();
 
         engine.rewrite_aof().unwrap();
         assert!(wait_for_rewrite(&writer, Duration::from_secs(5)));
