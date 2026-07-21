@@ -54,23 +54,33 @@ impl ServerGuard {
     }
 }
 
-/// Polls `addr` with short-lived connect attempts until the server is
-/// accept()ing. The Tokio runtime inside `run_listener` may take a
-/// moment to initialise, especially in CI.
+/// Sends a PING to `addr` and waits for the PONG until the server is ready.
+/// The Tokio runtime inside `run_listener` may take a moment to initialise,
+/// especially in CI. Unlike a raw connect, this exercises the full
+/// accept→parse→reply pipeline so the TCP handshake does not leak an
+/// unconsumed connection handler that could starve the real test traffic.
 fn wait_for_server_ready(addr: &str) {
-    let socket: SocketAddr = addr.parse().expect("parse server addr");
     let start = Instant::now();
     loop {
-        match TcpStream::connect_timeout(&socket, Duration::from_millis(100)) {
-            Ok(_) => return,
-            Err(_) => {
-                assert!(
-                    start.elapsed() < Duration::from_secs(5),
-                    "server did not start within 5s"
-                );
-                thread::sleep(Duration::from_millis(50));
+        match TcpStream::connect_timeout(
+            &addr.parse::<SocketAddr>().expect("parse server addr"),
+            Duration::from_millis(100),
+        ) {
+            Ok(mut s) => {
+                let _ = s.set_read_timeout(Some(Duration::from_millis(200)));
+                let _ = s.write_all(b"*1\r\n$4\r\nPING\r\n");
+                let mut buf = [0u8; 32];
+                if s.read(&mut buf).is_ok() && buf.starts_with(b"+PONG") {
+                    return;
+                }
             }
+            Err(_) => {}
         }
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "server did not start within 5s"
+        );
+        thread::sleep(Duration::from_millis(50));
     }
 }
 
