@@ -1,0 +1,327 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg viewBox="0 0 960 636" xmlns="http://www.w3.org/2000/svg" role="img"
+           aria-labelledby="ferrumkv-architecture-title ferrumkv-architecture-desc" id="ferrumkv-architecture-root">
+        <title id="ferrumkv-architecture-title">FerrumKV runtime architecture</title>
+        <desc id="ferrumkv-architecture-desc">Three-tier diagram of one FerrumKV process: RESP and dashboard clients enter a tokio server tier, the protocol pipeline hands commands to a shared KvEngine, and the engine tier holds the keyspace, eviction policies, an expiry sweeper thread, and the append-only file.</desc>
+        <defs>
+      <style>#ferrumkv-architecture-root { --color-paper:   #f7f3ea;
+      --color-ink:     #1f2328;
+      --color-muted:   #59636e;
+      --color-accent:  #b0470a;
+      --font-sans:     'Geist', system-ui, sans-serif;
+      --font-serif:    'Instrument Serif', 'Noto Serif', serif;
+      --font-mono:     'Geist Mono', ui-monospace, monospace; }
+      #ferrumkv-architecture-root { font-family: var(--font-sans); color: var(--color-ink); }
+      #ferrumkv-architecture-root .diagram-container { width: 100%; overflow-x: auto; }
+      #ferrumkv-architecture-root .diagram-container { overflow-x: visible; }</style>
+          <pattern id="ferrumkv-architecture-dots" width="22" height="22" patternUnits="userSpaceOnUse">
+            <circle cx="1" cy="1" r="0.9" fill="#1f2328" fill-opacity="0.09"/>
+          </pattern>
+          <marker id="ferrumkv-architecture-arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#59636e"/></marker>
+          <marker id="ferrumkv-architecture-arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#b0470a"/></marker>
+          <marker id="ferrumkv-architecture-arrow-link" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#0550ae"/></marker>
+        </defs>
+
+        <rect width="100%" height="100%" fill="#f7f3ea"/>
+        <rect width="100%" height="100%" fill="url(#ferrumkv-architecture-dots)"/>
+
+        <!-- ============================================================
+             SECTION RULES  (name left, folio right, hairline between)
+             ============================================================ -->
+
+        <text x="56" y="45" fill="#59636e" font-size="8" letter-spacing="0.16em"
+              font-family="'Geist Mono', ui-monospace, monospace">CLIENTS</text>
+        <text x="904" y="45" fill="#667079" font-size="8" letter-spacing="0.10em"
+              font-family="'Geist Mono', ui-monospace, monospace" text-anchor="end">01</text>
+        <line x1="112" y1="48" x2="884" y2="48" stroke="#1f2328" stroke-width="0.8" stroke-opacity="0.12"/>
+
+        <text x="56" y="161" fill="#59636e" font-size="8" letter-spacing="0.16em"
+              font-family="'Geist Mono', ui-monospace, monospace">SERVER PROCESS</text>
+        <text x="904" y="161" fill="#667079" font-size="8" letter-spacing="0.10em"
+              font-family="'Geist Mono', ui-monospace, monospace" text-anchor="end">02</text>
+        <line x1="155" y1="164" x2="884" y2="164" stroke="#1f2328" stroke-width="0.8" stroke-opacity="0.12"/>
+
+        <text x="56" y="361" fill="#59636e" font-size="8" letter-spacing="0.16em"
+              font-family="'Geist Mono', ui-monospace, monospace">ENGINE · STATE · DISK</text>
+        <text x="904" y="361" fill="#667079" font-size="8" letter-spacing="0.10em"
+              font-family="'Geist Mono', ui-monospace, monospace" text-anchor="end">03</text>
+        <line x1="199" y1="364" x2="884" y2="364" stroke="#1f2328" stroke-width="0.8" stroke-opacity="0.12"/>
+
+        <!-- ============================================================
+             CONNECTORS
+             ============================================================ -->
+
+        <line x1="150" y1="124" x2="150" y2="184" stroke="#0550ae" stroke-width="1.2"
+              stroke-linecap="round" marker-end="url(#ferrumkv-architecture-arrow-link)"/>
+        <line x1="590" y1="124" x2="590" y2="184" stroke="#0550ae" stroke-width="1.2"
+              stroke-linecap="round" marker-end="url(#ferrumkv-architecture-arrow-link)"/>
+        <line x1="150" y1="240" x2="150" y2="272" stroke="#59636e" stroke-width="1"
+              stroke-linecap="round" marker-end="url(#ferrumkv-architecture-arrow)"/>
+        <line x1="590" y1="240" x2="590" y2="272" stroke="#59636e" stroke-width="1"
+              stroke-linecap="round" marker-end="url(#ferrumkv-architecture-arrow)"/>
+
+        <line x1="244" y1="300" x2="276" y2="300" stroke="#59636e" stroke-width="1"
+              stroke-linecap="round" marker-end="url(#ferrumkv-architecture-arrow)"/>
+        <line x1="464" y1="300" x2="496" y2="300" stroke="#59636e" stroke-width="1"
+              stroke-linecap="round" marker-end="url(#ferrumkv-architecture-arrow)"/>
+        <line x1="684" y1="300" x2="716" y2="300" stroke="#59636e" stroke-width="1"
+              stroke-linecap="round" marker-end="url(#ferrumkv-architecture-arrow)"/>
+
+        <!-- headline path: executor -> engine -->
+        <line x1="560" y1="328" x2="560" y2="384" stroke="#b0470a" stroke-width="1.2"
+              stroke-linecap="round" marker-end="url(#ferrumkv-architecture-arrow-accent)"/>
+
+        <line x1="276" y1="412" x2="244" y2="412" stroke="#59636e" stroke-width="1"
+              stroke-linecap="round" marker-end="url(#ferrumkv-architecture-arrow)"/>
+        <line x1="684" y1="412" x2="716" y2="412" stroke="#59636e" stroke-width="1"
+              stroke-linecap="round" marker-end="url(#ferrumkv-architecture-arrow)"/>
+        <line x1="620" y1="440" x2="620" y2="472" stroke="#59636e" stroke-width="1"
+              stroke-linecap="round" marker-end="url(#ferrumkv-architecture-arrow)"/>
+        <line x1="684" y1="500" x2="716" y2="500" stroke="#59636e" stroke-width="1"
+              stroke-linecap="round" marker-end="url(#ferrumkv-architecture-arrow)"/>
+        <line x1="150" y1="472" x2="150" y2="440" stroke="#59636e" stroke-width="1"
+              stroke-linecap="round" marker-end="url(#ferrumkv-architecture-arrow)"/>
+
+        <line x1="370" y1="472" x2="370" y2="440" stroke="#59636e" stroke-width="0.9"
+              stroke-dasharray="4,3" stroke-linecap="round" marker-end="url(#ferrumkv-architecture-arrow)"/>
+        <path d="M 810,528 V 532 Q 810,540 802,540 H 438 Q 430,540 430,532 V 528"
+              fill="none" stroke="#59636e" stroke-width="0.9" stroke-dasharray="4,3"
+              stroke-linecap="round" marker-end="url(#ferrumkv-architecture-arrow)"/>
+
+        <!-- labels sit beside the stroke, so no mask is needed -->
+        <text x="158" y="146" fill="#0550ae" font-size="8" letter-spacing="0.06em"
+              font-family="'Geist Mono', ui-monospace, monospace">TCP :6380</text>
+        <text x="598" y="146" fill="#0550ae" font-size="8" letter-spacing="0.06em"
+              font-family="'Geist Mono', ui-monospace, monospace">HTTP :6381</text>
+
+        <!-- ============================================================
+             CARDS
+             ============================================================ -->
+
+        <!-- RESP client - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -->
+        <rect x="56" y="68" width="188" height="56" rx="8" fill="#f7f3ea"
+              stroke="#b9b2a2" stroke-width="1"/>
+        <svg x="68" y="86" width="20" height="20" viewBox="0 0 24 24" fill="none"
+             stroke="#667079" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M5 7l5 5l-5 5"/><path d="M12 19l7 0"/>
+        </svg>
+        <text x="96" y="92" fill="#1f2328" font-size="12" font-weight="600"
+              font-family="'Geist', system-ui, sans-serif">RESP client</text>
+        <text x="96" y="108" fill="#59636e" font-size="9"
+              font-family="'Geist Mono', ui-monospace, monospace">redis-cli · RESP2/RESP3</text>
+
+        <!-- Browser - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -->
+        <rect x="496" y="68" width="188" height="56" rx="8" fill="#f7f3ea"
+              stroke="#b9b2a2" stroke-width="1"/>
+        <svg x="508" y="86" width="20" height="20" viewBox="0 0 24 24" fill="none"
+             stroke="#667079" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M3 12a9 9 0 1 0 18 0a9 9 0 0 0 -18 0"/><path d="M3.6 9h16.8"/>
+          <path d="M3.6 15h16.8"/><path d="M11.5 3a17 17 0 0 0 0 18"/>
+          <path d="M12.5 3a17 17 0 0 1 0 18"/>
+        </svg>
+        <text x="536" y="92" fill="#1f2328" font-size="12" font-weight="600"
+              font-family="'Geist', system-ui, sans-serif">Browser</text>
+        <text x="536" y="108" fill="#59636e" font-size="9"
+              font-family="'Geist Mono', ui-monospace, monospace">dashboard UI · HTTP</text>
+
+        <!-- TcpListener - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -->
+        <rect x="56" y="184" width="188" height="56" rx="8" fill="#ffffff" stroke="#b9b2a2" stroke-width="1"/>
+        <svg x="68" y="202" width="20" height="20" viewBox="0 0 24 24" fill="none"
+             stroke="#59636e" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M8 12h13"/><path d="M18 9l3 3l-3 3"/>
+          <path d="M5.5 9.5l-2.5 2.5l2.5 2.5l2.5 -2.5l-2.5 -2.5"/>
+        </svg>
+        <text x="96" y="208" fill="#1f2328" font-size="12" font-weight="600"
+              font-family="'Geist', system-ui, sans-serif">TcpListener</text>
+        <text x="96" y="224" fill="#59636e" font-size="9"
+              font-family="'Geist Mono', ui-monospace, monospace">:6380 · std → tokio</text>
+
+        <!-- Dashboard server - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -->
+        <rect x="496" y="184" width="188" height="56" rx="8" fill="#ffffff" stroke="#b9b2a2" stroke-width="1"/>
+        <svg x="508" y="202" width="20" height="20" viewBox="0 0 24 24" fill="none"
+             stroke="#59636e" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M4 19l16 0"/><path d="M4 15l4 -6l4 2l4 -5l4 4"/>
+        </svg>
+        <text x="536" y="208" fill="#1f2328" font-size="12" font-weight="600"
+              font-family="'Geist', system-ui, sans-serif">Dashboard server</text>
+        <text x="536" y="224" fill="#59636e" font-size="9"
+              font-family="'Geist Mono', ui-monospace, monospace">:6381 · 2-worker runtime</text>
+
+        <!-- Connection task - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -->
+        <rect x="56" y="272" width="188" height="56" rx="8" fill="#ffffff" stroke="#b9b2a2" stroke-width="1"/>
+        <svg x="68" y="290" width="20" height="20" viewBox="0 0 24 24" fill="none"
+             stroke="#59636e" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M8 18a2 2 0 1 0 -4 0a2 2 0 0 0 4 0"/>
+          <path d="M20 6a2 2 0 1 0 -4 0a2 2 0 0 0 4 0"/>
+          <path d="M8 6a2 2 0 1 0 -4 0a2 2 0 0 0 4 0"/>
+          <path d="M20 18a2 2 0 1 0 -4 0a2 2 0 0 0 4 0"/>
+          <path d="M14 12a2 2 0 1 0 -4 0a2 2 0 0 0 4 0"/>
+          <path d="M7.5 7.5l3 3"/><path d="M7.5 16.5l3 -3"/>
+          <path d="M13.5 13.5l3 3"/><path d="M16.5 7.5l-3 3"/>
+        </svg>
+        <text x="96" y="296" fill="#1f2328" font-size="12" font-weight="600"
+              font-family="'Geist', system-ui, sans-serif">Connection task</text>
+        <text x="96" y="312" fill="#59636e" font-size="9"
+              font-family="'Geist Mono', ui-monospace, monospace">one task per client</text>
+
+        <!-- RESP2 parser - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -->
+        <rect x="276" y="272" width="188" height="56" rx="8" fill="#ffffff" stroke="#b9b2a2" stroke-width="1"/>
+        <svg x="288" y="290" width="20" height="20" viewBox="0 0 24 24" fill="none"
+             stroke="#59636e" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M5 18a2 2 0 1 0 4 0a2 2 0 1 0 -4 0"/><path d="M5 6a2 2 0 1 0 4 0a2 2 0 1 0 -4 0"/>
+          <path d="M15 12a2 2 0 1 0 4 0a2 2 0 1 0 -4 0"/><path d="M7 8l0 8"/>
+          <path d="M7 8a4 4 0 0 0 4 4h4"/>
+        </svg>
+        <text x="316" y="296" fill="#1f2328" font-size="12" font-weight="600"
+              font-family="'Geist', system-ui, sans-serif">RESP2 parser</text>
+        <text x="316" y="312" fill="#59636e" font-size="9"
+              font-family="'Geist Mono', ui-monospace, monospace">parse_frame → Command</text>
+
+        <!-- Executor - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -->
+        <rect x="496" y="272" width="188" height="56" rx="8" fill="#ffffff" stroke="#b9b2a2" stroke-width="1"/>
+        <svg x="508" y="290" width="20" height="20" viewBox="0 0 24 24" fill="none"
+             stroke="#59636e" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M7 4a2 2 0 0 0 -2 2v3a2 3 0 0 1 -2 3a2 3 0 0 1 2 3v3a2 2 0 0 0 2 2"/>
+          <path d="M17 4a2 2 0 0 1 2 2v3a2 3 0 0 0 2 3a2 3 0 0 0 -2 3v3a2 2 0 0 1 -2 2"/>
+        </svg>
+        <text x="536" y="296" fill="#1f2328" font-size="12" font-weight="600"
+              font-family="'Geist', system-ui, sans-serif">Executor</text>
+        <text x="536" y="312" fill="#59636e" font-size="9"
+              font-family="'Geist Mono', ui-monospace, monospace">execute_command</text>
+
+        <!-- Encoder - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -->
+        <rect x="716" y="272" width="188" height="56" rx="8" fill="#ffffff" stroke="#b9b2a2" stroke-width="1"/>
+        <svg x="728" y="290" width="20" height="20" viewBox="0 0 24 24" fill="none"
+             stroke="#59636e" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M5 12l14 0"/><path d="M13 18l6 -6"/><path d="M13 6l6 6"/>
+        </svg>
+        <text x="756" y="296" fill="#1f2328" font-size="12" font-weight="600"
+              font-family="'Geist', system-ui, sans-serif">Encoder</text>
+        <text x="756" y="312" fill="#59636e" font-size="9"
+              font-family="'Geist Mono', ui-monospace, monospace">RESP2 · RESP3 → socket</text>
+
+        <!-- Keyspace - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -->
+        <rect x="56" y="384" width="188" height="56" rx="8" fill="#efe7d6" stroke="#b9b2a2" stroke-width="1"/>
+        <svg x="68" y="402" width="20" height="20" viewBox="0 0 24 24" fill="none"
+             stroke="#59636e" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M4 6a8 3 0 1 0 16 0a8 3 0 1 0 -16 0"/><path d="M4 6v6a8 3 0 0 0 16 0v-6"/>
+          <path d="M4 12v6a8 3 0 0 0 16 0v-6"/>
+        </svg>
+        <text x="96" y="408" fill="#1f2328" font-size="12" font-weight="600"
+              font-family="'Geist', system-ui, sans-serif">Keyspace</text>
+        <text x="96" y="424" fill="#59636e" font-size="9"
+              font-family="'Geist Mono', ui-monospace, monospace">RwLock&lt;HashMap&lt;Vec&lt;u8&gt;&gt;&gt;</text>
+
+        <!-- KvEngine (focal, spans two columns) - - - - - - - - - - - - - - - - - - - - - - - - - - -->
+        <rect x="276" y="384" width="408" height="56" rx="8" fill="#b0470a"
+              stroke="#b0470a" stroke-width="1" fill-opacity="0.07"/>
+        <svg x="288" y="402" width="20" height="20" viewBox="0 0 24 24" fill="none"
+             stroke="#b0470a" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M3 7a3 3 0 0 1 3 -3h12a3 3 0 0 1 3 3v2a3 3 0 0 1 -3 3h-12a3 3 0 0 1 -3 -3"/>
+          <path d="M3 15a3 3 0 0 1 3 -3h12a3 3 0 0 1 3 3v2a3 3 0 0 1 -3 3h-12a3 3 0 0 1 -3 -3l0 -2"/>
+          <path d="M7 8l0 .01"/><path d="M7 16l0 .01"/>
+        </svg>
+        <text x="316" y="408" fill="#1f2328" font-size="12" font-weight="600"
+              font-family="'Geist', system-ui, sans-serif">KvEngine</text>
+        <text x="316" y="424" fill="#59636e" font-size="9"
+              font-family="'Geist Mono', ui-monospace, monospace">WriteGuard · enforce_memory_limit · sweep_expired</text>
+
+        <!-- Eviction - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -->
+        <rect x="716" y="384" width="188" height="56" rx="8" fill="#efe7d6" stroke="#b9b2a2" stroke-width="1"/>
+        <svg x="728" y="402" width="20" height="20" viewBox="0 0 24 24" fill="none"
+             stroke="#59636e" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M13 3l0 7l6 0l-8 11l0 -7l-6 0l8 -11"/>
+        </svg>
+        <text x="756" y="408" fill="#1f2328" font-size="12" font-weight="600"
+              font-family="'Geist', system-ui, sans-serif">Eviction</text>
+        <text x="756" y="424" fill="#59636e" font-size="9"
+              font-family="'Geist Mono', ui-monospace, monospace">16 policies · pick_victim</text>
+
+        <!-- Expire sweeper - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -->
+        <rect x="56" y="472" width="188" height="56" rx="8" fill="#ffffff" stroke="#b9b2a2" stroke-width="1"/>
+        <svg x="68" y="490" width="20" height="20" viewBox="0 0 24 24" fill="none"
+             stroke="#59636e" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M20 11a8.1 8.1 0 0 0 -15.5 -2m-.5 -4v4h4"/>
+          <path d="M4 13a8.1 8.1 0 0 0 15.5 2m.5 4v-4h-4"/>
+        </svg>
+        <text x="96" y="496" fill="#1f2328" font-size="12" font-weight="600"
+              font-family="'Geist', system-ui, sans-serif">Expire sweeper</text>
+        <text x="96" y="512" fill="#59636e" font-size="9"
+              font-family="'Geist Mono', ui-monospace, monospace">ferrum-expire · 100 ms</text>
+
+        <!-- Startup replay - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -->
+        <rect x="276" y="472" width="188" height="56" rx="8" fill="#efe7d6" stroke="#b9b2a2" stroke-width="1"/>
+        <svg x="288" y="490" width="20" height="20" viewBox="0 0 24 24" fill="none"
+             stroke="#59636e" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M6 4h10l4 4v10a2 2 0 0 1 -2 2h-12a2 2 0 0 1 -2 -2v-12a2 2 0 0 1 2 -2"/>
+          <path d="M10 14a2 2 0 1 0 4 0a2 2 0 1 0 -4 0"/><path d="M14 4l0 4l-6 0l0 -4"/>
+        </svg>
+        <text x="316" y="496" fill="#1f2328" font-size="12" font-weight="600"
+              font-family="'Geist', system-ui, sans-serif">Startup replay</text>
+        <text x="316" y="512" fill="#59636e" font-size="9"
+              font-family="'Geist Mono', ui-monospace, monospace">read_record at boot</text>
+
+        <!-- AofWriter - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -->
+        <rect x="496" y="472" width="188" height="56" rx="8" fill="#efe7d6" stroke="#b9b2a2" stroke-width="1"/>
+        <svg x="508" y="490" width="20" height="20" viewBox="0 0 24 24" fill="none"
+             stroke="#59636e" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M14 3v4a1 1 0 0 0 1 1h4"/>
+          <path d="M17 21h-10a2 2 0 0 1 -2 -2v-14a2 2 0 0 1 2 -2h7l5 5v11a2 2 0 0 1 -2 2"/>
+          <path d="M9 9l1 0"/><path d="M9 13l6 0"/><path d="M9 17l6 0"/>
+        </svg>
+        <text x="536" y="496" fill="#1f2328" font-size="12" font-weight="600"
+              font-family="'Geist', system-ui, sans-serif">AofWriter</text>
+        <text x="536" y="512" fill="#59636e" font-size="9"
+              font-family="'Geist Mono', ui-monospace, monospace">Mutex&lt;BufWriter&lt;File&gt;&gt;</text>
+
+        <!-- AOF file - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -->
+        <rect x="716" y="472" width="188" height="56" rx="8" fill="#efe7d6" stroke="#b9b2a2" stroke-width="1"/>
+        <svg x="728" y="490" width="20" height="20" viewBox="0 0 24 24" fill="none"
+             stroke="#59636e" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M14 3v4a1 1 0 0 0 1 1h4"/>
+          <path d="M17 21h-10a2 2 0 0 1 -2 -2v-14a2 2 0 0 1 2 -2h7l5 5v11a2 2 0 0 1 -2 2"/>
+        </svg>
+        <text x="756" y="496" fill="#1f2328" font-size="12" font-weight="600"
+              font-family="'Geist', system-ui, sans-serif">AOF file</text>
+        <text x="756" y="512" fill="#59636e" font-size="9"
+              font-family="'Geist Mono', ui-monospace, monospace">--aof-path · RESP2</text>
+
+        <!-- ============================================================
+             LEGEND
+             ============================================================ -->
+
+        <line x1="56" y1="572" x2="904" y2="572" stroke="#1f2328" stroke-width="0.8" stroke-opacity="0.12"/>
+        <text x="56" y="590" fill="#667079" font-size="8" letter-spacing="0.18em"
+              font-family="'Geist Mono', ui-monospace, monospace">LEGEND</text>
+
+        <rect x="153" y="582" width="14" height="10" rx="2" fill="#b0470a" stroke="#b0470a" stroke-width="1" fill-opacity="0.07"/>
+        <text x="173" y="590" fill="#59636e" font-size="8.5"
+              font-family="'Geist', system-ui, sans-serif">Focal</text>
+
+        <rect x="245" y="582" width="14" height="10" rx="2" fill="#ffffff" stroke="#b9b2a2" stroke-width="1"/>
+        <text x="265" y="590" fill="#59636e" font-size="8.5"
+              font-family="'Geist', system-ui, sans-serif">Component</text>
+
+        <rect x="357" y="582" width="14" height="10" rx="2" fill="#efe7d6" stroke="#b9b2a2" stroke-width="1"/>
+        <text x="377" y="590" fill="#59636e" font-size="8.5"
+              font-family="'Geist', system-ui, sans-serif">State / disk</text>
+
+        <rect x="484" y="582" width="14" height="10" rx="2" fill="#f7f3ea" stroke="#b9b2a2" stroke-width="1"/>
+        <text x="504" y="590" fill="#59636e" font-size="8.5"
+              font-family="'Geist', system-ui, sans-serif">Client</text>
+
+        <line x1="581" y1="587" x2="609" y2="587" stroke="#59636e" stroke-width="1"
+              stroke-linecap="round" marker-end="url(#ferrumkv-architecture-arrow)"/>
+        <text x="617" y="590" fill="#59636e" font-size="8.5"
+              font-family="'Geist', system-ui, sans-serif">Internal</text>
+
+        <line x1="704" y1="587" x2="732" y2="587" stroke="#0550ae" stroke-width="1.2"
+              stroke-linecap="round" marker-end="url(#ferrumkv-architecture-arrow-link)"/>
+        <text x="740" y="590" fill="#59636e" font-size="8.5"
+              font-family="'Geist', system-ui, sans-serif">Network I/O</text>
+
+        <line x1="842" y1="587" x2="870" y2="587" stroke="#59636e" stroke-width="0.9"
+              stroke-dasharray="4,3" stroke-linecap="round" marker-end="url(#ferrumkv-architecture-arrow)"/>
+        <text x="878" y="590" fill="#59636e" font-size="8.5"
+              font-family="'Geist', system-ui, sans-serif">Boot</text>
+      </svg>

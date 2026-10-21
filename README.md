@@ -184,83 +184,20 @@ Figures vary ~±1 pp across runs (internal LFU/LRU sampling RNG seeded from wall
 
 ## Architecture
 
-```mermaid
-flowchart TB
-    classDef runtime fill:#f8fafc,stroke:#94a3b8,stroke-width:2px,color:#334155,stroke-dasharray: 5 5
-    classDef engine fill:#eff6ff,stroke:#3b82f6,stroke-width:2px,color:#1e3a8a
-    classDef entity fill:#fef2f2,stroke:#ef4444,stroke-width:2px,color:#7f1d1d
-    classDef resource fill:#f0fdf4,stroke:#22c55e,stroke-width:2px,color:#14532d
-    classDef config fill:#faf5ff,stroke:#a855f7,stroke-width:2px,color:#581c87
-    classDef ext fill:#fff7ed,stroke:#ea580c,stroke-width:2px,color:#9a3412
+<p align="center">
+  <img src="assets/architecture.svg" width="100%"
+       alt="FerrumKV runtime architecture: RESP and browser clients, tokio server process, shared KvEngine with eviction and expiry, and AOF persistence" />
+</p>
 
-    subgraph ClientLayer ["🌐 External Clients"]
-        direction LR
-        Client[/"redis-cli / any RESP2 client"/]
-        Browser[/"Web browser (built-in dashboard)"/]
-    end
-
-    subgraph NetLayer ["🔌 Network & Concurrency"]
-        direction LR
-        Listener(("TcpListener (Port 6380)"))
-        WorkerThread[["Tokio Task (tokio::spawn)"]]
-
-        Listener -->|"accept connection"| WorkerThread
-    end
-
-    subgraph DashLayer ["🖥️ Built-in Web Dashboard"]
-        direction LR
-        Http(("HTTP Listener (Port 6381)"))
-        HttpThread[["Dashboard Thread"]]
-
-        Http -->|"serve request"| HttpThread
-    end
-
-    subgraph ProcessLayer ["⚙️ Processing Pipeline"]
-        direction LR
-        Parser["RESP2 Parser (Array of Bulk Strings)"]
-        Exec("Command Executor")
-        Encoder["RESP2 Encoder (+OK / $n / :n / -ERR)"]
-
-        Parser -->|"yield command"| Exec
-        Exec -->|"return result"| Encoder
-    end
-
-    subgraph StoreLayer ["💾 Storage Layer"]
-        direction LR
-        Engine[("KvEngine")]
-        State{{"Shared State (Arc<RwLock<HashMap<Vec<u8>, ValueEntry>>>)"}}
-        ExpireW[["Expire Sweeper (ferrum-expire thread)"]]
-
-        Engine -->|"manages"| State
-        ExpireW -.->|"evict expired keys"| State
-    end
-
-    subgraph PersistLayer ["🗄️ Persistence (AOF)"]
-        direction LR
-        AofWriter["AofWriter (Mutex<File>)"]
-        AofFile[/"ferrum.aof (RESP2 on disk)"/]
-        Replay["Startup Replay"]
-
-        AofWriter -->|"append + fsync"| AofFile
-        AofFile -->|"restore on boot"| Replay
-    end
-
-    ClientLayer == "TCP Stream" === NetLayer
-    Browser == "HTTP" === DashLayer
-    WorkerThread -.->|"delegates stream"| ProcessLayer
-    HttpThread -.->|"shares engine"| Engine
-    ProcessLayer == "read & write data" === StoreLayer
-    StoreLayer -.->|"log write ops"| PersistLayer
-    Replay -.->|"apply commands"| Engine
-    Encoder -.->|"flush to socket"| Client
-
-    class ClientLayer,NetLayer,ProcessLayer,StoreLayer,PersistLayer,DashLayer runtime
-    class Client,Browser ext
-    class Listener,WorkerThread,Http,HttpThread,ExpireW engine
-    class Parser,Exec,Encoder entity
-    class Engine,AofWriter,Replay resource
-    class State,AofFile config
-```
+One process, three tiers. The **tokio server** (`src/network`,
+`src/protocol`) accepts RESP2 clients on `:6380` and serves the built-in
+dashboard on `:6381`; both paths run through the same `execute_command`.
+The shared **`KvEngine`** (`src/storage`) owns the single
+`RwLock<HashMap>` keyspace and dispatches over 16 eviction policies.
+**AOF** (`src/persistence`) is optional (`--aof-path`) and appends RESP2
+frames synchronously inside the store write lock, replayed on the next
+boot. The expire sweeper, the AOF fsync thread (`--appendfsync
+everysec`), and the dashboard each run outside the main tokio runtime.
 
 ## CLI Flags
 
