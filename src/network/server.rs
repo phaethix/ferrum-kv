@@ -245,6 +245,26 @@ async fn handle_client(
                         return run_monitor_loop(stream, peer, &mut rx, shutdown).await;
                     } else if engine.auth_required() && !authed {
                         encoder::encode_error(&mut outbuf, "NOAUTH Authentication required.");
+                    } else if engine.aof_barrier_blocks() {
+                        // `appendfsync always` waits for a disk round-trip
+                        // inside `execute_command`. Running it on an async
+                        // worker would let a handful of writers occupy the
+                        // whole pool (measured: reads stalled to double-digit
+                        // rps). The blocking pool absorbs the wait.
+                        let engine_bg = engine.clone();
+                        match tokio::task::spawn_blocking(move || {
+                            let mut out = Vec::with_capacity(256);
+                            execute_command(command, &engine_bg, Some(peer), &mut out, version);
+                            out
+                        })
+                        .await
+                        {
+                            Ok(reply) => outbuf.extend_from_slice(&reply),
+                            Err(e) => write_ferrum_error(
+                                &mut outbuf,
+                                &FerrumError::Internal(format!("command task failed: {e}")),
+                            ),
+                        }
                     } else {
                         execute_command(command, &engine, Some(peer), &mut outbuf, version);
                     }
@@ -742,6 +762,11 @@ fn render_info_sections(engine: &KvEngine, section: Option<&[u8]>) -> Vec<(&'sta
             engine.aof_write_errors()
         ));
         out.push_str(&format!("aof_fsyncs:{}\r\n", engine.aof_fsync_count()));
+        out.push_str(&format!("aof_fsync_skips:{}\r\n", engine.aof_fsync_skips()));
+        out.push_str(&format!(
+            "aof_append_batches:{}\r\n",
+            engine.aof_append_batches()
+        ));
         out.push_str("\r\n");
         sections.push(("stats", out));
     }

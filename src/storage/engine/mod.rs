@@ -555,9 +555,32 @@ impl KvEngine {
         self.aof_errors.load(Ordering::Relaxed)
     }
 
+    /// True when a write command may block on a disk round-trip.
+    ///
+    /// Only `appendfsync always` waits for `fsync` before replying (see
+    /// [`crate::persistence::AofWriter::sync_if_needed`]). Callers running on
+    /// an async runtime should move command execution to a blocking thread in
+    /// that mode, otherwise a burst of writers occupies every worker.
+    pub fn aof_barrier_blocks(&self) -> bool {
+        self.aof
+            .as_ref()
+            .map(|w| w.fsync_policy() == crate::persistence::config::FsyncPolicy::Always)
+            .unwrap_or(false)
+    }
+
     /// Number of fsync barriers issued by the AOF writer (0 when disabled).
     pub fn aof_fsync_count(&self) -> u64 {
         self.aof.as_ref().map(|w| w.fsync_count()).unwrap_or(0)
+    }
+
+    /// Barriers skipped because a peer's fsync already covered the batch.
+    pub fn aof_fsync_skips(&self) -> u64 {
+        self.aof.as_ref().map(|w| w.fsync_skip_count()).unwrap_or(0)
+    }
+
+    /// Append batches handed to the durability path.
+    pub fn aof_append_batches(&self) -> u64 {
+        self.aof.as_ref().map(|w| w.append_batches()).unwrap_or(0)
     }
 
     /// Approximate bytes held by the active stateful eviction index.

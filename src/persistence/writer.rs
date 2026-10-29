@@ -50,6 +50,8 @@ pub struct AofWriter {
     synced: AtomicU64,
     /// Number of fsync calls actually issued (observability for group commit).
     fsyncs: AtomicU64,
+    /// Barriers that found their batch already covered by a peer.
+    fsync_skips: AtomicU64,
     /// Serialises fsync calls so concurrent writers coalesce into one barrier.
     sync_lock: Mutex<()>,
     policy: FsyncPolicy,
@@ -99,6 +101,7 @@ impl AofWriter {
             seq: AtomicU64::new(0),
             synced: AtomicU64::new(0),
             fsyncs: AtomicU64::new(0),
+            fsync_skips: AtomicU64::new(0),
             sync_lock: Mutex::new(()),
             policy: config.fsync,
             flusher,
@@ -244,6 +247,12 @@ impl AofWriter {
         // Group commit: one fsync per batch of concurrent writers. The kernel
         // serialises fsync on a single inode anyway, so letting every caller
         // issue its own barrier just multiplies the wait.
+        //
+        // On macOS `sync_data` maps to `F_FULLFSYNC`, which holds the vnode
+        // lock and therefore blocks concurrent `write`s to the same file; there
+        // the cooldown window is empty and throughput is pinned to one barrier
+        // per `F_FULLFSYNC` (~4 ms on APFS). On Linux `fdatasync` does not
+        // block writers, so bursts coalesce as intended.
         let _gate = self.sync_lock.lock()?;
         // Everything that was flushed before this barrier starts will be
         // covered by it. Recording `covered` (not just our own `target`) is
@@ -251,6 +260,7 @@ impl AofWriter {
         let covered = self.seq.load(Ordering::Acquire);
         if self.synced.load(Ordering::Acquire) >= covered {
             // Another barrier already covered every flushed batch.
+            self.fsync_skips.fetch_add(1, Ordering::Relaxed);
             return Ok(());
         }
         let flushed = {
@@ -313,9 +323,24 @@ impl AofWriter {
         self.rewriting.store(false, Ordering::SeqCst);
     }
 
+    /// The configured durability policy.
+    pub fn fsync_policy(&self) -> FsyncPolicy {
+        self.policy
+    }
+
     /// Number of fsync barriers issued so far (group-commit observability).
     pub fn fsync_count(&self) -> u64 {
         self.fsyncs.load(Ordering::Relaxed)
+    }
+
+    /// Number of barriers skipped because a peer already covered the batch.
+    pub fn fsync_skip_count(&self) -> u64 {
+        self.fsync_skips.load(Ordering::Relaxed)
+    }
+
+    /// Append batches that went through the durability path.
+    pub fn append_batches(&self) -> u64 {
+        self.seq.load(Ordering::Relaxed)
     }
 
     /// True when a rewrite is currently capturing the keyspace.
