@@ -42,9 +42,9 @@ pub(super) fn sample_candidates(
         }
         out.push(Candidate {
             key: key.clone(),
-            last_access: Some(entry.last_access),
+            last_access: Some(entry.last_access()),
             expire_at: entry.expire_at,
-            lfu_counter: entry.lfu_counter,
+            lfu_counter: entry.lfu_counter(),
         });
     }
     out

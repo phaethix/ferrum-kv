@@ -1160,3 +1160,61 @@ fn volatile_sieve_queue_tracks_only_ttl_keys() {
         "losing the TTL must dequeue the key"
     );
 }
+
+#[test]
+fn get_uses_a_shared_lock() {
+    let engine = KvEngine::new();
+    engine.set(b"k".to_vec(), b"v".to_vec()).unwrap();
+
+    // Hold the keyspace read lock here and read from another thread: both
+    // readers must succeed. The previous implementation took the *write* lock
+    // for every `GET`, which would block this thread until the timeout.
+    let (tx, rx) = std::sync::mpsc::channel();
+    let guard = engine.store.read().unwrap();
+    let reader = engine.clone();
+    std::thread::spawn(move || {
+        let _ = tx.send(reader.get(b"k").unwrap());
+    });
+    let got = rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("GET blocked on the keyspace lock");
+    assert_eq!(got, Some(b"v".to_vec()));
+    drop(guard);
+}
+
+#[test]
+fn read_paths_record_each_hit_and_miss_once() {
+    let engine = KvEngine::new();
+    engine.set(b"k".to_vec(), b"v".to_vec()).unwrap();
+
+    engine.get(b"k").unwrap(); // hit
+    engine.get(b"nope").unwrap(); // miss
+    engine.exists(b"k").unwrap(); // hit
+    engine.exists(b"nope").unwrap(); // miss
+    engine.mget(&[b"k".to_vec(), b"nope".to_vec()]).unwrap(); // hit + miss
+    engine
+        .exists_many(&[b"k".to_vec(), b"nope".to_vec()])
+        .unwrap(); // hit + miss
+
+    assert_eq!(engine.keyspace_stats(), (4, 4));
+}
+
+#[test]
+fn read_path_removes_lazily_expired_keys() {
+    let engine = KvEngine::new();
+    engine.set(b"k".to_vec(), b"v".to_vec()).unwrap();
+    {
+        let mut store = engine.store.write().unwrap();
+        store.get_mut("k".as_bytes()).unwrap().expire_at =
+            Some(Instant::now() - Duration::from_secs(1));
+    }
+
+    // The shared-lock fast path must not serve a stale value: it detects the
+    // expiry, then removes the entry under the exclusive lock.
+    assert_eq!(engine.get(b"k").unwrap(), None);
+    assert!(
+        engine.store.read().unwrap().get("k".as_bytes()).is_none(),
+        "expired entry must be physically removed"
+    );
+    assert_eq!(engine.ttl_ms(b"k").unwrap(), TtlStatus::Missing);
+}

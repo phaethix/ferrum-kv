@@ -711,11 +711,40 @@ impl KvEngine {
     /// Missing keys map to `None` so the caller can serialise them as
     /// null bulk strings without ambiguity. Expired entries are dropped in
     /// the same pass so the result reflects live state only.
+    ///
+    /// The batch is read under one shared lock; keys that turn out to be
+    /// expired are collected and cleaned up afterwards under the exclusive
+    /// lock (removal + AOF `DEL`), which keeps the common path concurrent.
     pub fn mget(&self, keys: &[Vec<u8>]) -> Result<Vec<Option<Vec<u8>>>, FerrumError> {
-        let mut g = WriteGuard::begin(self)?;
-        let mut out = Vec::with_capacity(keys.len());
-        for key in keys {
-            out.push(g.fetch_live(key));
+        let mut out: Vec<Option<Vec<u8>>> = Vec::with_capacity(keys.len());
+        let mut expired: Vec<usize> = Vec::new();
+        {
+            let store = self.store.read()?;
+            let now = Instant::now();
+            for (i, key) in keys.iter().enumerate() {
+                match store.get(key.as_slice()) {
+                    Some(entry) if !entry.is_expired(now) => {
+                        out.push(Some(entry.data.clone()));
+                        self.touch_access(&store, key);
+                        self.record_hit();
+                    }
+                    Some(_) => {
+                        out.push(None);
+                        expired.push(i);
+                    }
+                    None => {
+                        out.push(None);
+                        self.record_miss();
+                    }
+                }
+            }
+        }
+        if !expired.is_empty() {
+            let mut g = WriteGuard::begin(self)?;
+            for i in expired {
+                // Removes the stale entry, appends the AOF DEL, records a miss.
+                let _ = g.fetch_live(&keys[i]);
+            }
         }
         Ok(out)
     }
@@ -793,7 +822,29 @@ impl KvEngine {
     }
 
     /// Returns the value for `key`, or `None` if the key does not exist.
+    ///
+    /// Fast path: a shared lock. LRU/LFU metadata is updated through the
+    /// entry's atomics, so concurrent readers do not serialise. Only a key
+    /// that has actually expired takes the exclusive lock (to remove it and
+    /// append the AOF `DEL`).
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, FerrumError> {
+        {
+            let store = self.store.read()?;
+            let now = Instant::now();
+            match store.get(key) {
+                Some(entry) if !entry.is_expired(now) => {
+                    let data = entry.data.clone();
+                    self.touch_access(&store, key);
+                    self.record_hit();
+                    return Ok(Some(data));
+                }
+                Some(_) => {}
+                None => {
+                    self.record_miss();
+                    return Ok(None);
+                }
+            }
+        }
         let mut g = WriteGuard::begin(self)?;
         Ok(g.fetch_live(key))
     }
@@ -822,6 +873,21 @@ impl KvEngine {
 
     /// Returns `true` if `key` exists and has not expired.
     pub fn exists(&self, key: &[u8]) -> Result<bool, FerrumError> {
+        {
+            let store = self.store.read()?;
+            let now = Instant::now();
+            match store.get(key) {
+                Some(entry) if !entry.is_expired(now) => {
+                    self.record_hit();
+                    return Ok(true);
+                }
+                Some(_) => {}
+                None => {
+                    self.record_miss();
+                    return Ok(false);
+                }
+            }
+        }
         let mut g = WriteGuard::begin(self)?;
         Ok(g.contains_live(key))
     }
@@ -835,11 +901,28 @@ impl KvEngine {
         if keys.is_empty() {
             return Ok(0);
         }
-        let mut g = WriteGuard::begin(self)?;
         let mut count = 0usize;
-        for key in keys {
-            if g.contains_live(key) {
-                count += 1;
+        let mut expired: Vec<usize> = Vec::new();
+        {
+            let store = self.store.read()?;
+            let now = Instant::now();
+            for (i, key) in keys.iter().enumerate() {
+                match store.get(key.as_slice()) {
+                    Some(entry) if !entry.is_expired(now) => {
+                        count += 1;
+                        self.record_hit();
+                    }
+                    Some(_) => expired.push(i),
+                    None => self.record_miss(),
+                }
+            }
+        }
+        if !expired.is_empty() {
+            let mut g = WriteGuard::begin(self)?;
+            for i in expired {
+                if g.contains_live(&keys[i]) {
+                    count += 1;
+                }
             }
         }
         Ok(count)
@@ -938,6 +1021,15 @@ impl KvEngine {
 
     /// Returns the byte length of the value at `key`, or `0` if absent.
     pub fn strlen(&self, key: &[u8]) -> Result<usize, FerrumError> {
+        {
+            let store = self.store.read()?;
+            let now = Instant::now();
+            match store.get(key) {
+                Some(entry) if !entry.is_expired(now) => return Ok(entry.data.len()),
+                Some(_) => {}
+                None => return Ok(0),
+            }
+        }
         let mut g = WriteGuard::begin(self)?;
         Ok(g.strlen_of(key))
     }
@@ -1018,6 +1110,22 @@ impl KvEngine {
     /// * `Ok(TtlStatus::NoExpire)` — key exists without a TTL (Redis `-1`).
     /// * `Ok(TtlStatus::Millis(n))` — `n` milliseconds remaining.
     pub fn ttl_ms(&self, key: &[u8]) -> Result<TtlStatus, FerrumError> {
+        {
+            let store = self.store.read()?;
+            let now = Instant::now();
+            match store.get(key) {
+                Some(entry) if !entry.is_expired(now) => {
+                    return Ok(match entry.expire_at {
+                        None => TtlStatus::NoExpire,
+                        Some(deadline) => TtlStatus::Millis(
+                            deadline.saturating_duration_since(now).as_millis() as i64,
+                        ),
+                    });
+                }
+                Some(_) => {}
+                None => return Ok(TtlStatus::Missing),
+            }
+        }
         let mut g = WriteGuard::begin(self)?;
         Ok(g.ttl_of(key))
     }
@@ -1114,6 +1222,17 @@ impl KvEngine {
     /// single-entry contribution that `used_memory()` would shed if the
     /// key were removed.
     pub fn memory_usage(&self, key: &[u8]) -> Result<Option<u64>, FerrumError> {
+        {
+            let store = self.store.read()?;
+            let now = Instant::now();
+            match store.get(key) {
+                Some(entry) if !entry.is_expired(now) => {
+                    return Ok(Some(util::entry_bytes(key, entry)));
+                }
+                Some(_) => {}
+                None => return Ok(None),
+            }
+        }
         let mut g = WriteGuard::begin(self)?;
         g.memory_of(key)
     }
@@ -1241,8 +1360,8 @@ impl KvEngine {
     /// Used by read paths to give the LRU policy some accuracy without
     /// forcing the caller to touch `ValueEntry` internals. Also advances
     /// the Morris LFU counter probabilistically.
-    pub(crate) fn touch_access(&self, store: &mut HashMap<Vec<u8>, ValueEntry>, key: &[u8]) {
-        if let Some(entry) = store.get_mut(key) {
+    pub(crate) fn touch_access(&self, store: &HashMap<Vec<u8>, ValueEntry>, key: &[u8]) {
+        if let Some(entry) = store.get(key) {
             let r = self.next_rand01();
             entry.touch(r);
             self.sieve_notify_access(key);

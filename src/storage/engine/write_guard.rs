@@ -123,7 +123,7 @@ impl<'a> WriteGuard<'a> {
             }
             Some(entry) => {
                 let data = entry.data.clone();
-                self.engine.touch_access(&mut self.store, key);
+                self.engine.touch_access(&self.store, key);
                 self.engine.record_hit();
                 Some(data)
             }
