@@ -9,7 +9,7 @@ use std::time::Duration;
 use ferrum_kv::network::server::{self, ServerConfig};
 use ferrum_kv::network::shutdown::Shutdown;
 use ferrum_kv::protocol::encoder;
-use ferrum_kv::storage::engine::KvEngine;
+use ferrum_kv::storage::engine::{KvEngine, PER_ENTRY_OVERHEAD};
 use ferrum_kv::storage::eviction::{EvictionConfig, EvictionPolicy};
 
 struct ServerGuard {
@@ -156,7 +156,7 @@ fn noeviction_returns_oom_error_on_overflow() {
     let engine = KvEngine::new();
     engine
         .set_eviction_config(EvictionConfig {
-            max_memory: 64, // tight
+            max_memory: PER_ENTRY_OVERHEAD + 4, // room for one small entry
             policy: EvictionPolicy::NoEviction,
             samples: 5,
         })
@@ -179,7 +179,7 @@ fn allkeys_lru_evicts_over_the_wire() {
     // Room for two small entries.
     engine
         .set_eviction_config(EvictionConfig {
-            max_memory: 2 * (1 + 1 + 48),
+            max_memory: 2 * (1 + 1 + PER_ENTRY_OVERHEAD),
             policy: EvictionPolicy::AllKeysLru,
             samples: 10,
         })
@@ -211,7 +211,7 @@ fn allkeys_lfu_evicts_cold_key_over_the_wire() {
     // Room for two small entries.
     engine
         .set_eviction_config(EvictionConfig {
-            max_memory: 2 * (1 + 1 + 48),
+            max_memory: 2 * (1 + 1 + PER_ENTRY_OVERHEAD),
             policy: EvictionPolicy::AllKeysLfu,
             samples: 10,
         })
@@ -241,7 +241,7 @@ fn allkeys_ahe_evicts_and_publishes_alpha_in_info() {
     let engine = KvEngine::new();
     engine
         .set_eviction_config(EvictionConfig {
-            max_memory: 2 * (1 + 1 + 48),
+            max_memory: 2 * (1 + 1 + PER_ENTRY_OVERHEAD),
             policy: EvictionPolicy::AllKeysAhe,
             samples: 10,
         })
@@ -276,7 +276,7 @@ fn allkeys_sieve_evicts_over_the_wire() {
     // Room for two small entries.
     engine
         .set_eviction_config(EvictionConfig {
-            max_memory: 2 * (1 + 1 + 48),
+            max_memory: 2 * (1 + 1 + PER_ENTRY_OVERHEAD),
             policy: EvictionPolicy::AllKeysSieve,
             samples: 10,
         })
@@ -306,7 +306,7 @@ fn allkeys_sieves_evicts_and_publishes_policy_in_info() {
     // Room for two small entries.
     engine
         .set_eviction_config(EvictionConfig {
-            max_memory: 2 * (1 + 1 + 48),
+            max_memory: 2 * (1 + 1 + PER_ENTRY_OVERHEAD),
             policy: EvictionPolicy::AllKeysSieveS,
             samples: 10,
         })
@@ -334,7 +334,7 @@ fn volatile_sieve_only_considers_ttl_keys() {
     // Room for two small entries, volatile scope.
     engine
         .set_eviction_config(EvictionConfig {
-            max_memory: 2 * (1 + 1 + 48),
+            max_memory: 2 * (1 + 1 + PER_ENTRY_OVERHEAD),
             policy: EvictionPolicy::VolatileSieve,
             samples: 10,
         })

@@ -292,6 +292,7 @@ dependencies = [
  "criterion",
  "env_logger",
  "indexmap",
+ "libc",
  "log",
  "signal-hook",
  "tokio",

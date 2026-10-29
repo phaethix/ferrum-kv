@@ -10,6 +10,7 @@ directive in the config file (`ferrum.conf.example`).
 | `--config PATH` | *(none)* | Load a config file (directives below) |
 | `--addr HOST:PORT` | `127.0.0.1:6380` | RESP listening address |
 | `--dashboard-addr ADDR\|off` | `127.0.0.1:6381` | Web dashboard address, or `off` to disable |
+| `--dashboard-token SECRET` | *(none)* | Required secret for `/api/*`; mandatory for non-loopback binds |
 | `--aof-path PATH` | *(disabled)* | Enable AOF persistence |
 | `--appendfsync POLICY` | `everysec` | `always` / `everysec` / `no` |
 | `--client-timeout SECONDS` | `0` (disabled) | Per-connection idle timeout |
@@ -27,6 +28,7 @@ directive in the config file (`ferrum.conf.example`).
 bind 127.0.0.1
 port 6380
 dashboard-addr 127.0.0.1:6381
+dashboard-token "change-me"
 maxmemory 256mb
 maxmemory-policy allkeys-ahe
 appendonly yes

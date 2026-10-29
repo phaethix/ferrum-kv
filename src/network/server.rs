@@ -15,7 +15,9 @@ use crate::network::shutdown::Shutdown;
 use crate::protocol::ProtocolVersion;
 use crate::protocol::encoder;
 use crate::protocol::parser::{self, Command, FrameParse};
-use crate::storage::engine::{KvEngine, SlowLogEntry, TtlStatus, current_epoch_ms};
+use crate::storage::engine::{
+    KvEngine, SlowLogEntry, TtlStatus, VALUE_MAX_BYTES, current_epoch_ms,
+};
 use crate::storage::eviction::EvictionPolicy;
 
 /// Initial capacity of each per-connection read buffer.
@@ -26,12 +28,21 @@ const READ_BUF_INITIAL: usize = 1024;
 
 /// Upper bound on how much unparsed data we are willing to buffer per client.
 ///
-/// If the buffer exceeds this size without a complete frame the client is
-/// sending something malformed or abusive; we reply with an error and close.
-const READ_BUF_MAX: usize = 16 * 1024 * 1024;
+/// Must exceed [`VALUE_MAX_BYTES`] plus the RESP framing (command name, key,
+/// length prefixes): the old limit was exactly 16 MiB, the same as the largest
+/// value the engine accepts, so the biggest legal value could never be
+/// received. The extra 1 MiB covers framing for a 64 KiB key.
+const READ_BUF_MAX: usize = VALUE_MAX_BYTES + 1024 * 1024;
 
 /// Size of each `read()` scratch buffer.
 const READ_CHUNK: usize = 8 * 1024;
+
+/// Reply-buffer watermark used while draining a pipelined batch.
+///
+/// Replies are accumulated and flushed once per read batch; if a client
+/// pipelines aggressively the buffer is flushed whenever it crosses this
+/// watermark so memory stays bounded.
+const WRITE_BATCH_MAX: usize = 64 * 1024;
 
 /// Tunable per-server runtime knobs.
 ///
@@ -148,7 +159,7 @@ async fn handle_client(
 
     let mut inbuf: Vec<u8> = Vec::with_capacity(READ_BUF_INITIAL);
     let mut chunk = [0u8; READ_CHUNK];
-    let mut outbuf: Vec<u8> = Vec::with_capacity(256);
+    let mut outbuf: Vec<u8> = Vec::with_capacity(READ_BUF_INITIAL);
 
     // Per-connection authentication flag. Starts `false`; a successful `AUTH`
     // flips it, after which every other command runs. We keep this state in the
@@ -190,14 +201,21 @@ async fn handle_client(
         };
         inbuf.extend_from_slice(&chunk[..n]);
 
-        // Drain as many complete frames as the buffer currently holds.
+        // Drain as many complete frames as the buffer holds.
+        //
+        // Two changes keep pipelined clients efficient: frames are consumed by
+        // advancing `start` (the buffer is compacted once per read batch, so a
+        // deep pipeline no longer pays an O(remaining) memmove per command),
+        // and replies are accumulated in `outbuf` and flushed in batches
+        // instead of one `write_all` syscall per command.
+        let mut start = 0usize;
         loop {
-            match parser::parse_frame(&inbuf) {
+            match parser::parse_frame(&inbuf[start..]) {
                 Ok(FrameParse::Complete { command, consumed }) => {
-                    outbuf.clear();
                     // When a password is configured, every command except
-                    // `AUTH` is rejected until the connection authenticates.
-                    let requires_auth = engine.requirepass().map(|p| p.is_some()).unwrap_or(false);
+                    // `AUTH`/`HELLO` is rejected until the connection
+                    // authenticates. `auth_required` is a lock-free flag, so
+                    // the hot path no longer takes the password RwLock.
                     if let Command::Auth { password } = &command {
                         if auth_reply(&engine, password, &mut outbuf) {
                             authed = true;
@@ -216,53 +234,61 @@ async fn handle_client(
                         hello_reply(&mut outbuf, version);
                     } else if matches!(&command, Command::Monitor) {
                         // MONITOR bypasses the normal execute→write cycle
-                        // and enters a dedicated event loop.
+                        // and enters a dedicated event loop. Flush anything
+                        // already buffered (including the +OK) first.
                         encoder::encode_simple_string(&mut outbuf, "OK");
                         if let Err(e) = stream.write_all(&outbuf).await {
                             error!("write failed for {peer}: {e}");
                             return Err(e.into());
                         }
-                        inbuf.drain(..consumed);
                         let mut rx = engine.monitor_registry.subscribe();
                         return run_monitor_loop(stream, peer, &mut rx, shutdown).await;
-                    } else if requires_auth && !authed {
+                    } else if engine.auth_required() && !authed {
                         encoder::encode_error(&mut outbuf, "NOAUTH Authentication required.");
                     } else {
                         execute_command(command, &engine, Some(peer), &mut outbuf, version);
                     }
-                    if let Err(e) = stream.write_all(&outbuf).await {
-                        error!("write failed for {peer}: {e}");
-                        return Err(e.into());
-                    }
-                    inbuf.drain(..consumed);
+                    start += consumed;
                 }
                 Ok(FrameParse::Invalid { error, consumed }) => {
                     // The frame was well-formed; the command itself was
                     // invalid (unknown, wrong arity, etc). Reply with -ERR
                     // and keep the connection open so the client can retry.
-                    outbuf.clear();
                     write_ferrum_error(&mut outbuf, &error);
-                    if let Err(e) = stream.write_all(&outbuf).await {
-                        error!("write failed for {peer}: {e}");
-                        return Err(e.into());
-                    }
-                    inbuf.drain(..consumed);
+                    start += consumed;
                 }
                 Ok(FrameParse::Incomplete) => break,
                 Err(e) => {
                     // Protocol-level error: the byte stream itself cannot be
                     // resynchronised, so reply with -ERR and close.
-                    outbuf.clear();
                     write_ferrum_error(&mut outbuf, &e);
                     let _ = stream.write_all(&outbuf).await;
                     warn!("protocol error from {peer}: {e}");
                     return Ok(());
                 }
             }
+
+            if outbuf.len() >= WRITE_BATCH_MAX {
+                if let Err(e) = stream.write_all(&outbuf).await {
+                    error!("write failed for {peer}: {e}");
+                    return Err(e.into());
+                }
+                outbuf.clear();
+            }
+        }
+
+        if !outbuf.is_empty() {
+            if let Err(e) = stream.write_all(&outbuf).await {
+                error!("write failed for {peer}: {e}");
+                return Err(e.into());
+            }
+            outbuf.clear();
+        }
+        if start > 0 {
+            inbuf.drain(..start);
         }
 
         if inbuf.len() > READ_BUF_MAX {
-            outbuf.clear();
             encoder::encode_error(&mut outbuf, "ERR request too large");
             let _ = stream.write_all(&outbuf).await;
             warn!("request buffer overflow from {peer}");
@@ -335,53 +361,46 @@ pub fn execute_command(
         ProtocolVersion::Resp2 => encoder::encode_integer(out, v as i64),
         ProtocolVersion::Resp3 => encoder::encode_boolean(out, v),
     };
-    // Snapshot the command's RESP args *before* the consuming `match` (NLL
-    // lets a borrow precede the move), and time the whole dispatch. The
-    // snapshot is taken only when the slow-log is active, so a disabled log
-    // leaves the hot path allocation-free.
-    let slow_args = if engine.slowlog_active() {
-        Some(cmd.args())
-    } else {
-        None
-    };
     // SLOWLOG is a meta/observability command; it must not pollute its
     // own ring (a RESET would otherwise re-log itself and never clear).
-    let is_slowlog_meta = matches!(cmd, Command::SlowLog { .. } | Command::RewriteAof);
+    let is_slowlog_meta = matches!(&cmd, Command::SlowLog { .. } | Command::RewriteAof);
     engine
         .total_commands
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    // Broadcast to MONITOR clients — skip meta/observability commands
-    // that would create noise loops (SLOWLOG, MONITOR itself).
+    // Broadcast to MONITOR clients — skip meta/observability commands that
+    // would create noise loops (SLOWLOG, MONITOR itself), and skip the argv
+    // clone entirely when nobody is subscribed.
     let monitor_meta = matches!(
-        cmd,
+        &cmd,
         Command::SlowLog { .. } | Command::RewriteAof | Command::Monitor
     );
-    if !monitor_meta {
-        let args = cmd.args();
-        if !args.is_empty() {
-            engine.monitor_registry.send(MonitorMessage {
-                timestamp_ms: current_epoch_ms(),
-                peer: client.unwrap_or(SocketAddr::from(([0, 0, 0, 0], 0))),
-                args,
-            });
-        }
+    if !monitor_meta && engine.monitor_registry.has_subscribers() {
+        engine.monitor_registry.send(MonitorMessage {
+            timestamp_ms: current_epoch_ms(),
+            peer: client.unwrap_or(SocketAddr::from(([0, 0, 0, 0], 0))),
+            // `AUTH` secrets are masked; MONITOR must not leak the password.
+            args: cmd.args_redacted(),
+        });
     }
+    // Sample the slow-log switch *before* dispatch: a command that turns the
+    // log on must not be recorded by the very setting it installs.
+    let slowlog_armed = engine.slowlog_armed();
     let start = Instant::now();
-    match cmd {
-        Command::Set { key, value } => match engine.set(key, value) {
+    match &cmd {
+        Command::Set { key, value } => match engine.set(key.clone(), value.clone()) {
             Ok(_) => encoder::encode_simple_string(out, "OK"),
             Err(e) => write_ferrum_error(out, &e),
         },
-        Command::SetNx { key, value } => match engine.set_nx(key, value) {
+        Command::SetNx { key, value } => match engine.set_nx(key.clone(), value.clone()) {
             Ok(true) => enc_bool(out, true),
             Ok(false) => enc_bool(out, false),
             Err(e) => write_ferrum_error(out, &e),
         },
-        Command::MSet { pairs } => match engine.mset(pairs) {
+        Command::MSet { pairs } => match engine.mset(pairs.clone()) {
             Ok(()) => encoder::encode_simple_string(out, "OK"),
             Err(e) => write_ferrum_error(out, &e),
         },
-        Command::MGet { keys } => match engine.mget(&keys) {
+        Command::MGet { keys } => match engine.mget(keys) {
             Ok(values) => {
                 encoder::encode_array_header(out, values.len());
                 for value in values {
@@ -393,11 +412,11 @@ pub fn execute_command(
             }
             Err(e) => write_ferrum_error(out, &e),
         },
-        Command::IncrBy { key, delta } => match engine.incr_by(key, delta) {
+        Command::IncrBy { key, delta } => match engine.incr_by(key.clone(), *delta) {
             Ok(n) => encoder::encode_integer(out, n),
             Err(e) => write_ferrum_error(out, &e),
         },
-        Command::IncrByFloat { key, delta } => match engine.incr_by_float(key, delta) {
+        Command::IncrByFloat { key, delta } => match engine.incr_by_float(key.clone(), *delta) {
             // RESP2: bulk string (Redis-compatible). RESP3: native double.
             Ok(n) => match version {
                 ProtocolVersion::Resp2 => {
@@ -407,28 +426,28 @@ pub fn execute_command(
             },
             Err(e) => write_ferrum_error(out, &e),
         },
-        Command::Get { key } => match engine.get(&key) {
+        Command::Get { key } => match engine.get(key) {
             Ok(Some(v)) => encoder::encode_bulk_string(out, &v),
             Ok(None) => enc_null(out),
             Err(e) => write_ferrum_error(out, &e),
         },
-        Command::Del { keys } => match engine.del_many(&keys) {
+        Command::Del { keys } => match engine.del_many(keys) {
             Ok(n) => encoder::encode_integer(out, n as i64),
             Err(e) => write_ferrum_error(out, &e),
         },
-        Command::Exists { keys } => match engine.exists_many(&keys) {
+        Command::Exists { keys } => match engine.exists_many(keys) {
             Ok(n) => encoder::encode_integer(out, n as i64),
             Err(e) => write_ferrum_error(out, &e),
         },
         Command::Ping { msg } => match msg {
             None => encoder::encode_simple_string(out, "PONG"),
-            Some(m) => encoder::encode_bulk_string(out, &m),
+            Some(m) => encoder::encode_bulk_string(out, m),
         },
-        Command::Append { key, value } => match engine.append(key, value) {
+        Command::Append { key, value } => match engine.append(key.clone(), value.clone()) {
             Ok(n) => encoder::encode_integer(out, n as i64),
             Err(e) => write_ferrum_error(out, &e),
         },
-        Command::StrLen { key } => match engine.strlen(&key) {
+        Command::StrLen { key } => match engine.strlen(key) {
             Ok(n) => encoder::encode_integer(out, n as i64),
             Err(e) => write_ferrum_error(out, &e),
         },
@@ -441,36 +460,36 @@ pub fn execute_command(
             Err(e) => write_ferrum_error(out, &e),
         },
         Command::Expire { key, seconds } => {
-            let reply = expire_reply(engine, &key, checked_seconds_to_ms(seconds));
+            let reply = expire_reply(engine, key, checked_seconds_to_ms(*seconds));
             write_bool_integer(out, reply, version);
         }
         Command::PExpire { key, millis } => {
-            let reply = expire_reply(engine, &key, Some(millis));
+            let reply = expire_reply(engine, key, Some(*millis));
             write_bool_integer(out, reply, version);
         }
-        Command::PExpireAt { key, abs_epoch_ms } => match engine.expire_at_ms(&key, abs_epoch_ms) {
+        Command::PExpireAt { key, abs_epoch_ms } => match engine.expire_at_ms(key, *abs_epoch_ms) {
             Ok(true) => enc_bool(out, true),
             Ok(false) => enc_bool(out, false),
             Err(e) => write_ferrum_error(out, &e),
         },
-        Command::Persist { key } => match engine.persist(&key) {
+        Command::Persist { key } => match engine.persist(key) {
             Ok(true) => enc_bool(out, true),
             Ok(false) => enc_bool(out, false),
             Err(e) => write_ferrum_error(out, &e),
         },
-        Command::Ttl { key } => match engine.ttl_ms(&key) {
+        Command::Ttl { key } => match engine.ttl_ms(key) {
             Ok(TtlStatus::Missing) => encoder::encode_integer(out, -2),
             Ok(TtlStatus::NoExpire) => encoder::encode_integer(out, -1),
             Ok(TtlStatus::Millis(ms)) => encoder::encode_integer(out, (ms + 999) / 1000),
             Err(e) => write_ferrum_error(out, &e),
         },
-        Command::PTtl { key } => match engine.ttl_ms(&key) {
+        Command::PTtl { key } => match engine.ttl_ms(key) {
             Ok(TtlStatus::Missing) => encoder::encode_integer(out, -2),
             Ok(TtlStatus::NoExpire) => encoder::encode_integer(out, -1),
             Ok(TtlStatus::Millis(ms)) => encoder::encode_integer(out, ms),
             Err(e) => write_ferrum_error(out, &e),
         },
-        Command::MemoryUsage { key } => match engine.memory_usage(&key) {
+        Command::MemoryUsage { key } => match engine.memory_usage(key) {
             Ok(Some(bytes)) => encoder::encode_integer(out, bytes as i64),
             Ok(None) => enc_null(out),
             Err(e) => write_ferrum_error(out, &e),
@@ -556,14 +575,14 @@ pub fn execute_command(
             encoder::encode_error(out, "ERR internal: HELLO handled by connection layer");
         }
     }
-    // Slow-log: record the command only if it crossed the threshold. The
-    // snapshot is `None` (and no clock was read) when logging is disabled.
-    // SLOWLOG never observes itself.
-    if let Some(args) = slow_args
-        && !is_slowlog_meta
-    {
+    // Slow-log: serialise the argv only *after* the command ran and only when
+    // it actually crossed the threshold. `cmd` is still owned here because the
+    // dispatcher borrows it, so no snapshot is needed on the fast path.
+    if !is_slowlog_meta && slowlog_armed {
         let elapsed_us = start.elapsed().as_micros() as u64;
-        engine.maybe_push_slowlog(args, client, elapsed_us);
+        if engine.slowlog_would_log(elapsed_us) {
+            engine.maybe_push_slowlog(cmd.args_redacted(), client, elapsed_us);
+        }
     }
 }
 
@@ -687,6 +706,13 @@ fn render_info_sections(engine: &KvEngine, section: Option<&[u8]>) -> Vec<(&'sta
         out.push_str(&format!("maxmemory:{}\r\n", cfg.max_memory));
         out.push_str(&format!("maxmemory_policy:{}\r\n", cfg.policy.name()));
         out.push_str(&format!("maxmemory_samples:{}\r\n", cfg.samples));
+        // Bytes held by the SIEVE / AdaptiveClimb index. Not part of
+        // `used_memory` (which only accounts for the keyspace), but operators
+        // sizing a container need to see it.
+        out.push_str(&format!(
+            "used_memory_policy_indexes:{}\r\n",
+            engine.policy_index_memory()
+        ));
         // Surface the AHE controller state so operators can see the
         // self-tuning converge. Redis has no exact analogue; we keep the
         // `ahe_` prefix so tooling can filter it out easily.
@@ -708,6 +734,14 @@ fn render_info_sections(engine: &KvEngine, section: Option<&[u8]>) -> Vec<(&'sta
         out.push_str(&format!("keyspace_misses:{misses}\r\n"));
         out.push_str(&format!("evicted_keys:{}\r\n", engine.evicted_keys()));
         out.push_str(&format!("expired_keys:{}\r\n", engine.expired_keys()));
+        // Persistence failures are logged as warnings and do not fail the
+        // client command, so this counter is the only operator-visible signal
+        // that acknowledged writes are not reaching the disk.
+        out.push_str(&format!(
+            "aof_write_errors:{}\r\n",
+            engine.aof_write_errors()
+        ));
+        out.push_str(&format!("aof_fsyncs:{}\r\n", engine.aof_fsync_count()));
         out.push_str("\r\n");
         sections.push(("stats", out));
     }
@@ -743,9 +777,13 @@ fn config_get(engine: &KvEngine, pattern: &[u8], out: &mut Vec<u8>, version: Pro
         Ok(c) => c,
         Err(e) => return write_ferrum_error(out, &e),
     };
-    // The configured password (or empty when none is set), cloned
-    // once so the pairs array below can own its bytes.
-    let requirepass = engine.requirepass().unwrap_or_default().unwrap_or_default();
+    // Never echo the password itself: `CONFIG GET requirepass` used to return
+    // it in clear text to any authenticated client (and to the dashboard).
+    // A non-empty mask still lets tooling tell "set" from "not set".
+    let requirepass: Vec<u8> = match engine.requirepass() {
+        Ok(Some(_)) => b"(redacted)".to_vec(),
+        _ => Vec::new(),
+    };
     // (name, value) pairs in display order. Only the eviction-related
     // parameters and `requirepass` are exposed.
     let pairs: Vec<(&str, Vec<u8>)> = vec![
@@ -1022,6 +1060,7 @@ pub fn run_listener(
     shutdown: Shutdown,
     config: ServerConfig,
 ) -> Result<(), FerrumError> {
+    raise_listen_backlog(&listener);
     listener.set_nonblocking(true)?;
 
     let mut builder = Builder::new_multi_thread();
@@ -1044,6 +1083,33 @@ pub fn run_listener(
     // bounds the wait so a stuck task cannot block process exit indefinitely.
     runtime.shutdown_timeout(Duration::from_millis(500));
     result
+}
+
+/// Raises the kernel's accept queue for `listener`.
+///
+/// `std::net::TcpListener::bind` hardcodes a backlog of 128. When hundreds of
+/// clients connect simultaneously (a benchmark start, a reconnect storm, the
+/// concurrency smoke test) the queue overflows and the kernel resets otherwise
+/// valid connections — the client sees `ECONNRESET` on its first read even
+/// though the server never returned an error. Redis listens with 511.
+fn raise_listen_backlog(listener: &StdTcpListener) {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        // SAFETY: `listener` owns a valid, open socket for the duration of the
+        // call, and `listen(2)` only updates the backlog for that socket.
+        let rc = unsafe { libc::listen(listener.as_raw_fd(), 1024) };
+        if rc != 0 {
+            warn!(
+                "failed to raise listen backlog: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = listener;
+    }
 }
 
 /// Async accept loop running on the tokio runtime.

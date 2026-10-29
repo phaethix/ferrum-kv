@@ -20,7 +20,7 @@ RESP2-compatible KV store you can drive with `redis-cli`.
 
 It is **not** a Redis replacement. It is a research vehicle: every
 algorithm ships with reproducible benchmarks, every code path is
-commented, and the entire ~8,500-line codebase is designed to be read
+commented, and the entire ~12,000-line codebase is designed to be read
 in an afternoon.
 
 Three principles guide the project:
@@ -34,7 +34,7 @@ SIEVE-S, AdaptiveClimb, and 10 more policies ship alongside it, all
 benchmarked against the same workload suite.
 
 **📖 Readable end-to-end.**
-~8,500 lines of layered, well-commented Rust — no macro magic, no custom
+~12,000 lines of layered, well-commented Rust — no macro magic, no custom
 allocators. TCP → RESP2 parsing → engine → eviction → AOF → Tokio async:
 the whole pipeline is followable in an afternoon.
 
@@ -81,7 +81,9 @@ maxmemory:268435456
 ...
 ```
 
-Open **http://127.0.0.1:6381** for the built-in dashboard.
+Open **http://127.0.0.1:6381** for the built-in dashboard. It is bound to
+loopback by default and refuses a non-loopback address unless
+`--dashboard-token` is supplied.
 
 ## The Eviction Laboratory
 
@@ -206,6 +208,7 @@ everysec`), and the dashboard each run outside the main tokio runtime.
 | `--config PATH` | *(none)* | Load a config file |
 | `--addr HOST:PORT` | `127.0.0.1:6380` | RESP listening address |
 | `--dashboard-addr ADDR\|off` | `127.0.0.1:6381` | Web dashboard address, or `off` to disable |
+| `--dashboard-token SECRET` | *(none)* | Require this token on every `/api/*` dashboard request; mandatory for non-loopback binds |
 | `--aof-path PATH` | *(disabled)* | Enable AOF persistence |
 | `--appendfsync POLICY` | `everysec` | `always` / `everysec` / `no` |
 | `--client-timeout SECONDS` | `0` (disabled) | Per-connection idle timeout |

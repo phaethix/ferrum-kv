@@ -46,7 +46,8 @@ fn spawn_server_with_sweeper() -> ServerGuard {
             sweeper_shutdown.clone(),
             16,
             Duration::from_millis(10),
-        );
+        )
+        .expect("spawn expire sweeper");
         let _ = server::run_listener(listener, engine, sweeper_shutdown, ServerConfig::default());
         sweeper.shutdown();
     });

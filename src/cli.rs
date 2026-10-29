@@ -11,6 +11,7 @@
 //! supplied — loads the file and fills in any field `argv` left empty.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use ferrum_kv::config::{FileConfig, FileConfigError};
@@ -31,7 +32,7 @@ pub const USAGE: &str = concat!(
     "                 [--maxmemory BYTES] [--maxmemory-policy POLICY]\n",
     "                 [--maxmemory-samples N] [--io-threads N]\n",
     "                 [--requirepass PASSWORD]\n",
-    "                 [--dashboard-addr ADDR|off]\n",
+    "                 [--dashboard-addr ADDR|off] [--dashboard-token SECRET]\n",
     "                 [--loglevel off|error|warn|info|debug|trace]"
 );
 
@@ -81,6 +82,9 @@ pub struct CliArgs {
     /// `off` / `disabled` / `none` to turn it off. `None` means "use the
     /// built-in default" rather than "disabled".
     dashboard_addr: Option<String>,
+    /// Shared secret required on every `/api/*` dashboard request. Mandatory
+    /// when the dashboard binds a non-loopback address.
+    dashboard_token: Option<String>,
 }
 
 /// Raw, un-merged values taken verbatim from the command line.
@@ -107,6 +111,8 @@ struct RawFlags {
     /// Bind address for the built-in web dashboard. `None` means "use the
     /// default address"; the literals `off` / `disabled` / `none` disable it.
     dashboard_addr: Option<String>,
+    /// Shared secret for the dashboard HTTP API.
+    dashboard_token: Option<String>,
     /// Whether AOF was explicitly enabled via the config file's `appendonly yes`.
     /// CLI `--aof-path` implies enabled; this field only carries the file's
     /// intent so that a later merge step can decide.
@@ -196,6 +202,11 @@ impl CliArgs {
     pub fn requirepass(&self) -> Option<Vec<u8>> {
         self.requirepass.as_ref().map(|s| s.as_bytes().to_vec())
     }
+
+    /// Returns the dashboard API token, if one was configured.
+    pub fn dashboard_token(&self) -> Option<Arc<str>> {
+        self.dashboard_token.as_deref().map(Arc::from)
+    }
 }
 
 enum ScanOutcome {
@@ -284,6 +295,13 @@ fn scan_argv<I: IntoIterator<Item = String>>(args: I) -> Result<ScanOutcome, Str
                 let value = take_value(&mut iter, "--dashboard-addr")?;
                 raw.dashboard_addr = Some(value);
             }
+            "--dashboard-token" => {
+                let value = take_value(&mut iter, "--dashboard-token")?;
+                if value.is_empty() {
+                    return Err("--dashboard-token must not be empty".to_string());
+                }
+                raw.dashboard_token = Some(value);
+            }
             "-h" | "--help" => return Ok(ScanOutcome::Help),
             other => return Err(format!("unrecognised argument: '{other}'")),
         }
@@ -356,6 +374,9 @@ fn merge(raw: RawFlags, file: Option<&FileConfig>) -> Result<CliArgs, String> {
     let dashboard_addr = raw
         .dashboard_addr
         .or_else(|| file.and_then(|f| f.dashboard_addr.clone()));
+    let dashboard_token = raw
+        .dashboard_token
+        .or_else(|| file.and_then(|f| f.dashboard_token.clone()));
     // CLI wins for the password; the file's `requirepass` is the
     // fallback so operators can ship a config without a flag.
     let requirepass = raw
@@ -375,6 +396,7 @@ fn merge(raw: RawFlags, file: Option<&FileConfig>) -> Result<CliArgs, String> {
         requirepass,
         io_threads,
         dashboard_addr,
+        dashboard_token,
     })
 }
 

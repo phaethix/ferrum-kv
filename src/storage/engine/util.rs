@@ -104,11 +104,29 @@ pub(super) fn validate_value(value: &[u8]) -> Result<(), FerrumError> {
 ///
 /// The whitepaper (§7.2) specifies that persistence errors are best-effort:
 /// in-memory state is authoritative during runtime and a failed AOF append is
-/// reported but does not propagate to the client.
+/// reported but does not propagate to the client. Failures are additionally
+/// counted by the caller and surfaced as `INFO stats:aof_write_errors`, so a
+/// failing disk is visible to operators instead of only in the log.
 pub(super) fn log_aof_result(cmd: &str, result: Result<(), FerrumError>) {
     if let Err(e) = result {
         warn!("aof append for {cmd} failed: {e}");
     }
+}
+
+/// Compares two byte strings without early-exiting on the first mismatch.
+///
+/// Used for the `requirepass` check: a short-circuiting `==` leaks how many
+/// leading bytes were correct through timing. The length comparison is not
+/// secret (the configured password length is fixed), so it may exit early.
+pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 /// Builds the initial xorshift32 seed. Mixes the low 32 bits of the wall

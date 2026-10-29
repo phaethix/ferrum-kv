@@ -58,8 +58,9 @@ sequences must round-trip through network + AOF unchanged.
   it for operators, not for debugging.
 
 ### RESP2 / Redis compatibility
-- FerrumKV speaks RESP2 only. Inline commands are rejected (first byte must
-  be `*`).
+- FerrumKV defaults to RESP2 and supports RESP3 via `HELLO 3` (typed null /
+  boolean / double / map replies). Inline commands are rejected (first byte
+  must be `*`).
 - Redis is the reference semantics. When adding/changing a command, check
   Redis behavior first; deviations must be documented in README and have a
   test asserting the chosen behavior.
@@ -274,9 +275,10 @@ inaccuracy, record it as a new numbered issue before finishing. Mark
 ## Testing Conventions
 
 - Unit tests are inline `#[cfg(test)] mod tests` in each module.
-- Integration tests live in `tests/` (10 suites: aof, async, timeout,
-  concurrency, eviction, expire, kv_engine, max_clients, resp2_wire,
-  shutdown).
+- Integration tests live in `tests/` (15 suites: aof persistence, aof
+  rewrite, async concurrency, client timeout, concurrency stress, eviction,
+  expire, hello/RESP3, kv_engine, max clients, monitor, resp2 wire, resp3,
+  shutdown, slowlog).
 - Wire-protocol behavior is tested end-to-end in `tests/resp2_wire_test.rs`
   via a real TCP listener — prefer adding cases there over mocking.
 - Benches use Criterion; run `cargo bench --no-run` in CI, full bench locally.

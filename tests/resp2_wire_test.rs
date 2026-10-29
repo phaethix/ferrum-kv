@@ -726,20 +726,22 @@ fn auth_survives_across_pipelined_commands() {
 }
 
 #[test]
-fn config_get_requirepass_returns_set_password() {
+fn config_get_requirepass_is_redacted() {
     let server = spawn_server_with_requirepass(auth_password());
     let mut s = connect(&server.addr);
 
-    // The server requires auth, so AUTH first, then read the password back.
+    // The server requires auth, so AUTH first, then read the parameter back.
     round_trip(
         &mut s,
         &build_request(&[b"AUTH", auth_password()]),
         b"+OK\r\n",
     );
+    // `CONFIG GET requirepass` must never echo the secret: a non-empty mask
+    // still tells tooling that a password is configured.
     round_trip(
         &mut s,
         &build_request(&[b"CONFIG", b"GET", b"requirepass"]),
-        b"*2\r\n$11\r\nrequirepass\r\n$6\r\nsecret\r\n",
+        b"*2\r\n$11\r\nrequirepass\r\n$10\r\n(redacted)\r\n",
     );
 }
 
@@ -769,4 +771,29 @@ fn config_set_requirepass_enables_auth_mid_connection() {
     // Authenticate and confirm the gate opens for this connection.
     round_trip(&mut s, &build_request(&[b"AUTH", b"secret"]), b"+OK\r\n");
     round_trip(&mut s, &build_request(&[b"SET", b"k", b"v"]), b"+OK\r\n");
+}
+
+#[test]
+fn config_set_empty_requirepass_disables_auth() {
+    let server = spawn_server_with_requirepass(auth_password());
+    let mut s = connect(&server.addr);
+    round_trip(
+        &mut s,
+        &build_request(&[b"AUTH", auth_password()]),
+        b"+OK\r\n",
+    );
+
+    // Redis semantics: an empty password turns authentication off rather than
+    // configuring "the empty password".
+    round_trip(
+        &mut s,
+        &build_request(&[b"CONFIG", b"SET", b"requirepass", b""]),
+        b"+OK\r\n",
+    );
+    round_trip(&mut s, &build_request(&[b"PING"]), b"+PONG\r\n");
+    round_trip(
+        &mut s,
+        &build_request(&[b"AUTH", b"anything"]),
+        b"-ERR Client sent AUTH, but no password is set\r\n",
+    );
 }

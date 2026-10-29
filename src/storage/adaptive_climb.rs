@@ -31,7 +31,11 @@
 //! - On a **hit** we apply the promotion rule verbatim (decrement `jump`,
 //!   move the key up by `jump`).
 //! - On an **insert/miss** we apply the insertion rule: bump `jump`, then
-//!   splice the new key in `jump` positions from the LRU end.
+//!   splice the new key at index `len - jump`. Note that a *larger* `jump`
+//!   therefore means a *smaller* index, i.e. an insert closer to the MRU end
+//!   (the paper's 1-indexed `K - jump + 1`). Under a write-heavy workload
+//!   `jump` saturates at `len`, so new keys enter at the head and the eviction
+//!   victim is always the untouched tail.
 //! - On **eviction** the engine removes the LRU-end key (index `len - 1`),
 //!   exactly the paper's "evict position `K`".
 //!
@@ -84,9 +88,9 @@ impl AdaptiveClimbState {
         }
     }
 
-    /// Records a (re)insertion of `key`: splice it in `jump` positions from
-    /// the LRU end (the paper's miss rule), after bumping `jump`. An existing
-    /// key is removed first so an overwrite re-enters like a fresh miss.
+    /// Records a (re)insertion of `key`: bump `jump`, then splice the key in
+    /// at index `len - jump` (the paper's miss rule). An existing key is
+    /// removed first so an overwrite re-enters like a fresh miss.
     pub(crate) fn observe_insert(&mut self, key: &[u8]) {
         self.queue.shift_remove(key);
         self.clamp_jump();
@@ -105,6 +109,13 @@ impl AdaptiveClimbState {
 
     /// Records a hit on `key`: promote it up by `jump` (decrementing `jump`
     /// first), exactly the paper's hit rule.
+    ///
+    /// Uses [`IndexMap::move_index`] rather than `shift_remove_index` +
+    /// `insert_before`: both are O(n) in the index array, but the former does
+    /// a single rotation instead of two memmoves, halving the per-hit cost.
+    /// (AdaptiveClimb is inherently O(n) per hit while active; the engine only
+    /// maintains this structure when an AdaptiveClimb policy is selected, so
+    /// the other 14 policies pay nothing.)
     pub(crate) fn observe_access(&mut self, key: &[u8]) {
         let Some(p) = self.queue.get_index_of(key) else {
             return;
@@ -118,8 +129,7 @@ impl AdaptiveClimbState {
             // end and the items in between shift down by one.
             let target = p.saturating_sub(self.jump);
             if target < p {
-                let key_vec = self.queue.shift_remove_index(p).unwrap().0;
-                self.queue.insert_before(target, key_vec, ());
+                self.queue.move_index(p, target);
             }
         }
     }

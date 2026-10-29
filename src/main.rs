@@ -118,12 +118,21 @@ fn main() -> ExitCode {
         info!("io-threads: {}", server_config.worker_threads);
     }
 
-    let expire_handle = expire::spawn(engine.clone(), shutdown.clone());
+    // A failure to start the sweeper is not fatal: TTLs are still enforced
+    // lazily on access, so log it and continue.
+    let expire_handle = match expire::spawn(engine.clone(), shutdown.clone()) {
+        Ok(handle) => Some(handle),
+        Err(e) => {
+            error!("failed to start expire sweeper: {e}");
+            None
+        }
+    };
 
     // Start the built-in web dashboard on its own thread/runtime, if enabled.
     if let Some(dashboard_addr) = args.dashboard_addr() {
         let dash_engine = engine.clone();
         let dash_shutdown = shutdown.clone();
+        let dash_token = args.dashboard_token();
         if let Err(e) = thread::Builder::new()
             .name("ferrum-dashboard".into())
             .spawn(move || {
@@ -131,6 +140,7 @@ fn main() -> ExitCode {
                     &dashboard_addr,
                     dash_engine,
                     dash_shutdown,
+                    dash_token,
                 ) {
                     error!("dashboard error: {e}");
                 }
@@ -142,7 +152,9 @@ fn main() -> ExitCode {
 
     let server_result =
         ferrum_kv::network::server::run_listener(listener, engine, shutdown, server_config);
-    expire_handle.shutdown();
+    if let Some(handle) = expire_handle {
+        handle.shutdown();
+    }
 
     if let Err(e) = server_result {
         error!("server error: {e}");

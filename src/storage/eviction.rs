@@ -139,6 +139,24 @@ impl EvictionPolicy {
             Self::AllKeysAdaptiveClimb | Self::VolatileAdaptiveClimb
         )
     }
+
+    /// Which stateful index (if any) the engine must keep in sync for this
+    /// policy, encoded as a [`crate::storage::engine::index_kind`] constant.
+    ///
+    /// The engine consults this on the hot path so a policy that does not use
+    /// SIEVE or AdaptiveClimb pays nothing for their bookkeeping.
+    pub(crate) fn index_kind(self) -> u8 {
+        use crate::storage::engine::index_kind as k;
+        match self {
+            Self::AllKeysSieve => k::SIEVE_ALL,
+            Self::VolatileSieve => k::SIEVE_VOLATILE,
+            Self::AllKeysSieveS => k::SIEVE_S_ALL,
+            Self::VolatileSieveS => k::SIEVE_S_VOLATILE,
+            Self::AllKeysAdaptiveClimb => k::AC_ALL,
+            Self::VolatileAdaptiveClimb => k::AC_VOLATILE,
+            _ => k::NONE,
+        }
+    }
 }
 
 /// Which subset of the keyspace is eligible for eviction under a policy.
@@ -399,6 +417,15 @@ pub struct AdaptiveHybridState {
     pub window_size: u64,
     /// Samples accumulated in the current window.
     pub window_count: u64,
+    /// Cumulative hit counter at the last window boundary. The controller
+    /// works on *deltas*: feeding it the lifetime totals (as it used to) made
+    /// the ratio converge to a constant, so after warm-up the gradient signal
+    /// fell below the regression threshold and `alpha` stopped adapting.
+    pub last_hits: u64,
+    /// Cumulative miss counter at the last window boundary.
+    pub last_misses: u64,
+    /// `false` until the first sample establishes the baseline counters.
+    pub primed: bool,
 }
 
 impl Default for AdaptiveHybridState {
@@ -410,26 +437,51 @@ impl Default for AdaptiveHybridState {
             last_hit_ratio: 0.0,
             window_size: 64,
             window_count: 0,
+            last_hits: 0,
+            last_misses: 0,
+            primed: false,
         }
     }
 }
 
 impl AdaptiveHybridState {
-    /// Feeds one eviction sample `(hits, misses)` into the controller.
+    /// Feeds a `(hits, misses)` snapshot into the controller.
+    ///
+    /// The arguments are the engine's **cumulative** counters; the controller
+    /// converts them to window deltas internally. The first sample only
+    /// establishes the baseline.
     ///
     /// Returns `true` when the window completed and `alpha` was adjusted,
     /// `false` otherwise. Callers typically ignore the return value; it
     /// exists so tests can assert that adjustments fire.
     pub fn observe(&mut self, hits: u64, misses: u64) -> bool {
+        if !self.primed {
+            self.primed = true;
+            self.last_hits = hits;
+            self.last_misses = misses;
+            // Seed the comparison baseline with the ratio observed so far, so
+            // the *first* completed window is judged against something.
+            let total = hits + misses;
+            if total > 0 {
+                self.last_hit_ratio = hits as f32 / total as f32;
+            }
+            return false;
+        }
         self.window_count += 1;
         if self.window_count < self.window_size {
             return false;
         }
-        let total = hits + misses;
+        // Window-local counters: a regression must be measured against the
+        // previous window, not against the lifetime average.
+        let delta_hits = hits.saturating_sub(self.last_hits);
+        let delta_misses = misses.saturating_sub(self.last_misses);
+        self.last_hits = hits;
+        self.last_misses = misses;
+        let total = delta_hits + delta_misses;
         let ratio = if total == 0 {
             self.last_hit_ratio
         } else {
-            hits as f32 / total as f32
+            delta_hits as f32 / total as f32
         };
         if ratio + 1e-4 < self.last_hit_ratio {
             // Regressed — flip direction.

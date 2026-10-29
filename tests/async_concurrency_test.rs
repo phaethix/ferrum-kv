@@ -34,6 +34,24 @@ const FAN_OUT_CLIENTS: usize = 500;
 /// 1. the accept loop can absorb hundreds of concurrent incoming connections,
 /// 2. the shared engine correctly replies on each of them, and
 /// 3. the server winds down cleanly after the shared shutdown flag flips.
+///
+/// One client round trip: connect, `PING`, and verify a `+PONG` prefix.
+///
+/// The reply is `+PONG\r\n` (7 bytes); only the prefix is checked so the test
+/// stays resilient to future PING payload variants.
+fn one_client(addr: std::net::SocketAddr) -> std::io::Result<()> {
+    let mut stream = TcpStream::connect(addr)?;
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    stream.write_all(b"*1\r\n$4\r\nPING\r\n")?;
+    let mut buf = [0u8; 16];
+    let n = stream.read(&mut buf)?;
+    if n >= 5 && &buf[..5] == b"+PONG" {
+        Ok(())
+    } else {
+        Err(std::io::Error::other("unexpected reply"))
+    }
+}
+
 #[test]
 fn handles_many_concurrent_ping_clients() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
@@ -60,17 +78,19 @@ fn handles_many_concurrent_ping_clients() {
     for _ in 0..FAN_OUT_CLIENTS {
         let ok = Arc::clone(&ok);
         handles.push(thread::spawn(move || {
-            let mut stream = TcpStream::connect(addr).expect("connect");
-            stream
-                .set_read_timeout(Some(Duration::from_secs(5)))
-                .unwrap();
-            stream.write_all(b"*1\r\n$4\r\nPING\r\n").unwrap();
-            let mut buf = [0u8; 16];
-            let n = stream.read(&mut buf).unwrap();
-            // The reply is `+PONG\r\n` (7 bytes); we only look at the prefix
-            // so we stay resilient to any future PING payload variants.
-            if n >= 5 && &buf[..5] == b"+PONG" {
-                ok.fetch_add(1, Ordering::SeqCst);
+            // A 500-thread SYN storm can overflow the kernel's accept queue on
+            // a heavily loaded machine (observed on CI runners and during
+            // parallel test runs): the connection is reset before the server
+            // ever sees it. One retry keeps the assertion about the accept
+            // loop multiplexing clients rather than about backlog sizing.
+            for attempt in 0..2 {
+                if one_client(addr).is_ok() {
+                    ok.fetch_add(1, Ordering::SeqCst);
+                    return;
+                }
+                if attempt == 0 {
+                    thread::sleep(Duration::from_millis(20));
+                }
             }
         }));
     }

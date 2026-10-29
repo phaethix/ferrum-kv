@@ -325,6 +325,10 @@
 
 <script>
   const state = { filter: "*", offset: 0, limit: 50, total: 0, currentKey: null, mode: "view" };
+  // Base64 of the currently displayed value when it is not valid UTF-8.
+  // Kept so a TTL-only edit round-trips the bytes unchanged.
+  let binaryValue = null;
+  const TOKEN_KEY = "ferrum.dashboard.token";
   const $ = (id) => document.getElementById(id);
 
   // Theme toggle (persisted in localStorage)
@@ -432,9 +436,27 @@
     ).join("");
   }
 
+  function withToken(headers) {
+    const token = localStorage.getItem(TOKEN_KEY);
+    const h = Object.assign({}, headers || {});
+    if (token) h["X-Ferrum-Token"] = token;
+    return h;
+  }
+
   async function api(path, opts) {
+    opts = Object.assign({}, opts || {});
+    opts.headers = withToken(opts.headers);
     try {
-      const resp = await fetch(path, opts);
+      let resp = await fetch(path, opts);
+      if (resp.status === 401) {
+        // The server was started with --dashboard-token: ask once, remember it.
+        const entered = prompt("Dashboard token required:");
+        if (entered) {
+          localStorage.setItem(TOKEN_KEY, entered);
+          opts.headers = withToken(opts.headers);
+          resp = await fetch(path, opts);
+        }
+      }
       let data = null;
       const text = await resp.text();
       try { data = JSON.parse(text); } catch { data = { error: text }; }
@@ -475,6 +497,9 @@
     const list = $("key-list");
     list.innerHTML = "";
     (data.keys || []).forEach(k => {
+      // Keys that are not valid UTF-8 cannot be addressed through a URL, so
+      // they are listed as read-only rather than being silently mangled.
+      if (k.binary_key) return;
       const li = document.createElement("li");
       li.dataset.key = k.key;
       const ttlCls = k.ttl_ms >= 0 ? "ttl live" : "ttl";
@@ -496,6 +521,7 @@
   function renderOverview(keys) {
     const ns = {};
     keys.forEach(k => {
+      if (!k.key) return;
       const p = k.key.indexOf(":") >= 0 ? k.key.split(":")[0] : "(root)";
       ns[p] = (ns[p] || 0) + 1;
     });
@@ -523,8 +549,15 @@
     $("detail-key").value = data.key;
     $("detail-key").readOnly = true;
     $("detail-ttl").value = data.ttl_ms >= 0 ? Math.round(data.ttl_ms / 1000) : 0;
-    $("detail-value").value = data.value ?? "";
-    $("detail-msg").textContent = "";
+    binaryValue = data.binary ? (data.value_b64 || "") : null;
+    $("detail-value").value = data.binary ? "" : (data.value ?? "");
+    $("detail-value").readOnly = !!data.binary;
+    $("detail-value").placeholder = data.binary
+      ? "(binary value, " + (data.bytes || 0) + " bytes — editing disabled)"
+      : "";
+    $("detail-msg").textContent = data.binary
+      ? "binary value: shown read-only, saving keeps the bytes unchanged"
+      : "";
     document.querySelectorAll(".key-list li").forEach(li =>
       li.classList.toggle("active", li.dataset.key === key));
   }
@@ -538,6 +571,9 @@
     $("detail-key").readOnly = false;
     $("detail-ttl").value = 0;
     $("detail-value").value = "";
+    $("detail-value").readOnly = false;
+    $("detail-value").placeholder = "";
+    binaryValue = null;
     $("detail-msg").textContent = "";
     $("detail-key").focus();
   }
@@ -547,7 +583,11 @@
     const value = $("detail-value").value;
     const ttl = $("detail-ttl").value || 0;
     if (!key) { $("detail-msg").textContent = "key required"; $("detail-msg").style.color = "var(--red)"; return; }
-    const body = new URLSearchParams({ value, ttl });
+    const body = new URLSearchParams({ ttl });
+    // Binary values are never re-encoded from the textarea: send the original
+    // base64 so a TTL-only edit cannot corrupt the payload.
+    if (binaryValue !== null) body.set("value_b64", binaryValue);
+    else body.set("value", value);
     let res;
     if (state.mode === "create") {
       body.set("key", key);

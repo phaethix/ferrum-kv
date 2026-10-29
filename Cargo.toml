@@ -5,6 +5,9 @@ edition = "2024"
 
 [dependencies]
 signal-hook = "0.4.4"
+# Used only to raise the TCP listen backlog: `std::net::TcpListener` hardcodes
+# 128, which drops connections when hundreds of clients connect at once.
+libc = "0.2"
 log = "0.4"
 env_logger = "0.11"
 indexmap = "2"

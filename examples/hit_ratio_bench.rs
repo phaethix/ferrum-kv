@@ -33,11 +33,11 @@ use std::process::{Child, Command, Stdio};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
-/// Default per-entry footprint. Keys are formatted `k{id:08}` (9 bytes);
-/// `PER_ENTRY_OVERHEAD` in the engine is 48. Keep this in sync with
-/// `src/storage/engine/mod.rs::PER_ENTRY_OVERHEAD`.
+/// Default per-entry footprint. Keys are formatted `k{id:08}` (9 bytes) and
+/// the engine's own `PER_ENTRY_OVERHEAD` is added, so this stays in sync with
+/// `src/storage/engine/mod.rs` automatically.
 fn bytes_per_entry(value_size: usize) -> u64 {
-    (9 + value_size + 48) as u64
+    9 + value_size as u64 + ferrum_kv::storage::engine::PER_ENTRY_OVERHEAD
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

@@ -4,6 +4,10 @@
 //! receives every command the server processes via unbounded mpsc channels.
 //! The sending side is non-blocking so monitored connections never slow down
 //! normal command execution.
+//!
+//! Broadcasts are gated on [`MonitorRegistry::has_subscribers`]: the command
+//! hot path used to clone the full argv (including multi-megabyte values) for
+//! every command even when nobody was listening.
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -22,8 +26,9 @@ pub(crate) struct MonitorMessage {
 
 /// Thread-safe registry of active MONITOR clients.
 ///
-/// Shared via `Arc` so it can be stored on [`KvEngine`] (and thus
-/// automatically cloned into every connection task via `engine.clone()`).
+/// Shared via `Arc` so it can be stored on [`crate::storage::engine::KvEngine`]
+/// (and thus automatically cloned into every connection task via
+/// `engine.clone()`).
 #[derive(Clone, Default)]
 pub(crate) struct MonitorRegistry {
     senders: Arc<Mutex<Vec<UnboundedSender<MonitorMessage>>>>,
@@ -35,14 +40,27 @@ impl MonitorRegistry {
     /// when the receiver is dropped.
     pub(crate) fn subscribe(&self) -> UnboundedReceiver<MonitorMessage> {
         let (tx, rx) = mpsc::unbounded_channel();
-        self.senders.lock().unwrap().push(tx);
+        if let Ok(mut guard) = self.senders.lock() {
+            guard.push(tx);
+        }
         rx
+    }
+
+    /// `true` when at least one client is monitoring. Lets the hot path skip
+    /// building a [`MonitorMessage`] entirely.
+    #[inline]
+    pub(crate) fn has_subscribers(&self) -> bool {
+        // A poisoned lock means a monitor connection panicked; treat it as
+        // "nobody is listening" rather than panicking the data path.
+        self.senders.lock().map(|g| !g.is_empty()).unwrap_or(false)
     }
 
     /// Sends a command snapshot to every active MONITOR client.
     /// Dead senders (disconnected clients) are lazily purged.
     pub(crate) fn send(&self, msg: MonitorMessage) {
-        let mut guard = self.senders.lock().unwrap();
+        let Ok(mut guard) = self.senders.lock() else {
+            return;
+        };
         guard.retain(|tx| tx.send(msg.clone()).is_ok());
     }
 }

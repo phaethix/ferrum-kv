@@ -15,6 +15,7 @@ use std::time::Duration;
 
 use log::{debug, warn};
 
+use crate::error::FerrumError;
 use crate::network::shutdown::Shutdown;
 use crate::storage::engine::KvEngine;
 
@@ -31,7 +32,7 @@ pub const DEFAULT_INTERVAL: Duration = Duration::from_millis(100);
 /// the shared [`Shutdown`] flag flips, so callers that forward the server's
 /// shutdown signal do not need to call the handle explicitly — dropping it
 /// will still join the thread.
-pub fn spawn(engine: KvEngine, shutdown: Shutdown) -> ExpireSweeperHandle {
+pub fn spawn(engine: KvEngine, shutdown: Shutdown) -> Result<ExpireSweeperHandle, FerrumError> {
     spawn_with(engine, shutdown, DEFAULT_SAMPLE, DEFAULT_INTERVAL)
 }
 
@@ -41,20 +42,22 @@ pub fn spawn_with(
     shutdown: Shutdown,
     sample: usize,
     interval: Duration,
-) -> ExpireSweeperHandle {
+) -> Result<ExpireSweeperHandle, FerrumError> {
     let wait = Arc::new(SleepWaker::default());
     let wait_clone = Arc::clone(&wait);
     let shutdown_clone = shutdown.clone();
 
+    // Propagate spawn failure instead of panicking: a server that cannot
+    // start the sweeper can still run with lazy expiry only.
     let handle = thread::Builder::new()
         .name("ferrum-expire".into())
         .spawn(move || run(engine, shutdown_clone, sample, interval, wait_clone))
-        .expect("failed to spawn ferrum-expire thread");
+        .map_err(|e| FerrumError::Internal(format!("failed to spawn expire sweeper: {e}")))?;
 
-    ExpireSweeperHandle {
+    Ok(ExpireSweeperHandle {
         handle: Some(handle),
         wait,
-    }
+    })
 }
 
 /// Joins the sweeper thread on drop, surfacing any thread panic as a warning.
@@ -164,7 +167,8 @@ mod tests {
             shutdown.clone(),
             8,
             Duration::from_millis(5),
-        );
+        )
+        .expect("spawn sweeper");
 
         let deadline = Instant::now() + Duration::from_millis(500);
         while Instant::now() < deadline {
@@ -186,7 +190,8 @@ mod tests {
     fn sweeper_honours_shutdown_flag() {
         let engine = KvEngine::new();
         let shutdown = Shutdown::new();
-        let handle = spawn_with(engine, shutdown.clone(), 8, Duration::from_millis(50));
+        let handle =
+            spawn_with(engine, shutdown.clone(), 8, Duration::from_millis(50)).expect("spawn");
         shutdown.trigger();
         handle.shutdown();
         // Absence of a hang here is the assertion.

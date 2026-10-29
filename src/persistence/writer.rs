@@ -11,7 +11,7 @@
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -33,6 +33,25 @@ const DEFAULT_DELTA_CAP: usize = 64 * 1024 * 1024;
 /// Writes mutating commands to the AOF log with a configurable fsync policy.
 pub struct AofWriter {
     inner: Arc<Mutex<BufWriter<File>>>,
+    /// Duplicate handle used for the durability barrier.
+    ///
+    /// `sync_data` can take milliseconds; running it while holding `inner`
+    /// (which every writer needs) would serialise the whole server behind the
+    /// disk. The dup shares the same file description, so syncing it flushes
+    /// whatever `inner` has already written.
+    sync_file: Mutex<File>,
+    /// Number of buffered-and-flushed append batches (`always` only).
+    ///
+    /// Together with [`Self::synced`] this implements group commit: a caller
+    /// records the sequence its own bytes produced and only returns once a
+    /// fsync that started *after* that flush has completed.
+    seq: AtomicU64,
+    /// Highest [`Self::seq`] covered by a completed fsync.
+    synced: AtomicU64,
+    /// Number of fsync calls actually issued (observability for group commit).
+    fsyncs: AtomicU64,
+    /// Serialises fsync calls so concurrent writers coalesce into one barrier.
+    sync_lock: Mutex<()>,
     policy: FsyncPolicy,
     flusher: Option<BackgroundFlusher>,
     /// On-disk path of the AOF, retained so a rewrite can reopen the handle
@@ -62,17 +81,25 @@ impl AofWriter {
             .open(config.path())
             .map_err(|e| persistence_error(config.path(), "open", &e))?;
 
+        let sync_file = file
+            .try_clone()
+            .map_err(|e| persistence_error(config.path(), "clone", &e))?;
         let inner = Arc::new(Mutex::new(BufWriter::new(file)));
         let flusher = match config.fsync {
             FsyncPolicy::EverySec => Some(BackgroundFlusher::spawn(
                 Arc::clone(&inner),
                 Duration::from_secs(1),
-            )),
+            )?),
             FsyncPolicy::Always | FsyncPolicy::No => None,
         };
 
         Ok(Self {
             inner,
+            sync_file: Mutex::new(sync_file),
+            seq: AtomicU64::new(0),
+            synced: AtomicU64::new(0),
+            fsyncs: AtomicU64::new(0),
+            sync_lock: Mutex::new(()),
             policy: config.fsync,
             flusher,
             path: config.path().to_path_buf(),
@@ -161,13 +188,16 @@ impl AofWriter {
 
         match self.policy {
             FsyncPolicy::Always => {
+                // Push the bytes to the OS here (cheap) but leave the fsync to
+                // `sync_if_needed`, which the engine runs *after* releasing the
+                // keyspace lock. Fsyncing under that lock serialised every
+                // client behind one disk round-trip.
                 guard
                     .flush()
                     .map_err(|e| FerrumError::PersistenceError(format!("aof flush failed: {e}")))?;
-                guard
-                    .get_ref()
-                    .sync_data()
-                    .map_err(|e| FerrumError::PersistenceError(format!("aof fsync failed: {e}")))?;
+                // Publish the sequence *after* the flush so a fsync that starts
+                // later is guaranteed to cover these bytes.
+                self.seq.fetch_add(1, Ordering::Release);
             }
             FsyncPolicy::EverySec | FsyncPolicy::No => {
                 // EverySec delegates durability to the background flusher;
@@ -195,13 +225,83 @@ impl AofWriter {
         Ok(())
     }
 
+    /// Runs the `appendfsync always` durability barrier.
+    ///
+    /// The engine calls this after releasing the keyspace lock, so a slow disk
+    /// no longer blocks every other client. Concurrent writers coalesce: a
+    /// caller records the sequence produced by its own flush and returns only
+    /// after an fsync that started later has completed, so one barrier covers
+    /// every write that landed before it.
+    pub fn sync_if_needed(&self) -> Result<(), FerrumError> {
+        if self.policy != FsyncPolicy::Always {
+            return Ok(());
+        }
+        // Everything flushed so far — including this caller's batch.
+        let target = self.seq.load(Ordering::Acquire);
+        if self.synced.load(Ordering::Acquire) >= target {
+            return Ok(());
+        }
+        // Group commit: one fsync per batch of concurrent writers. The kernel
+        // serialises fsync on a single inode anyway, so letting every caller
+        // issue its own barrier just multiplies the wait.
+        let _gate = self.sync_lock.lock()?;
+        // Everything that was flushed before this barrier starts will be
+        // covered by it. Recording `covered` (not just our own `target`) is
+        // what lets one fsync satisfy every writer that queued behind it.
+        let covered = self.seq.load(Ordering::Acquire);
+        if self.synced.load(Ordering::Acquire) >= covered {
+            // Another barrier already covered every flushed batch.
+            return Ok(());
+        }
+        let flushed = {
+            let mut guard = self.inner.lock()?;
+            guard
+                .flush()
+                .map_err(|e| FerrumError::PersistenceError(format!("aof flush failed: {e}")))
+        };
+        let result = match flushed {
+            Ok(()) => self
+                .sync_file
+                .lock()?
+                .sync_data()
+                .map_err(|e| FerrumError::PersistenceError(format!("aof fsync failed: {e}"))),
+            Err(e) => Err(e),
+        };
+        if result.is_ok() {
+            // Never move `synced` backwards: a concurrent barrier may already
+            // have covered a later sequence.
+            self.synced.fetch_max(covered, Ordering::Release);
+            self.fsyncs.fetch_add(1, Ordering::Relaxed);
+        }
+        result
+    }
+
     /// Marks a rewrite as started: clears the delta buffer and flips the
     /// `rewriting` flag so subsequent `append_*` calls buffer into `delta`.
+    ///
+    /// Test-only helper; production code claims the slot atomically with
+    /// [`Self::try_begin_rewrite`] before spawning the worker thread.
+    #[cfg(test)]
     pub fn begin_rewrite(&self) {
         if let Ok(mut d) = self.delta.lock() {
             d.clear();
         }
         self.rewriting.store(true, Ordering::SeqCst);
+    }
+
+    /// Atomically claims the rewrite slot.
+    ///
+    /// Returns `false` when a rewrite is already in flight. Doing this before
+    /// spawning the worker closes the race that allowed two concurrent
+    /// `BGREWRITEAOF` calls to write the same temp file.
+    ///
+    /// The delta buffer is intentionally *not* cleared here: it can only be
+    /// non-empty while a rewrite is in flight, and clearing it after
+    /// publishing the flag could drop a write that arrived in between.
+    pub fn try_begin_rewrite(&self) -> bool {
+        self.rewriting
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
     }
 
     /// Aborts an in-flight rewrite: drops the buffered delta and clears the
@@ -211,6 +311,11 @@ impl AofWriter {
             d.clear();
         }
         self.rewriting.store(false, Ordering::SeqCst);
+    }
+
+    /// Number of fsync barriers issued so far (group-commit observability).
+    pub fn fsync_count(&self) -> u64 {
+        self.fsyncs.load(Ordering::Relaxed)
     }
 
     /// True when a rewrite is currently capturing the keyspace.
@@ -256,9 +361,19 @@ impl AofWriter {
             .append(true)
             .open(&self.path)
             .map_err(|e| FerrumError::PersistenceError(format!("aof reopen failed: {e}")))?;
+        // The durability barrier must sync the *new* file from now on.
+        let new_sync = file
+            .try_clone()
+            .map_err(|e| FerrumError::PersistenceError(format!("aof reopen failed: {e}")))?;
         // The background flusher keeps working because it shares this same
         // `Arc<Mutex<BufWriter<File>>>`.
         let _old = std::mem::replace(&mut *inner, BufWriter::new(file));
+        if let Ok(mut handle) = self.sync_file.lock() {
+            *handle = new_sync;
+        }
+        // The compact snapshot was fsync'd before the rename.
+        self.seq.store(0, Ordering::Release);
+        self.synced.store(0, Ordering::Release);
 
         // Replay buffered in-flight writes onto the compact snapshot.
         let mut delta_guard = self.delta.lock()?;
@@ -312,7 +427,7 @@ struct FlusherShared {
 }
 
 impl BackgroundFlusher {
-    fn spawn(inner: Arc<Mutex<BufWriter<File>>>, interval: Duration) -> Self {
+    fn spawn(inner: Arc<Mutex<BufWriter<File>>>, interval: Duration) -> Result<Self, FerrumError> {
         let shared = Arc::new(FlusherShared {
             stop: AtomicBool::new(false),
             cvar: Condvar::new(),
@@ -323,12 +438,14 @@ impl BackgroundFlusher {
         let handle = thread::Builder::new()
             .name("ferrum-aof-fsync".into())
             .spawn(move || run(inner, thread_shared, interval))
-            .expect("failed to spawn aof fsync thread");
+            .map_err(|e| {
+                FerrumError::PersistenceError(format!("failed to spawn aof fsync thread: {e}"))
+            })?;
 
-        Self {
+        Ok(Self {
             shared,
             handle: Some(handle),
-        }
+        })
     }
 
     fn shutdown(mut self) {

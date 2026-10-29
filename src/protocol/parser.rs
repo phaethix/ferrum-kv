@@ -88,6 +88,18 @@ pub enum Command {
 }
 
 impl Command {
+    /// Like [`Self::args`] but masks credentials.
+    ///
+    /// `MONITOR` and `SLOWLOG` both surface the argv to operators, and both
+    /// used to include the `AUTH` password in clear text. Redis redacts
+    /// sensitive commands in these outputs; we do the same.
+    pub(crate) fn args_redacted(&self) -> Vec<Vec<u8>> {
+        match self {
+            Command::Auth { .. } => vec![b"AUTH".to_vec(), b"***".to_vec()],
+            _ => self.args(),
+        }
+    }
+
     /// Reconstructs the RESP argument vector (`*N\r\n$..\r\n..`) for this
     /// command.
     ///

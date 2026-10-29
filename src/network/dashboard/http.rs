@@ -27,11 +27,22 @@ const INDEX_HTML: &str = include_str!("index.html");
 /// Default page size for the key browser.
 const KEYS_PER_PAGE: usize = 50;
 
-/// A parsed HTTP request (method, path, query string and body).
+/// Maximum accepted HTTP header block (bytes).
+const MAX_HEADER_BYTES: usize = 64 * 1024;
+
+/// Maximum accepted request body (bytes). A KV edit form never needs more.
+const MAX_BODY_BYTES: usize = 1024 * 1024;
+
+/// Per-read timeout for dashboard connections, so a slowloris client cannot
+/// hold a file descriptor indefinitely.
+const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// A parsed HTTP request (method, path, query string, headers and body).
 struct Request {
     method: String,
     path: String,
     query: String,
+    headers: HashMap<String, String>,
     body: Vec<u8>,
 }
 
@@ -73,11 +84,71 @@ fn status_text(status: u16) -> &'static str {
         200 => "OK",
         204 => "No Content",
         400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        408 => "Request Timeout",
+        413 => "Payload Too Large",
         500 => "Internal Server Error",
         _ => "Unknown",
     }
+}
+
+/// Enforces dashboard access control.
+///
+/// * With `--dashboard-token` configured, every `/api/*` request must present
+///   `X-Ferrum-Token: <token>` (or `Authorization: Bearer <token>`). `/`
+///   stays open so the page can prompt for the token.
+/// * Without a token the dashboard is only reachable from loopback (enforced
+///   when the listener is bound) and cross-origin mutating requests are
+///   rejected, which blocks drive-by CSRF against `127.0.0.1:6381`.
+///
+/// Returns `Some(response)` when the request must be refused.
+fn authorize(req: &Request, token: Option<&str>) -> Option<Response> {
+    if let Some(expected) = token {
+        if req.path == "/" {
+            return None;
+        }
+        let provided = req
+            .headers
+            .get("x-ferrum-token")
+            .map(String::as_bytes)
+            .or_else(|| {
+                req.headers
+                    .get("authorization")
+                    .and_then(|v| v.strip_prefix("Bearer "))
+                    .map(str::as_bytes)
+            });
+        return match provided {
+            Some(p) if crate::storage::engine::util::constant_time_eq(p, expected.as_bytes()) => {
+                None
+            }
+            _ => Some(json_error(401, "missing or invalid dashboard token")),
+        };
+    }
+
+    // No token: reject cross-origin state changes. Browsers always attach
+    // `Origin` to cross-origin fetch/XHR requests, so a mismatching (or
+    // opaque) origin means the request did not come from our own page.
+    if matches!(req.method.as_str(), "POST" | "PUT" | "DELETE" | "PATCH")
+        && let Some(origin) = req.headers.get("origin")
+    {
+        let host = req.headers.get("host").map(String::as_str).unwrap_or("");
+        if origin_host(origin) != Some(host) {
+            return Some(json_error(403, "cross-origin request rejected"));
+        }
+    }
+    None
+}
+
+/// Extracts `host[:port]` from an `Origin` header value.
+fn origin_host(origin: &str) -> Option<&str> {
+    let rest = origin
+        .strip_prefix("http://")
+        .or_else(|| origin.strip_prefix("https://"))?;
+    let host = rest.split('/').next()?;
+    if host.is_empty() { None } else { Some(host) }
 }
 
 /// Routes a parsed request to a response. This is the entire dashboard logic
@@ -174,19 +245,27 @@ fn keys_json(engine: &KvEngine, query: &str) -> String {
     let all = engine.scan_keys(filter.as_bytes()).unwrap_or_default();
     let total = all.len();
     let slice_start = offset.min(total);
-    let slice_end = (offset + limit).min(total);
+    let slice_end = offset.saturating_add(limit).min(total);
 
     let mut items = String::new();
     for key in &all[slice_start..slice_end] {
-        let key_str = String::from_utf8_lossy(key);
         let ttl = match engine.ttl_ms(key) {
             Ok(TtlStatus::NoExpire) => -1i64,
             Ok(TtlStatus::Millis(ms)) => ms,
             _ => -1,
         };
+        // `String::from_utf8_lossy` replaces invalid bytes with U+FFFD, so a
+        // lossy key could not be addressed again. Emit a lossless base64 form
+        // (and mark it read-only in the UI) instead of silently corrupting it.
+        let (key_field, binary_key) = match std::str::from_utf8(key) {
+            Ok(text) => (json_string(text), false),
+            Err(_) => ("null".to_string(), true),
+        };
         items.push_str(&format!(
-            "{{\"key\":{},\"type\":\"string\",\"ttl_ms\":{}}},",
-            json_string(&key_str),
+            "{{\"key\":{},\"key_b64\":{},\"binary_key\":{},\"type\":\"string\",\"ttl_ms\":{}}},",
+            key_field,
+            json_string(&base64_encode(key)),
+            binary_key,
             ttl
         ));
     }
@@ -203,17 +282,29 @@ fn keys_json(engine: &KvEngine, query: &str) -> String {
 fn key_detail(engine: &KvEngine, key: &[u8]) -> Response {
     match engine.get(key) {
         Ok(Some(value)) => {
-            let value_str = String::from_utf8_lossy(&value);
             let key_str = String::from_utf8_lossy(key);
             let ttl = match engine.ttl_ms(key) {
                 Ok(TtlStatus::NoExpire) => -1i64,
                 Ok(TtlStatus::Millis(ms)) => ms,
                 _ => -1,
             };
+            // Binary values are returned losslessly as base64. Rendering them
+            // through `from_utf8_lossy` replaced every non-UTF-8 byte with
+            // U+FFFD, so opening and saving a key in the dashboard silently
+            // destroyed its contents.
+            let value_field = match std::str::from_utf8(&value) {
+                Ok(text) => format!(",\"value\":{},\"binary\":false", json_string(text)),
+                Err(_) => format!(
+                    ",\"value\":null,\"binary\":true,\"value_b64\":{}",
+                    json_string(&base64_encode(&value))
+                ),
+            };
             let body = format!(
-                "{{\"key\":{},\"type\":\"string\",\"value\":{},\"ttl_ms\":{}}}",
+                "{{\"key\":{},\"key_b64\":{},\"type\":\"string\"{},\"bytes\":{},\"ttl_ms\":{}}}",
                 json_string(&key_str),
-                json_string(&value_str),
+                json_string(&base64_encode(key)),
+                value_field,
+                value.len(),
                 ttl
             );
             Response::ok_json(body)
@@ -225,27 +316,30 @@ fn key_detail(engine: &KvEngine, key: &[u8]) -> Response {
 
 fn create_key(engine: &KvEngine, body: &[u8]) -> Response {
     let form = parse_query(std::str::from_utf8(body).unwrap_or(""));
-    let key = match form.get("key") {
-        Some(k) if !k.is_empty() => k.clone(),
+    let key = match form_bytes(&form, "key") {
+        Some(k) if !k.is_empty() => k,
         _ => return json_error(400, "missing 'key'"),
     };
-    let value = form.get("value").cloned().unwrap_or_default();
-    if let Err(e) = engine.set(key.as_bytes().to_vec(), value.as_bytes().to_vec()) {
+    let value = form_bytes(&form, "value").unwrap_or_default();
+    if let Err(e) = engine.set(key.clone(), value) {
         return json_error(500, &e.to_string());
     }
     if let Some(ttl_str) = form.get("ttl") {
-        apply_ttl(engine, key.as_bytes(), ttl_str);
+        apply_ttl(engine, &key, ttl_str);
     }
-    Response::ok_json(format!("{{\"ok\":true,\"key\":{}}}", json_string(&key)))
+    Response::ok_json(format!(
+        "{{\"ok\":true,\"key\":{}}}",
+        json_string(&String::from_utf8_lossy(&key))
+    ))
 }
 
 fn update_key(engine: &KvEngine, key: &[u8], body: &[u8]) -> Response {
     let form = parse_query(std::str::from_utf8(body).unwrap_or(""));
-    let value = match form.get("value") {
-        Some(v) => v.clone(),
+    let value = match form_bytes(&form, "value") {
+        Some(v) => v,
         None => return json_error(400, "missing 'value'"),
     };
-    if let Err(e) = engine.set(key.to_vec(), value.as_bytes().to_vec()) {
+    if let Err(e) = engine.set(key.to_vec(), value) {
         return json_error(500, &e.to_string());
     }
     if let Some(ttl_str) = form.get("ttl") {
@@ -254,18 +348,97 @@ fn update_key(engine: &KvEngine, key: &[u8], body: &[u8]) -> Response {
     Response::ok_json("{\"ok\":true}".to_string())
 }
 
+/// Reads a form field as raw bytes, preferring the lossless `<field>_b64`
+/// variant when the client supplied one.
+fn form_bytes(form: &HashMap<String, String>, field: &str) -> Option<Vec<u8>> {
+    if let Some(b64) = form.get(&format!("{field}_b64")) {
+        return base64_decode(b64);
+    }
+    form.get(field).map(|v| v.as_bytes().to_vec())
+}
+
 /// Applies a TTL form field to `key`: a positive value sets an expiry, `0`
 /// clears any existing expiry, and empty/invalid values are ignored.
 fn apply_ttl(engine: &KvEngine, key: &[u8], ttl_str: &str) {
     match ttl_str.parse::<i64>() {
         Ok(ttl) if ttl > 0 => {
-            let _ = engine.expire_at_ms(key, now_ms() + ttl * 1000);
+            // Saturating: a huge TTL used to overflow `ttl * 1000` (panic in
+            // debug, wrap to a past deadline in release).
+            let _ = engine.expire_at_ms(key, now_ms().saturating_add(ttl.saturating_mul(1000)));
         }
         Ok(0) => {
             let _ = engine.persist(key);
         }
         _ => {}
     }
+}
+
+/// Standard base64 (RFC 4648) with padding.
+///
+/// The dashboard needs to move arbitrary bytes through JSON, which is
+/// UTF-8-only; base64 is the lossless representation. Hand-rolled to keep the
+/// zero-dependency promise.
+fn base64_encode(input: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[((n >> 18) & 63) as usize] as char);
+        out.push(TABLE[((n >> 12) & 63) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            TABLE[((n >> 6) & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            TABLE[(n & 63) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+fn base64_decode(s: &str) -> Option<Vec<u8>> {
+    fn sextet(c: u8) -> Option<u32> {
+        match c {
+            b'A'..=b'Z' => Some((c - b'A') as u32),
+            b'a'..=b'z' => Some((c - b'a' + 26) as u32),
+            b'0'..=b'9' => Some((c - b'0' + 52) as u32),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+    let bytes: Vec<u8> = s.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
+    if bytes.is_empty() {
+        return Some(Vec::new());
+    }
+    if !bytes.len().is_multiple_of(4) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
+    for chunk in bytes.chunks(4) {
+        let pad = chunk.iter().filter(|&&b| b == b'=').count();
+        if pad > 2 {
+            return None;
+        }
+        let mut n = 0u32;
+        for &b in chunk {
+            n = (n << 6) | if b == b'=' { 0 } else { sextet(b)? };
+        }
+        out.push((n >> 16) as u8);
+        if pad < 2 {
+            out.push((n >> 8) as u8);
+        }
+        if pad < 1 {
+            out.push(n as u8);
+        }
+    }
+    Some(out)
 }
 
 fn delete_key(engine: &KvEngine, key: &[u8]) -> Response {
@@ -315,12 +488,16 @@ pub async fn handle_conn(
     mut stream: TcpStream,
     engine: Arc<KvEngine>,
     shutdown: Shutdown,
+    token: Option<Arc<str>>,
 ) -> Result<(), FerrumError> {
     let start = Instant::now();
     let mut buf: Vec<u8> = Vec::with_capacity(8192);
     let mut tmp = [0u8; 8192];
 
-    // Phase 1: read until the header block is complete.
+    // Phase 1: read until the header block is complete. The block is bounded
+    // both in size and in time — the previous implementation had no cap on the
+    // body and no timeout at all, so one client could park a task forever or
+    // stream gigabytes into memory.
     let header_end = loop {
         if shutdown.is_triggered() {
             return Ok(());
@@ -328,36 +505,36 @@ pub async fn handle_conn(
         if let Some(pos) = find_subsequence(&buf, b"\r\n\r\n") {
             break pos + 4;
         }
-        if buf.len() > 1 << 20 {
+        if buf.len() > MAX_HEADER_BYTES {
+            write_status(&mut stream, 400).await;
             return Ok(());
         }
-        let n = tokio::select! {
-            _ = shutdown.notified() => return Ok(()),
-            r = stream.read(&mut tmp) => r,
+        let n = match read_with_timeout(&mut stream, &mut tmp, &shutdown).await {
+            Some(Ok(0)) => return Ok(()),
+            Some(Ok(k)) => k,
+            Some(Err(e)) => return Err(e.into()),
+            None => return Ok(()), // shutdown or idle timeout
         };
-        match n {
-            Ok(0) => return Ok(()),
-            Ok(k) => buf.extend_from_slice(&tmp[..k]),
-            Err(e) => return Err(e.into()),
-        }
+        buf.extend_from_slice(&tmp[..n]);
     };
 
     // Phase 2: keep reading until the declared Content-Length body arrives.
     let content_length = header_value(&buf[..header_end], "content-length")
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(0);
+    if content_length > MAX_BODY_BYTES {
+        write_status(&mut stream, 413).await;
+        return Ok(());
+    }
     while buf.len() < header_end + content_length {
         if shutdown.is_triggered() {
             return Ok(());
         }
-        let n = tokio::select! {
-            _ = shutdown.notified() => return Ok(()),
-            r = stream.read(&mut tmp) => r,
-        };
-        match n {
-            Ok(0) => break,
-            Ok(k) => buf.extend_from_slice(&tmp[..k]),
-            Err(e) => return Err(e.into()),
+        match read_with_timeout(&mut stream, &mut tmp, &shutdown).await {
+            Some(Ok(0)) => break,
+            Some(Ok(k)) => buf.extend_from_slice(&tmp[..k]),
+            Some(Err(e)) => return Err(e.into()),
+            None => return Ok(()),
         }
     }
 
@@ -368,9 +545,30 @@ pub async fn handle_conn(
             return Ok(());
         }
     };
+    if let Some(denied) = authorize(&req, token.as_deref()) {
+        write_response(&mut stream, &denied).await;
+        return Ok(());
+    }
     let resp = route(&engine, start, &req);
     write_response(&mut stream, &resp).await;
     Ok(())
+}
+
+/// Reads one chunk, racing shutdown against [`READ_TIMEOUT`].
+///
+/// `None` means "stop quietly" (shutdown fired or the client went idle), which
+/// the caller treats as a clean disconnect.
+async fn read_with_timeout(
+    stream: &mut TcpStream,
+    buf: &mut [u8],
+    shutdown: &Shutdown,
+) -> Option<std::io::Result<usize>> {
+    tokio::select! {
+        biased;
+        _ = shutdown.notified() => None,
+        // `None` (elapsed) means the client went idle: drop the connection.
+        r = tokio::time::timeout(READ_TIMEOUT, stream.read(buf)) => r.ok(),
+    }
 }
 
 fn parse_request(buf: &[u8]) -> Option<Request> {
@@ -385,6 +583,20 @@ fn parse_request(buf: &[u8]) -> Option<Request> {
         Some((p, q)) => (p.to_string(), q.to_string()),
         None => (target, String::new()),
     };
+    // Header names are case-insensitive; normalise to lowercase so the auth
+    // and CSRF checks can look them up directly.
+    let mut headers = HashMap::new();
+    for line in lines {
+        let Some((k, v)) = split_byte(line, b':') else {
+            continue;
+        };
+        let name = String::from_utf8_lossy(trim_ascii(k)).to_ascii_lowercase();
+        let value = String::from_utf8_lossy(trim_ascii(strip_prefix_byte(trim_ascii(v), b'\r')))
+            .into_owned();
+        if !name.is_empty() {
+            headers.insert(name, value);
+        }
+    }
     let content_length = header_value(header_block, "content-length")
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(0);
@@ -397,6 +609,7 @@ fn parse_request(buf: &[u8]) -> Option<Request> {
         method,
         path,
         query,
+        headers,
         body,
     })
 }
@@ -428,6 +641,11 @@ async fn write_response(stream: &mut TcpStream, resp: &Response) {
     );
     out.extend_from_slice(format!("Content-Type: {}\r\n", resp.content_type).as_bytes());
     out.extend_from_slice(format!("Content-Length: {}\r\n", resp.body.len()).as_bytes());
+    // No framing, no sniffing, no caching of a page that can mutate the store.
+    out.extend_from_slice(b"X-Content-Type-Options: nosniff\r\n");
+    out.extend_from_slice(b"X-Frame-Options: DENY\r\n");
+    out.extend_from_slice(b"Referrer-Policy: no-referrer\r\n");
+    out.extend_from_slice(b"Cache-Control: no-store\r\n");
     out.extend_from_slice(b"Connection: close\r\n\r\n");
     out.extend_from_slice(&resp.body);
     let _ = stream.write_all(&out).await;
@@ -697,12 +915,28 @@ mod tests {
             method: method.to_string(),
             path: path.to_string(),
             query: query.to_string(),
+            headers: HashMap::new(),
             body: body.to_vec(),
         }
     }
 
     fn body_of(resp: &Response) -> String {
         String::from_utf8_lossy(&resp.body).into_owned()
+    }
+
+    /// Percent-encodes a value for an `application/x-www-form-urlencoded` body
+    /// (base64's `+`, `/` and `=` are not form-safe as literals).
+    fn form_encode(v: &str) -> String {
+        let mut out = String::new();
+        for b in v.bytes() {
+            match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                    out.push(b as char)
+                }
+                _ => out.push_str(&format!("%{b:02X}")),
+            }
+        }
+        out
     }
 
     #[test]
@@ -800,5 +1034,78 @@ mod tests {
         let e = make_engine();
         let resp = route(&e, Instant::now(), &req("DELETE", "/api/info", "", b""));
         assert_eq!(resp.status, 405);
+    }
+
+    #[test]
+    fn binary_values_round_trip_losslessly() {
+        let e = make_engine();
+        let raw = vec![0x00, 0xff, 0x80, b'\r', b'\n', 0x42];
+        e.set(b"blob".to_vec(), raw.clone()).unwrap();
+
+        let got = route(&e, Instant::now(), &req("GET", "/api/keys/blob", "", b""));
+        let body = body_of(&got);
+        assert!(body.contains("\"binary\":true"), "body: {body}");
+        assert!(
+            !body.contains('\u{FFFD}'),
+            "must not emit replacement chars"
+        );
+
+        // Re-submitting the base64 form must preserve every byte.
+        let b64 = base64_encode(&raw);
+        let form = format!("value_b64={}", form_encode(&b64));
+        let upd = route(
+            &e,
+            Instant::now(),
+            &req("PUT", "/api/keys/blob", "", form.as_bytes()),
+        );
+        assert_eq!(upd.status, 200);
+        assert_eq!(e.get(b"blob").unwrap(), Some(raw));
+    }
+
+    #[test]
+    fn base64_helpers_round_trip() {
+        for input in [
+            &b""[..],
+            &b"a"[..],
+            &b"ab"[..],
+            &b"abc"[..],
+            &[0u8, 1, 2, 253, 254, 255][..],
+        ] {
+            let encoded = base64_encode(input);
+            assert_eq!(base64_decode(&encoded).as_deref(), Some(input));
+        }
+        assert!(base64_decode("not base64!").is_none());
+    }
+
+    #[test]
+    fn token_is_required_for_api_when_configured() {
+        let mut r = req("GET", "/api/keys", "filter=*", b"");
+        assert_eq!(authorize(&r, Some("s3cret")).map(|r| r.status), Some(401));
+
+        r.headers
+            .insert("x-ferrum-token".into(), "wrong".to_string());
+        assert_eq!(authorize(&r, Some("s3cret")).map(|r| r.status), Some(401));
+
+        r.headers
+            .insert("x-ferrum-token".into(), "s3cret".to_string());
+        assert!(authorize(&r, Some("s3cret")).is_none());
+    }
+
+    #[test]
+    fn cross_origin_writes_are_rejected_without_token() {
+        let mut r = req("POST", "/api/command", "", b"command=FLUSHDB");
+        r.headers.insert("host".into(), "127.0.0.1:6381".into());
+        r.headers
+            .insert("origin".into(), "http://evil.example".into());
+        assert_eq!(authorize(&r, None).map(|r| r.status), Some(403));
+
+        // Same-origin writes are fine.
+        r.headers
+            .insert("origin".into(), "http://127.0.0.1:6381".into());
+        assert!(authorize(&r, None).is_none());
+
+        // Reads without an Origin header (curl, tests) are unaffected.
+        let get = req("GET", "/api/info", "", b"");
+        assert!(authorize(&get, None).is_none());
     }
 }

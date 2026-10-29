@@ -5,14 +5,14 @@
 //! See `docs/plans/2026-07-20-writeguard-refactor-design.md` (F-07).
 
 use std::collections::HashMap;
+use std::ops::{Deref, DerefMut};
 use std::sync::RwLockWriteGuard;
 use std::time::{Duration, Instant};
 
 use crate::error::FerrumError;
 use crate::storage::engine::entry::{ValueEntry, live_payload};
 use crate::storage::engine::util::{
-    current_epoch_ms, deadline_to_epoch_ms, entry_bytes, log_aof_result, validate_key,
-    validate_value,
+    current_epoch_ms, deadline_to_epoch_ms, entry_bytes, validate_key, validate_value,
 };
 use crate::storage::engine::{KvEngine, TtlStatus};
 
@@ -20,15 +20,68 @@ use crate::storage::engine::{KvEngine, TtlStatus};
 /// exposes typed operations that encapsulate the boilerplate every mutating
 /// and lazy-expiring command used to repeat by hand.
 ///
-/// The lock is taken once in [`WriteGuard::begin`] and released when the
-/// guard is dropped, exactly as the old per-method `store.write()?` did — so
-/// the AOF ordering invariant (the in-memory state and on-disk log agree on
-/// write order because the lock is held while appending) is preserved.
+/// The lock is taken once in [`WriteGuard::begin`] and released in
+/// [`Drop`] — *before* the `appendfsync always` durability barrier runs. The
+/// AOF ordering invariant is preserved either way: every append still happens
+/// while the lock is held, so the on-disk order matches the order in which the
+/// mutations became visible.
 pub(crate) struct WriteGuard<'a> {
     engine: &'a KvEngine,
-    store: RwLockWriteGuard<'a, HashMap<Vec<u8>, ValueEntry>>,
+    store: StoreLock<'a>,
     now: Instant,
     now_ms: i64,
+    /// Set when this command appended at least one record. Only then does the
+    /// destructor run the `appendfsync always` barrier: a read-only command
+    /// must not be delayed by someone else's durability wait.
+    wrote_aof: bool,
+}
+
+/// Owns the keyspace write lock and can release it on demand.
+///
+/// This exists so [`WriteGuard`]'s destructor can drop the lock *before*
+/// running the AOF durability barrier: `appendfsync always` used to fsync while
+/// holding the global keyspace lock, which serialised every client behind a
+/// single disk round-trip (measured: 254 rps at 50 connections, p50 195 ms).
+struct StoreLock<'a> {
+    guard: Option<RwLockWriteGuard<'a, HashMap<Vec<u8>, ValueEntry>>>,
+}
+
+impl Deref for StoreLock<'_> {
+    type Target = HashMap<Vec<u8>, ValueEntry>;
+
+    fn deref(&self) -> &Self::Target {
+        // The guard is only cleared in `Drop`, after every method access.
+        self.guard.as_deref().expect("store lock already released")
+    }
+}
+
+impl DerefMut for StoreLock<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.guard
+            .as_deref_mut()
+            .expect("store lock already released")
+    }
+}
+
+impl StoreLock<'_> {
+    fn release(&mut self) {
+        self.guard = None;
+    }
+}
+
+impl Drop for WriteGuard<'_> {
+    fn drop(&mut self) {
+        // Release the keyspace lock first so the durability barrier (which may
+        // take milliseconds on `appendfsync always`) does not block readers and
+        // writers. The in-memory state is already final at this point, and the
+        // bytes are already in the AOF buffer, so ordering is preserved.
+        self.store.release();
+        if self.wrote_aof
+            && let Some(aof) = &self.engine.aof
+        {
+            self.engine.note_aof_result("SYNC", aof.sync_if_needed());
+        }
+    }
 }
 
 impl<'a> WriteGuard<'a> {
@@ -37,18 +90,20 @@ impl<'a> WriteGuard<'a> {
         let store = engine.store.write()?;
         Ok(Self {
             engine,
-            store,
+            store: StoreLock { guard: Some(store) },
             now: Instant::now(),
             now_ms: current_epoch_ms(),
+            wrote_aof: false,
         })
     }
 
     /// Logs an AOF record only when an AOF writer is attached. The `res`
     /// future is computed lazily by the caller (it is `None` when there is no
     /// writer, so `append_*` is never evaluated needlessly).
-    fn log(&self, cmd: &str, res: Option<Result<(), FerrumError>>) {
+    fn log(&mut self, cmd: &str, res: Option<Result<(), FerrumError>>) {
         if let Some(r) = res {
-            log_aof_result(cmd, r);
+            self.wrote_aof = true;
+            self.engine.note_aof_result(cmd, r);
         }
     }
 
@@ -330,6 +385,20 @@ impl<'a> WriteGuard<'a> {
                     TtlStatus::Millis(remaining.as_millis() as i64)
                 }
             },
+        }
+    }
+
+    /// `STRLEN`: byte length of the live value, applying lazy expiry first.
+    pub(crate) fn strlen_of(&mut self, key: &[u8]) -> usize {
+        let now = self.now;
+        match self.store.get(key) {
+            Some(entry) if entry.is_expired(now) => {
+                self.engine.track_remove(&mut self.store, key);
+                self.engine.log_expire_drop(key);
+                0
+            }
+            Some(entry) => entry.data.len(),
+            None => 0,
         }
     }
 

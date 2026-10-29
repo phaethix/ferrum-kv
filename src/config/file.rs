@@ -51,6 +51,8 @@ pub struct FileConfig {
     /// Bind address for the built-in web dashboard. `None` uses the default
     /// address; the literal `off` (or `no`) disables the dashboard.
     pub dashboard_addr: Option<String>,
+    /// Shared secret required on every `/api/*` dashboard request.
+    pub dashboard_token: Option<String>,
 }
 
 /// Error type for configuration file parsing.
@@ -199,6 +201,9 @@ fn apply_directive(cfg: &mut FileConfig, key: &str, value: &str) -> Result<(), S
         }
         "io-threads" => {
             cfg.io_threads = Some(parse_usize(value, "io-threads")?);
+        }
+        "dashboard-token" => {
+            cfg.dashboard_token = Some(strip_quotes(value).to_string());
         }
         "dashboard-addr" => {
             // `off` / `no` switch the dashboard off; anything else is taken

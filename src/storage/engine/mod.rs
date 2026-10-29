@@ -34,7 +34,9 @@ pub(crate) use util::current_epoch_ms;
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::path::Path;
-use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{
+    AtomicBool, AtomicI64, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering,
+};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -58,13 +60,68 @@ pub const KEY_MAX_BYTES: usize = 64 * 1024;
 /// Maximum allowed value size in bytes (16 MiB).
 pub const VALUE_MAX_BYTES: usize = 16 * 1024 * 1024;
 
-/// Approximate per-entry overhead charged on top of `key.len() + value.len()`.
+/// Approximate per-entry overhead charged on top of `key.capacity() +
+/// value.capacity()`.
 ///
-/// Covers the `HashMap` bucket, the `ValueEntry` metadata, and the per-key
-/// allocations that `Vec<u8>` carries. Chosen as a conservative constant so
-/// the reported `used_memory` stays a useful safety bound without pretending
-/// to match the allocator to the byte.
-pub const PER_ENTRY_OVERHEAD: u64 = 48;
+/// Derived from the real in-memory layout instead of a hand-waved constant:
+///
+/// | Component | Bytes |
+/// |---|---|
+/// | `size_of::<ValueEntry>()` (Vec header + 2 × `Instant` + flags) | ~72 |
+/// | `HashMap` bucket (`Vec` header + `ValueEntry`, amortised over a 7/8 load factor) | ~96 |
+/// | malloc header / size-class rounding for the key and value allocations | ~32 |
+///
+/// Rounded up to 144. `Vec::capacity()` (not `len()`) is charged separately so
+/// oversized allocations are reflected. This is still an *estimate* — the
+/// allocator's exact size classes are unknowable here — but the previous value
+/// of 48 under-reported real usage by ~5×, which made `maxmemory` a poor
+/// safety bound.
+///
+/// Note: the stateful SIEVE / AdaptiveClimb indexes keep their own copy of every
+/// tracked key. Those structures are only populated while their policy is
+/// active (see `index_kind`), and their footprint is *not* included in this
+/// per-entry constant; `INFO memory` exposes `used_memory_policy_indexes` so
+/// operators can see the extra cost.
+pub const PER_ENTRY_OVERHEAD: u64 = 144;
+
+/// Approximate cost of one key tracked in a stateful eviction index
+/// (`IndexMap` bucket + the cloned key's heap allocation).
+pub(crate) const PER_INDEX_ENTRY_BYTES: u64 = 48;
+
+/// Which stateful eviction index (if any) must be maintained.
+///
+/// The engine keeps SIEVE and AdaptiveClimb queues in sync with the keyspace so
+/// a runtime policy switch is immediately consistent — but maintaining both on
+/// every access is pure overhead for the other 12 policies. This enum is stored
+/// in a lock-free atomic and consulted on the hot path so only the active index
+/// (if any) is touched.
+pub(crate) mod index_kind {
+    pub(crate) const NONE: u8 = 0;
+    pub(crate) const SIEVE_ALL: u8 = 1;
+    pub(crate) const SIEVE_VOLATILE: u8 = 2;
+    pub(crate) const SIEVE_S_ALL: u8 = 3;
+    pub(crate) const SIEVE_S_VOLATILE: u8 = 4;
+    pub(crate) const AC_ALL: u8 = 5;
+    pub(crate) const AC_VOLATILE: u8 = 6;
+
+    #[inline]
+    pub(crate) fn is_sieve(kind: u8) -> bool {
+        matches!(
+            kind,
+            SIEVE_ALL | SIEVE_VOLATILE | SIEVE_S_ALL | SIEVE_S_VOLATILE
+        )
+    }
+
+    #[inline]
+    pub(crate) fn is_sieve_ttl(kind: u8) -> bool {
+        matches!(kind, SIEVE_S_ALL | SIEVE_S_VOLATILE)
+    }
+
+    #[inline]
+    pub(crate) fn is_ac(kind: u8) -> bool {
+        matches!(kind, AC_ALL | AC_VOLATILE)
+    }
+}
 
 /// Upper bound on the number of keys [`KvEngine::scan_keys`] returns in one
 /// call.
@@ -178,6 +235,22 @@ pub struct KvEngine {
     /// Registry of active MONITOR clients. Shared via `Arc` so every
     /// engine clone broadcasts to the same set of subscribers.
     pub(crate) monitor_registry: MonitorRegistry,
+    /// Which stateful eviction index is currently active, as an
+    /// [`index_kind`] constant. Consulted lock-free on every access so the
+    /// inactive index is never touched (previously both were maintained
+    /// unconditionally, which made every read O(n) under AdaptiveClimb).
+    pub(crate) index_kind: Arc<AtomicU8>,
+    /// `true` when a `requirepass` password is configured. Read once per
+    /// command instead of taking the password `RwLock`.
+    pub(crate) auth_required: Arc<AtomicBool>,
+    /// Cumulative AOF append failures. Surfaced via
+    /// `INFO stats:aof_write_errors` so a failing disk is visible instead of
+    /// only appearing in the log.
+    pub(crate) aof_errors: Arc<AtomicU64>,
+    /// Rotating start offset for the active-expiry sweep. Without it the
+    /// sweeper kept sampling the same `HashMap` bucket prefix forever, so
+    /// expired keys outside that prefix were never collected.
+    pub(crate) sweep_cursor: Arc<AtomicUsize>,
 }
 
 /// One recorded slow command.
@@ -231,6 +304,10 @@ impl KvEngine {
             evicted_keys: Arc::new(AtomicU64::new(0)),
             expired_keys: Arc::new(AtomicU64::new(0)),
             monitor_registry: MonitorRegistry::default(),
+            index_kind: Arc::new(AtomicU8::new(index_kind::NONE)),
+            auth_required: Arc::new(AtomicBool::new(false)),
+            aof_errors: Arc::new(AtomicU64::new(0)),
+            sweep_cursor: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -251,31 +328,38 @@ impl KvEngine {
     /// the algorithm has accurate state at once; when leaving SIEVE the queue
     /// is cleared so it does not retain stale entries.
     pub fn set_eviction_config(&self, cfg: EvictionConfig) -> Result<(), FerrumError> {
-        // When leaving a stateful policy, clear its structure; when entering
-        // one, (re)build it from the live keyspace so the algorithm has
-        // accurate state at once. Only one stateful policy is active at a
-        // time, so the other is always cleared.
-        match cfg.policy {
-            p if p.is_sieve() => {
-                let store = self.store.read()?;
+        // Only one stateful index is maintained at a time. Rebuilding is a
+        // full keyspace pass, so it is done *only* when the index class
+        // actually changes: a plain `CONFIG SET maxmemory` must not wipe the
+        // SIEVE `visited` bits / AdaptiveClimb `jump` state.
+        let new_kind = cfg.policy.index_kind();
+        let old_kind = self.index_kind.load(Ordering::Acquire);
+        if new_kind != old_kind {
+            // Holding the store read lock blocks writers for the duration of
+            // the transition, so no write can slip in between "index rebuilt"
+            // and "kind published" (or observe the old kind while the index is
+            // being cleared).
+            let store = self.store.read()?;
+            if index_kind::is_sieve(new_kind) {
                 let mut sieve = self.sieve.lock()?;
                 sieve.rebuild(&store, cfg.policy.scope());
                 let mut ac = self.ac.lock()?;
                 ac.clear();
-            }
-            p if p.is_adaptive_climb() => {
-                let store = self.store.read()?;
+            } else if index_kind::is_ac(new_kind) {
                 let mut ac = self.ac.lock()?;
                 ac.rebuild(&store, cfg.policy.scope());
                 let mut sieve = self.sieve.lock()?;
                 sieve.clear();
+            } else {
+                if let Ok(mut sieve) = self.sieve.lock() {
+                    sieve.clear();
+                }
+                if let Ok(mut ac) = self.ac.lock() {
+                    ac.clear();
+                }
             }
-            _ => {
-                let mut sieve = self.sieve.lock()?;
-                sieve.clear();
-                let mut ac = self.ac.lock()?;
-                ac.clear();
-            }
+            self.index_kind.store(new_kind, Ordering::Release);
+            drop(store);
         }
         let mut guard = self.eviction.write()?;
         *guard = cfg;
@@ -295,9 +379,24 @@ impl KvEngine {
     /// later changed or cleared. The change is runtime-only and is not
     /// persisted to the AOF, consistent with Redis.
     pub fn set_requirepass(&self, pw: Option<Vec<u8>>) -> Result<(), FerrumError> {
+        // Redis semantics: an empty password disables authentication, it does
+        // not mean "require the empty password".
+        let pw = pw.filter(|p| !p.is_empty());
+        let required = pw.is_some();
         let mut guard = self.auth_password.write()?;
         *guard = pw;
+        // Publish the hot-path flag while still holding the lock so a
+        // connection can never observe "password set" before the password
+        // itself is visible (or vice versa).
+        self.auth_required.store(required, Ordering::Release);
         Ok(())
+    }
+
+    /// `true` when a password is configured. Lock-free: the connection hot
+    /// path calls this for every command.
+    #[inline]
+    pub fn auth_required(&self) -> bool {
+        self.auth_required.load(Ordering::Acquire)
     }
 
     /// Returns a copy of the current `requirepass` password, if any.
@@ -311,12 +410,26 @@ impl KvEngine {
     // (`slowlog_slower_than_us`, `slowlog_max_len`) are lock-free atomics so
     // the per-command hot path reads them without touching any engine lock.
 
-    /// True when the slow-log can record anything: logging is forced on with
-    /// a negative threshold, or a positive threshold is configured. A `0`
-    /// threshold means disabled, and the caller skips the `args()` snapshot
-    /// entirely so the disabled hot path stays allocation-free.
-    pub(crate) fn slowlog_active(&self) -> bool {
+    /// True when slow-logging is configured at all (`threshold != 0`).
+    ///
+    /// Sampled *before* a command runs so that the command which enables
+    /// logging (`CONFIG SET slowlog-log-slower-than -1`) is not itself
+    /// recorded — matching the historical behaviour and, more importantly,
+    /// keeping the ring contents predictable for operators.
+    pub(crate) fn slowlog_armed(&self) -> bool {
         self.slowlog_slower_than_us.load(Ordering::Relaxed) != 0
+    }
+
+    /// True when a command of `duration_us` should be recorded.
+    ///
+    /// Lets the dispatcher decide *before* serialising the argv for the
+    /// slow-log, so a fast command never pays the snapshot cost.
+    pub(crate) fn slowlog_would_log(&self, duration_us: u64) -> bool {
+        match self.slowlog_slower_than_us.load(Ordering::Relaxed) {
+            0 => false,
+            n if n < 0 => true,
+            n => duration_us > n as u64,
+        }
     }
 
     /// Records `command_args` as a slow entry when its `duration_us` crosses
@@ -415,10 +528,52 @@ impl KvEngine {
     pub fn authenticate(&self, provided: &[u8]) -> Result<bool, FerrumError> {
         let guard = self.auth_password.read()?;
         match guard.as_deref() {
-            Some(expected) => Ok(provided == expected),
+            // Constant-time compare: a plain `==` lets a remote attacker learn
+            // the correct prefix length from response timing.
+            Some(expected) => Ok(util::constant_time_eq(provided, expected)),
             None => Err(FerrumError::ParseError(
                 "Client sent AUTH, but no password is set".into(),
             )),
+        }
+    }
+
+    /// Records an AOF append outcome, counting failures for `INFO`.
+    ///
+    /// Persistence stays best-effort (the in-memory state is authoritative and
+    /// a failed append does not fail the client command), but the error is now
+    /// observable via `INFO stats:aof_write_errors` instead of only appearing
+    /// in the log.
+    pub(crate) fn note_aof_result(&self, cmd: &str, result: Result<(), FerrumError>) {
+        if result.is_err() {
+            self.aof_errors.fetch_add(1, Ordering::Relaxed);
+        }
+        log_aof_result(cmd, result);
+    }
+
+    /// Cumulative number of failed AOF appends.
+    pub fn aof_write_errors(&self) -> u64 {
+        self.aof_errors.load(Ordering::Relaxed)
+    }
+
+    /// Number of fsync barriers issued by the AOF writer (0 when disabled).
+    pub fn aof_fsync_count(&self) -> u64 {
+        self.aof.as_ref().map(|w| w.fsync_count()).unwrap_or(0)
+    }
+
+    /// Approximate bytes held by the active stateful eviction index.
+    ///
+    /// SIEVE / AdaptiveClimb keep a second copy of every tracked key. Those
+    /// bytes are deliberately *not* part of [`Self::used_memory`] (they are
+    /// policy-dependent), but operators need to see them because `maxmemory`
+    /// only accounts for the keyspace. `INFO memory` reports this as
+    /// `used_memory_policy_indexes`.
+    pub fn policy_index_memory(&self) -> u64 {
+        if self.index_kind.load(Ordering::Relaxed) == index_kind::NONE {
+            return 0;
+        }
+        match self.store.read() {
+            Ok(store) => store.len() as u64 * PER_INDEX_ENTRY_BYTES,
+            Err(_) => 0,
         }
     }
 
@@ -438,11 +593,15 @@ impl KvEngine {
     /// Records a (re)insertion in auxiliary eviction structures.
     ///
     /// Kept separate so the public command methods stay terse; callers must
-    /// already hold the write lock or own the engine reference. The SIEVE
-    /// queue is updated even when the active policy is not SIEVE so a runtime
-    /// switch to a SIEVE variant is immediately consistent.
+    /// already hold the write lock or own the engine reference. Both helpers
+    /// are gated on the lock-free [`Self::index_kind`] so the 14 policies that
+    /// do not use a stateful index pay nothing for it (previously every write
+    /// cloned the key into two `IndexMap`s regardless of the active policy).
     #[inline]
     fn sieve_notify_insert(&self, key: &[u8]) {
+        if !index_kind::is_sieve(self.index_kind.load(Ordering::Relaxed)) {
+            return;
+        }
         if let Ok(mut s) = self.sieve.lock() {
             s.observe_insert(key);
         }
@@ -451,6 +610,9 @@ impl KvEngine {
     /// Mirrors a key access into the SIEVE `visited` bit.
     #[inline]
     fn sieve_notify_access(&self, key: &[u8]) {
+        if !index_kind::is_sieve(self.index_kind.load(Ordering::Relaxed)) {
+            return;
+        }
         if let Ok(mut s) = self.sieve.lock() {
             s.observe_access(key);
         }
@@ -459,22 +621,20 @@ impl KvEngine {
     /// Mirrors a key removal from the SIEVE FIFO queue.
     #[inline]
     fn sieve_notify_remove(&self, key: &[u8]) {
+        if !index_kind::is_sieve(self.index_kind.load(Ordering::Relaxed)) {
+            return;
+        }
         if let Ok(mut s) = self.sieve.lock() {
             s.observe_remove(key);
-        }
-    }
-
-    /// Clears the SIEVE FIFO queue (used by `FLUSHDB`).
-    #[inline]
-    fn sieve_notify_clear(&self) {
-        if let Ok(mut s) = self.sieve.lock() {
-            s.clear();
         }
     }
 
     /// Mirrors a (re)insertion into the AdaptiveClimb ordered list.
     #[inline]
     fn ac_notify_insert(&self, key: &[u8]) {
+        if !index_kind::is_ac(self.index_kind.load(Ordering::Relaxed)) {
+            return;
+        }
         if let Ok(mut s) = self.ac.lock() {
             s.observe_insert(key);
         }
@@ -483,6 +643,9 @@ impl KvEngine {
     /// Mirrors a hit into the AdaptiveClimb promotion rule.
     #[inline]
     fn ac_notify_access(&self, key: &[u8]) {
+        if !index_kind::is_ac(self.index_kind.load(Ordering::Relaxed)) {
+            return;
+        }
         if let Ok(mut s) = self.ac.lock() {
             s.observe_access(key);
         }
@@ -491,16 +654,11 @@ impl KvEngine {
     /// Mirrors a removal from the AdaptiveClimb ordered list.
     #[inline]
     fn ac_notify_remove(&self, key: &[u8]) {
+        if !index_kind::is_ac(self.index_kind.load(Ordering::Relaxed)) {
+            return;
+        }
         if let Ok(mut s) = self.ac.lock() {
             s.observe_remove(key);
-        }
-    }
-
-    /// Clears the AdaptiveClimb ordered list (used by `FLUSHDB`).
-    #[inline]
-    fn ac_notify_clear(&self) {
-        if let Ok(mut s) = self.ac.lock() {
-            s.clear();
         }
     }
 
@@ -757,17 +915,8 @@ impl KvEngine {
 
     /// Returns the byte length of the value at `key`, or `0` if absent.
     pub fn strlen(&self, key: &[u8]) -> Result<usize, FerrumError> {
-        let mut store = self.store.write()?;
-        let now = Instant::now();
-        match store.get(key) {
-            Some(entry) if entry.is_expired(now) => {
-                self.track_remove(&mut store, key);
-                self.log_expire_drop(key);
-                Ok(0)
-            }
-            Some(entry) => Ok(entry.data.len()),
-            None => Ok(0),
-        }
+        let mut g = WriteGuard::begin(self)?;
+        Ok(g.strlen_of(key))
     }
 
     /// Removes all keys from the store.
@@ -811,18 +960,33 @@ impl KvEngine {
         let Some(writer) = self.aof.as_ref() else {
             return Err(FerrumError::AofNotEnabled);
         };
-        if writer.is_rewriting() {
+        // Claim the rewrite slot *before* spawning. Previously the check and
+        // the flag update were separated by the thread spawn, so two
+        // concurrent BGREWRITEAOF requests could both pass the guard and
+        // spawn two workers racing on the same temp file.
+        if !writer.try_begin_rewrite() {
+            // A rewrite is already in flight: Redis replies +OK and ignores
+            // the second request, which keeps the delta invariant intact.
             return Ok(());
         }
         let writer = Arc::clone(writer);
         let engine = self.clone();
-        std::thread::Builder::new()
+        match std::thread::Builder::new()
             .name("ferrum-aof-rewrite".to_string())
             .spawn(move || perform_aof_rewrite(engine, writer))
-            .map_err(|e| {
-                FerrumError::Internal(format!("failed to spawn aof rewrite thread: {e}"))
-            })?;
-        Ok(())
+        {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                // The slot was claimed but no worker exists: release it so a
+                // later attempt can succeed.
+                if let Some(w) = self.aof.as_ref() {
+                    w.abort_rewrite();
+                }
+                Err(FerrumError::Internal(format!(
+                    "failed to spawn aof rewrite thread: {e}"
+                )))
+            }
+        }
     }
 
     /// Returns the remaining TTL for `key` in milliseconds.
@@ -845,6 +1009,15 @@ impl KvEngine {
     /// When more than 25% of the sample was expired the caller is expected
     /// to invoke this method again immediately; the signal is surfaced via
     /// the returned fraction so the scheduler can make that decision.
+    ///
+    /// Sampling starts at a rotating cursor rather than at the map's first
+    /// bucket. `HashMap` iteration order is stable between mutations, so
+    /// always taking the first `sample` keys meant keys outside that prefix
+    /// were never actively expired. The cursor advances by the number of keys
+    /// examined, so the whole keyspace is covered after `len / sample` ticks.
+    /// The `skip` costs O(cursor) pointer steps (a few milliseconds for a
+    /// million keys, every sweep interval) — the price of guaranteed coverage
+    /// without maintaining a second TTL index.
     pub fn sweep_expired(&self, sample: usize) -> Result<SweepStats, FerrumError> {
         if sample == 0 {
             return Ok(SweepStats {
@@ -855,9 +1028,16 @@ impl KvEngine {
         let mut store = self.store.write()?;
         let now = Instant::now();
 
+        let len = store.len();
+        let start = if len == 0 {
+            0
+        } else {
+            self.sweep_cursor.load(Ordering::Relaxed) % len
+        };
+
         let mut victims: Vec<Vec<u8>> = Vec::new();
         let mut examined = 0usize;
-        for (key, entry) in store.iter() {
+        for (key, entry) in store.iter().skip(start).chain(store.iter().take(start)) {
             if examined >= sample {
                 break;
             }
@@ -866,13 +1046,17 @@ impl KvEngine {
                 victims.push(key.clone());
             }
         }
+        if len > 0 {
+            self.sweep_cursor
+                .store(start.wrapping_add(examined) % len, Ordering::Relaxed);
+        }
 
         let evicted = victims.len();
         for key in &victims {
             self.track_remove(&mut store, key.as_slice());
             self.expired_keys.fetch_add(1, Ordering::Relaxed);
             if let Some(aof) = &self.aof {
-                log_aof_result("DEL", aof.append_del(key));
+                self.note_aof_result("DEL", aof.append_del(key));
             }
         }
 
@@ -885,7 +1069,7 @@ impl KvEngine {
     /// already hold the write lock.
     pub(crate) fn log_expire_drop(&self, key: &[u8]) {
         if let Some(aof) = &self.aof {
-            log_aof_result("DEL", aof.append_del(key));
+            self.note_aof_result("DEL", aof.append_del(key));
         }
     }
 
@@ -983,10 +1167,7 @@ impl KvEngine {
                 | EvictionPolicy::VolatileSieve
                 | EvictionPolicy::AllKeysSieveS
                 | EvictionPolicy::VolatileSieveS => {
-                    let ttl_aware = matches!(
-                        cfg.policy,
-                        EvictionPolicy::AllKeysSieveS | EvictionPolicy::VolatileSieveS
-                    );
+                    let ttl_aware = index_kind::is_sieve_ttl(cfg.policy.index_kind());
                     self.evict_sieve(store, cfg.policy.scope(), ttl_aware)?
                 }
                 EvictionPolicy::AllKeysAdaptiveClimb | EvictionPolicy::VolatileAdaptiveClimb => {
@@ -1008,7 +1189,7 @@ impl KvEngine {
             evicted += 1;
             self.evicted_keys.fetch_add(1, Ordering::Relaxed);
             if let Some(aof) = &self.aof {
-                log_aof_result("DEL", aof.append_del(&victim_key));
+                self.note_aof_result("DEL", aof.append_del(&victim_key));
             }
         }
 
@@ -1214,8 +1395,14 @@ impl KvEngine {
     /// Clears every entry, resetting the memory counter to zero.
     pub(crate) fn track_clear(&self, store: &mut HashMap<Vec<u8>, ValueEntry>) {
         store.clear();
-        self.sieve_notify_clear();
-        self.ac_notify_clear();
+        // `FLUSHDB` is rare, so clearing both indexes unconditionally is
+        // cheaper than branching on the active policy kind.
+        if let Ok(mut sieve) = self.sieve.lock() {
+            sieve.clear();
+        }
+        if let Ok(mut ac) = self.ac.lock() {
+            ac.clear();
+        }
         self.used_memory.store(0, Ordering::Relaxed);
     }
 
@@ -1340,7 +1527,7 @@ impl KvEngine {
 /// `ferrum-aof-rewrite` OS thread; it never blocks the connection that issued
 /// `BGREWRITEAOF`.
 fn perform_aof_rewrite(engine: KvEngine, writer: Arc<AofWriter>) {
-    writer.begin_rewrite();
+    // The caller has already claimed the slot via `try_begin_rewrite`.
 
     // Snapshot live entries: (key, value, optional absolute-TTL epoch ms).
     // Holding only the read lock keeps the writer pause brief.
@@ -1392,31 +1579,41 @@ fn serialise_compact_aof(
     temp: &Path,
     snapshot: &[(Vec<u8>, Vec<u8>, Option<i64>)],
 ) -> Result<(), FerrumError> {
-    use std::io::Write;
+    use std::io::{BufWriter, Write};
 
-    let mut f = std::fs::File::create(temp).map_err(|e| {
+    let f = std::fs::File::create(temp).map_err(|e| {
         FerrumError::PersistenceError(format!("aof rewrite create temp failed: {e}"))
     })?;
-    let mut buf: Vec<u8> = Vec::new();
+    // Stream through a buffered writer instead of materialising the whole
+    // compact file in one `Vec`. The previous approach held a second full copy
+    // of the dataset in memory, so a rewrite needed roughly 3× the live
+    // keyspace (snapshot + serialised buffer + file cache).
+    let mut w = BufWriter::with_capacity(64 * 1024, f);
     for (k, v, ttl) in snapshot {
-        buf.extend_from_slice(&crate::persistence::resp::encode_command(&[
+        w.write_all(&crate::persistence::resp::encode_command(&[
             b"SET",
             k.as_slice(),
             v.as_slice(),
-        ]));
+        ]))
+        .map_err(|e| {
+            FerrumError::PersistenceError(format!("aof rewrite write temp failed: {e}"))
+        })?;
         if let Some(abs_ms) = ttl {
             let ts = abs_ms.to_string();
-            buf.extend_from_slice(&crate::persistence::resp::encode_command(&[
+            w.write_all(&crate::persistence::resp::encode_command(&[
                 b"PEXPIREAT",
                 k.as_slice(),
                 ts.as_bytes(),
-            ]));
+            ]))
+            .map_err(|e| {
+                FerrumError::PersistenceError(format!("aof rewrite write temp failed: {e}"))
+            })?;
         }
     }
-    f.write_all(&buf).map_err(|e| {
-        FerrumError::PersistenceError(format!("aof rewrite write temp failed: {e}"))
+    w.flush().map_err(|e| {
+        FerrumError::PersistenceError(format!("aof rewrite flush temp failed: {e}"))
     })?;
-    f.sync_all().map_err(|e| {
+    w.get_ref().sync_all().map_err(|e| {
         FerrumError::PersistenceError(format!("aof rewrite fsync temp failed: {e}"))
     })?;
     Ok(())
@@ -1577,10 +1774,10 @@ mod info_fields_tests {
     #[test]
     fn evicted_keys_increments_on_maxmemory_eviction() {
         let e = KvEngine::new();
-        // 30 bytes of overhead + value; set maxmemory to 1 to force eviction
-        // of the first key when the second is inserted.
+        // Room for exactly one entry (`PER_ENTRY_OVERHEAD` dominates): the
+        // second insert must evict the first.
         e.set_eviction_config(EvictionConfig {
-            max_memory: 60,
+            max_memory: PER_ENTRY_OVERHEAD + 4,
             policy: EvictionPolicy::AllKeysRandom,
             samples: 1,
         })

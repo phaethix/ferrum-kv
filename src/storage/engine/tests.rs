@@ -1020,3 +1020,104 @@ fn scan_keys_glob_filtering() {
     // No match.
     assert_eq!(engine.scan_keys(b"nope:*").unwrap().len(), 0);
 }
+
+#[test]
+fn per_entry_overhead_covers_the_value_record() {
+    assert!(
+        PER_ENTRY_OVERHEAD >= std::mem::size_of::<ValueEntry>() as u64,
+        "the per-entry estimate must at least cover the in-memory record",
+    );
+}
+
+#[test]
+fn stateful_indexes_are_only_maintained_for_the_active_policy() {
+    let engine = KvEngine::new(); // noeviction
+    engine.set(b"a".to_vec(), b"1".to_vec()).unwrap();
+    assert_eq!(
+        engine.sieve.lock().unwrap().len(),
+        0,
+        "SIEVE queue must stay empty unless a SIEVE policy is active"
+    );
+    assert_eq!(
+        engine.ac.lock().unwrap().len(),
+        0,
+        "AdaptiveClimb list must stay empty unless an AC policy is active"
+    );
+
+    // Switching to SIEVE rebuilds the queue from the live keyspace.
+    engine
+        .set_eviction_config(EvictionConfig {
+            policy: EvictionPolicy::AllKeysSieve,
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(engine.sieve.lock().unwrap().len(), 1);
+    engine.set(b"b".to_vec(), b"2".to_vec()).unwrap();
+    assert_eq!(engine.sieve.lock().unwrap().len(), 2);
+
+    // Changing an unrelated knob must not wipe the visited bits.
+    engine
+        .set_eviction_config(EvictionConfig {
+            policy: EvictionPolicy::AllKeysSieve,
+            max_memory: 1 << 20,
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(engine.sieve.lock().unwrap().len(), 2);
+
+    // Leaving the SIEVE family drains the queue.
+    engine
+        .set_eviction_config(EvictionConfig {
+            policy: EvictionPolicy::AllKeysLru,
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(engine.sieve.lock().unwrap().len(), 0);
+}
+
+#[test]
+fn empty_requirepass_disables_authentication() {
+    let engine = KvEngine::new();
+    engine.set_requirepass(Some(b"secret".to_vec())).unwrap();
+    assert!(engine.auth_required());
+    assert!(engine.authenticate(b"secret").unwrap());
+
+    // Redis semantics: an empty password turns authentication off instead of
+    // requiring the empty string.
+    engine.set_requirepass(Some(Vec::new())).unwrap();
+    assert!(!engine.auth_required());
+    assert!(
+        engine.authenticate(b"").is_err(),
+        "AUTH must be rejected when no password is configured"
+    );
+}
+
+#[test]
+fn sweep_cursor_eventually_reaches_every_key() {
+    let engine = KvEngine::new();
+    for i in 0..200u32 {
+        engine
+            .set(format!("k{i:03}").into_bytes(), b"v".to_vec())
+            .unwrap();
+    }
+    let victim: Vec<u8> = b"k137".to_vec();
+    {
+        let mut store = engine.store.write().unwrap();
+        if let Some(entry) = store.get_mut(victim.as_slice()) {
+            entry.expire_at = Some(Instant::now() - Duration::from_secs(1));
+        }
+    }
+
+    // Sampling one key per tick must eventually visit the victim. The old
+    // implementation always re-examined the same HashMap bucket prefix, so a
+    // key outside it was never actively expired.
+    let mut evicted = 0;
+    for _ in 0..1000 {
+        evicted += engine.sweep_expired(1).unwrap().evicted;
+        if evicted > 0 {
+            break;
+        }
+    }
+    assert_eq!(evicted, 1, "the rotating cursor must reach every key");
+    assert_eq!(engine.expired_keys(), 1);
+}

@@ -76,3 +76,9 @@ loglevel info
 # Address the built-in web dashboard listens on. Enabled by default on
 # 127.0.0.1:6381. Set to "off" to disable the dashboard entirely.
 # dashboard-addr 127.0.0.1:6381
+
+# Shared secret required on every /api/* dashboard request. Required when
+# `dashboard-addr` is not a loopback address; optional on loopback, where
+# cross-origin (CSRF) requests are rejected instead.
+# dashboard-token "change-me"
+
