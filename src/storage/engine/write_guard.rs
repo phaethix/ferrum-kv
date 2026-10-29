@@ -324,6 +324,9 @@ impl<'a> WriteGuard<'a> {
         if let Some(entry) = self.store.get_mut(key) {
             entry.expire_at = Some(deadline);
         }
+        // A key that just gained a TTL becomes a volatile-scope candidate.
+        self.engine.sieve_notify_insert(key, true);
+        self.engine.ac_notify_insert(key, true);
         self.log(
             "PEXPIREAT",
             self.engine
@@ -351,6 +354,9 @@ impl<'a> WriteGuard<'a> {
             return Ok(false);
         }
         entry.expire_at = None;
+        // It is no longer a volatile-scope candidate.
+        self.engine.sieve_notify_remove(key);
+        self.engine.ac_notify_remove(key);
         self.log(
             "PERSIST",
             self.engine.aof.as_ref().map(|a| a.append_persist(key)),

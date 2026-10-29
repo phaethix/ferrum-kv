@@ -1121,3 +1121,42 @@ fn sweep_cursor_eventually_reaches_every_key() {
     assert_eq!(evicted, 1, "the rotating cursor must reach every key");
     assert_eq!(engine.expired_keys(), 1);
 }
+
+#[test]
+fn volatile_sieve_queue_tracks_only_ttl_keys() {
+    let engine = KvEngine::new();
+    engine
+        .set_eviction_config(EvictionConfig {
+            policy: EvictionPolicy::VolatileSieve,
+            ..Default::default()
+        })
+        .unwrap();
+
+    for i in 0..50u32 {
+        engine
+            .set(format!("p{i:02}").into_bytes(), b"v".to_vec())
+            .unwrap();
+    }
+    assert_eq!(
+        engine.sieve.lock().unwrap().len(),
+        0,
+        "persistent keys must not enter a volatile-scope queue"
+    );
+
+    engine.set(b"t".to_vec(), b"v".to_vec()).unwrap();
+    engine
+        .expire_at_ms(b"t", current_epoch_ms() + 60_000)
+        .unwrap();
+    assert_eq!(
+        engine.sieve.lock().unwrap().len(),
+        1,
+        "gaining a TTL must enqueue the key"
+    );
+
+    engine.persist(b"t").unwrap();
+    assert_eq!(
+        engine.sieve.lock().unwrap().len(),
+        0,
+        "losing the TTL must dequeue the key"
+    );
+}

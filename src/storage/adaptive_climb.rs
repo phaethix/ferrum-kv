@@ -61,6 +61,8 @@ use crate::storage::eviction::EvictionScope;
 pub(crate) struct AdaptiveClimbState {
     queue: IndexMap<Vec<u8>, ()>,
     jump: usize,
+    /// Only keys with a TTL are tracked under [`EvictionScope::Volatile`].
+    scope: EvictionScope,
 }
 
 impl Default for AdaptiveClimbState {
@@ -74,6 +76,7 @@ impl AdaptiveClimbState {
         Self {
             queue: IndexMap::new(),
             jump: 1,
+            scope: EvictionScope::AllKeys,
         }
     }
 
@@ -91,7 +94,14 @@ impl AdaptiveClimbState {
     /// Records a (re)insertion of `key`: bump `jump`, then splice the key in
     /// at index `len - jump` (the paper's miss rule). An existing key is
     /// removed first so an overwrite re-enters like a fresh miss.
-    pub(crate) fn observe_insert(&mut self, key: &[u8]) {
+    ///
+    /// Under [`EvictionScope::Volatile`] a key without a TTL is not a
+    /// candidate, so it is removed rather than tracked.
+    pub(crate) fn observe_insert(&mut self, key: &[u8], has_ttl: bool) {
+        if matches!(self.scope, EvictionScope::Volatile) && !has_ttl {
+            self.observe_remove(key);
+            return;
+        }
         self.queue.shift_remove(key);
         self.clamp_jump();
         let len = self.queue.len();
@@ -147,6 +157,7 @@ impl AdaptiveClimbState {
     pub(crate) fn rebuild(&mut self, store: &HashMap<Vec<u8>, ValueEntry>, scope: EvictionScope) {
         self.queue.clear();
         self.jump = 1;
+        self.scope = scope;
         for (key, entry) in store.iter() {
             let eligible = match scope {
                 EvictionScope::AllKeys => true,
@@ -249,8 +260,8 @@ mod tests {
         // First key is the only key (MRU). Second key prepends, pushing the
         // first to the LRU end.
         let mut s = AdaptiveClimbState::new();
-        s.observe_insert(b"a");
-        s.observe_insert(b"b");
+        s.observe_insert(b"a", false);
+        s.observe_insert(b"b", false);
         assert_eq!(s.position(b"b"), Some(0));
         assert_eq!(s.position(b"a"), Some(1));
     }
@@ -258,8 +269,8 @@ mod tests {
     #[test]
     fn evict_picks_lru_end() {
         let mut s = AdaptiveClimbState::new();
-        s.observe_insert(b"a");
-        s.observe_insert(b"b"); // b is MRU, a is LRU
+        s.observe_insert(b"a", false);
+        s.observe_insert(b"b", false); // b is MRU, a is LRU
         let store = store_with(&[("a", entry_no_ttl()), ("b", entry_no_ttl())]);
         let victim = s.evict_one(&store, EvictionScope::AllKeys);
         assert_eq!(victim.as_deref(), Some(&b"a"[..]));
@@ -269,8 +280,8 @@ mod tests {
     fn hit_promotes_key_toward_mru() {
         // a (LRU), b (MRU). A hit on `a` must move it up by `jump`.
         let mut s = AdaptiveClimbState::new();
-        s.observe_insert(b"a");
-        s.observe_insert(b"b");
+        s.observe_insert(b"a", false);
+        s.observe_insert(b"b", false);
         assert_eq!(s.position(b"a"), Some(1));
         s.observe_access(b"a");
         // After a hit `jump` was at least decremented and `a` moved up; it is
@@ -281,9 +292,9 @@ mod tests {
     #[test]
     fn repeated_hits_keep_hot_key_at_mru() {
         let mut s = AdaptiveClimbState::new();
-        s.observe_insert(b"a");
-        s.observe_insert(b"b");
-        s.observe_insert(b"c"); // order: c MRU, b, a LRU
+        s.observe_insert(b"a", false);
+        s.observe_insert(b"b", false);
+        s.observe_insert(b"c", false); // order: c MRU, b, a LRU
         for _ in 0..5 {
             s.observe_access(b"a"); // repeatedly hit the LRU key
         }
@@ -297,9 +308,9 @@ mod tests {
         // Insert a (MRU), then overwrite it. The key re-enters and the list
         // still contains exactly one entry.
         let mut s = AdaptiveClimbState::new();
-        s.observe_insert(b"a");
+        s.observe_insert(b"a", false);
         s.observe_access(b"a");
-        s.observe_insert(b"a");
+        s.observe_insert(b"a", false);
         assert_eq!(s.len(), 1);
         assert_eq!(s.position(b"a"), Some(0));
     }
@@ -307,8 +318,8 @@ mod tests {
     #[test]
     fn volatile_scope_skips_keys_without_ttl() {
         let mut s = AdaptiveClimbState::new();
-        s.observe_insert(b"a"); // no TTL
-        s.observe_insert(b"b"); // no TTL
+        s.observe_insert(b"a", false); // no TTL
+        s.observe_insert(b"b", false); // no TTL
         let store = store_with(&[("a", entry_no_ttl()), ("b", entry_no_ttl())]);
         // No key has a TTL under volatile scope → no eligible victim.
         assert!(s.evict_one(&store, EvictionScope::Volatile).is_none());
@@ -317,8 +328,8 @@ mod tests {
     #[test]
     fn volatile_scope_evicts_ttl_key_at_lru() {
         let mut s = AdaptiveClimbState::new();
-        s.observe_insert(b"a"); // no TTL
-        s.observe_insert(b"b"); // TTL → LRU end, sole eligible victim
+        s.observe_insert(b"a", false); // no TTL
+        s.observe_insert(b"b", false); // TTL → LRU end, sole eligible victim
         let store = store_with(&[("a", entry_no_ttl()), ("b", entry_with_ttl(60_000))]);
         let victim = s.evict_one(&store, EvictionScope::Volatile);
         assert_eq!(victim.as_deref(), Some(&b"b"[..]));
@@ -327,8 +338,8 @@ mod tests {
     #[test]
     fn tombstone_in_store_is_skipped() {
         let mut s = AdaptiveClimbState::new();
-        s.observe_insert(b"a");
-        s.observe_insert(b"b");
+        s.observe_insert(b"a", false);
+        s.observe_insert(b"b", false);
         // `a` is gone from the store but still in the list — `b` (LRU-end
         // eligible) must be chosen instead.
         let store = store_with(&[("b", entry_no_ttl())]);
@@ -339,18 +350,32 @@ mod tests {
     #[test]
     fn jump_starts_at_one_when_empty() {
         let mut s = AdaptiveClimbState::new();
-        s.observe_insert(b"a");
+        s.observe_insert(b"a", false);
         assert_eq!(s.jump(), 1);
     }
 
     #[test]
     fn rebuild_repopulates_from_store() {
         let mut s = AdaptiveClimbState::new();
-        s.observe_insert(b"stale");
+        s.observe_insert(b"stale", false);
         let store = store_with(&[("a", entry_no_ttl()), ("b", entry_no_ttl())]);
         s.rebuild(&store, EvictionScope::AllKeys);
         assert_eq!(s.len(), 2);
         let victim = s.evict_one(&store, EvictionScope::AllKeys);
         assert!(victim.is_some());
+    }
+
+    #[test]
+    fn volatile_scope_ignores_keys_without_ttl() {
+        let mut s = AdaptiveClimbState::new();
+        let store = HashMap::new();
+        s.rebuild(&store, EvictionScope::Volatile);
+
+        s.observe_insert(b"plain", false);
+        s.observe_insert(b"ttl", true);
+        assert_eq!(s.len(), 1, "only TTL keys belong in a volatile list");
+
+        s.observe_insert(b"ttl", false);
+        assert_eq!(s.len(), 0);
     }
 }

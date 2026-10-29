@@ -56,6 +56,11 @@ pub(crate) struct SieveState {
     queue: IndexMap<Vec<u8>, bool>,
     /// Index of the hand into `queue`. Wraps modulo `queue.len()`.
     hand: usize,
+    /// Which subset of the keyspace this queue tracks. Under
+    /// [`EvictionScope::Volatile`] only keys with a TTL are enqueued, so a
+    /// dataset full of persistent keys cannot bloat the queue or force the
+    /// hand to skip them one by one during eviction.
+    scope: EvictionScope,
     /// For SIEVE-S: keys within this fraction of the TTL horizon are
     /// force-demoted (treated as not-visited).
     pub ttl_demote_threshold: f64,
@@ -72,6 +77,7 @@ impl SieveState {
         Self {
             queue: IndexMap::new(),
             hand: 0,
+            scope: EvictionScope::AllKeys,
             ttl_demote_threshold: SIEVE_S_TTL_THRESHOLD,
         }
     }
@@ -80,7 +86,16 @@ impl SieveState {
     /// its `visited` bit cleared, exactly as SIEVE's `insert` does. For a key
     /// already in the queue the bit is reset in place but its position is
     /// kept, mirroring a fresh write of an existing object.
-    pub(crate) fn observe_insert(&mut self, key: &[u8]) {
+    ///
+    /// `has_ttl` reflects the entry's TTL *after* the write (a plain `SET`
+    /// clears it). Under [`EvictionScope::Volatile`] a key without a TTL is
+    /// never a candidate, so it is dropped from the queue instead of being
+    /// enqueued and lazily skipped later.
+    pub(crate) fn observe_insert(&mut self, key: &[u8], has_ttl: bool) {
+        if matches!(self.scope, EvictionScope::Volatile) && !has_ttl {
+            self.observe_remove(key);
+            return;
+        }
         self.queue.insert(key.to_vec(), false);
     }
 
@@ -112,6 +127,7 @@ impl SieveState {
     pub(crate) fn rebuild(&mut self, store: &HashMap<Vec<u8>, ValueEntry>, scope: EvictionScope) {
         self.queue.clear();
         self.hand = 0;
+        self.scope = scope;
         for (key, entry) in store.iter() {
             let eligible = match scope {
                 EvictionScope::AllKeys => true,
@@ -244,8 +260,8 @@ mod tests {
     fn quick_demotion_evicts_unvisited_first() {
         // a visited, b not. SIEVE should evict b (the unvisited one).
         let mut s = SieveState::new();
-        s.observe_insert(b"a");
-        s.observe_insert(b"b");
+        s.observe_insert(b"a", false);
+        s.observe_insert(b"b", false);
         s.observe_access(b"a"); // a.visited = true
         let store = store_with(&[("a", entry_no_ttl()), ("b", entry_no_ttl())]);
         let victim = s.evict_one(&store, EvictionScope::AllKeys, false, Instant::now());
@@ -256,8 +272,8 @@ mod tests {
     fn all_visited_evicts_hand_position_after_clearing() {
         // Both visited: hand clears a, then b, then wraps to a (now false).
         let mut s = SieveState::new();
-        s.observe_insert(b"a");
-        s.observe_insert(b"b");
+        s.observe_insert(b"a", false);
+        s.observe_insert(b"b", false);
         s.observe_access(b"a");
         s.observe_access(b"b");
         let store = store_with(&[("a", entry_no_ttl()), ("b", entry_no_ttl())]);
@@ -269,7 +285,7 @@ mod tests {
     fn single_visited_key_is_evicted() {
         // n = 1, entirely visited: must still yield a victim.
         let mut s = SieveState::new();
-        s.observe_insert(b"only");
+        s.observe_insert(b"only", false);
         s.observe_access(b"only");
         let store = store_with(&[("only", entry_no_ttl())]);
         let victim = s.evict_one(&store, EvictionScope::AllKeys, false, Instant::now());
@@ -290,8 +306,8 @@ mod tests {
     fn volatile_scope_skips_keys_without_ttl() {
         // Only `a` has a TTL; under volatile scope it is the sole candidate.
         let mut s = SieveState::new();
-        s.observe_insert(b"a");
-        s.observe_insert(b"b"); // no TTL
+        s.observe_insert(b"a", false);
+        s.observe_insert(b"b", false); // no TTL
         s.observe_access(b"a");
         let store = store_with(&[("a", entry_with_ttl(60_000)), ("b", entry_no_ttl())]);
         let victim = s.evict_one(&store, EvictionScope::Volatile, false, Instant::now());
@@ -301,8 +317,8 @@ mod tests {
     #[test]
     fn volatile_scope_with_no_ttl_keys_yields_none() {
         let mut s = SieveState::new();
-        s.observe_insert(b"a");
-        s.observe_insert(b"b");
+        s.observe_insert(b"a", false);
+        s.observe_insert(b"b", false);
         let store = store_with(&[("a", entry_no_ttl()), ("b", entry_no_ttl())]);
         assert!(
             s.evict_one(&store, EvictionScope::Volatile, false, Instant::now())
@@ -316,8 +332,8 @@ mod tests {
         // Plain SIEVE would evict `far` (FIFO order); SIEVE-S should evict
         // the near-expiry `near` instead.
         let mut plain = SieveState::new();
-        plain.observe_insert(b"far");
-        plain.observe_insert(b"near");
+        plain.observe_insert(b"far", false);
+        plain.observe_insert(b"near", false);
         plain.observe_access(b"far");
         plain.observe_access(b"near");
         let store = store_with(&[
@@ -329,8 +345,8 @@ mod tests {
         assert_eq!(plain_victim.as_deref(), Some(&b"far"[..]));
 
         let mut aware = SieveState::new();
-        aware.observe_insert(b"far");
-        aware.observe_insert(b"near");
+        aware.observe_insert(b"far", false);
+        aware.observe_insert(b"near", false);
         aware.observe_access(b"far");
         aware.observe_access(b"near");
         let aware_victim = aware.evict_one(&store, EvictionScope::AllKeys, true, Instant::now());
@@ -356,9 +372,9 @@ mod tests {
     #[test]
     fn observe_remove_keeps_queue_consistent() {
         let mut s = SieveState::new();
-        s.observe_insert(b"a");
-        s.observe_insert(b"b");
-        s.observe_insert(b"c");
+        s.observe_insert(b"a", false);
+        s.observe_insert(b"b", false);
+        s.observe_insert(b"c", false);
         s.observe_remove(b"b");
         assert_eq!(s.len(), 2);
         let store = store_with(&[("a", entry_no_ttl()), ("c", entry_no_ttl())]);
@@ -370,11 +386,26 @@ mod tests {
     #[test]
     fn rebuild_repopulates_from_store() {
         let mut s = SieveState::new();
-        s.observe_insert(b"stale");
+        s.observe_insert(b"stale", false);
         let store = store_with(&[("a", entry_no_ttl()), ("b", entry_no_ttl())]);
         s.rebuild(&store, EvictionScope::AllKeys);
         assert_eq!(s.len(), 2);
         let victim = s.evict_one(&store, EvictionScope::AllKeys, false, Instant::now());
         assert!(victim.is_some());
+    }
+
+    #[test]
+    fn volatile_scope_ignores_keys_without_ttl() {
+        let mut s = SieveState::new();
+        let store = HashMap::new();
+        s.rebuild(&store, EvictionScope::Volatile);
+
+        s.observe_insert(b"plain", false);
+        s.observe_insert(b"ttl", true);
+        assert_eq!(s.len(), 1, "only TTL keys belong in a volatile queue");
+
+        // Losing the TTL (plain SET / PERSIST) drops it from the queue.
+        s.observe_insert(b"ttl", false);
+        assert_eq!(s.len(), 0);
     }
 }

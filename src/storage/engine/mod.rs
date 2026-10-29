@@ -598,12 +598,12 @@ impl KvEngine {
     /// do not use a stateful index pay nothing for it (previously every write
     /// cloned the key into two `IndexMap`s regardless of the active policy).
     #[inline]
-    fn sieve_notify_insert(&self, key: &[u8]) {
+    fn sieve_notify_insert(&self, key: &[u8], has_ttl: bool) {
         if !index_kind::is_sieve(self.index_kind.load(Ordering::Relaxed)) {
             return;
         }
         if let Ok(mut s) = self.sieve.lock() {
-            s.observe_insert(key);
+            s.observe_insert(key, has_ttl);
         }
     }
 
@@ -631,12 +631,12 @@ impl KvEngine {
 
     /// Mirrors a (re)insertion into the AdaptiveClimb ordered list.
     #[inline]
-    fn ac_notify_insert(&self, key: &[u8]) {
+    fn ac_notify_insert(&self, key: &[u8], has_ttl: bool) {
         if !index_kind::is_ac(self.index_kind.load(Ordering::Relaxed)) {
             return;
         }
         if let Ok(mut s) = self.ac.lock() {
-            s.observe_insert(key);
+            s.observe_insert(key, has_ttl);
         }
     }
 
@@ -1105,14 +1105,15 @@ impl KvEngine {
         entry: ValueEntry,
     ) -> Option<ValueEntry> {
         let incoming = util::entry_bytes(&key, &entry);
+        let has_ttl = entry.expire_at.is_some();
         let previous = store.insert(key.clone(), entry);
         let outgoing = previous
             .as_ref()
             .map(|p| util::entry_bytes(&key, p))
             .unwrap_or(0);
         self.apply_delta(incoming as i64 - outgoing as i64);
-        self.sieve_notify_insert(&key);
-        self.ac_notify_insert(&key);
+        self.sieve_notify_insert(&key, has_ttl);
+        self.ac_notify_insert(&key, has_ttl);
         previous
     }
 
