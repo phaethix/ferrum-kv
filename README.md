@@ -197,8 +197,8 @@ dashboard on `:6381`; both paths run through the same `execute_command`.
 The shared **`KvEngine`** (`src/storage`) owns the single
 `RwLock<HashMap>` keyspace and dispatches over 16 eviction policies.
 **AOF** (`src/persistence`) is optional (`--aof-path`) and appends RESP2
-frames synchronously inside the store write lock, replayed on the next
-boot. The expire sweeper, the AOF fsync thread (`--appendfsync
+frames inside the store write lock — the `fsync` barrier runs after the
+lock is released — and is replayed on the next boot. The expire sweeper, the AOF fsync thread (`--appendfsync
 everysec`), and the dashboard each run outside the main tokio runtime.
 
 ## CLI Flags
