@@ -273,7 +273,9 @@ pub fn parse_frame(buf: &[u8]) -> Result<FrameParse, FerrumError> {
         )));
     }
 
-    let mut parts: Vec<Vec<u8>> = Vec::with_capacity(count);
+    // Do not pre-allocate from the header alone: `*1048576\r\n` is 12 bytes
+    // and would otherwise force a multi-megabyte allocation up front.
+    let mut parts: Vec<Vec<u8>> = Vec::with_capacity(count.min(64));
     for _ in 0..count {
         match read_bulk_string(buf, cursor)? {
             Some((s, next)) => {
@@ -301,9 +303,12 @@ pub fn parse_frame(buf: &[u8]) -> Result<FrameParse, FerrumError> {
 
 /// Upper bound on the number of elements in a single array frame.
 ///
-/// Chosen generously enough for any command FerrumKV implements while still
-/// rejecting obviously malicious inputs that try to force huge allocations.
-const MAX_ARRAY_ELEMENTS: usize = 1024;
+/// FerrumKV only implements bulk-string arrays, so this is purely a sanity
+/// bound; the real limit is the per-connection read buffer (`READ_BUF_MAX`):
+/// an array large enough to matter cannot fit in it. 1 Mi elements is well
+/// past anything `MSET`/`MGET` needs and still bounds the work a single frame
+/// can request.
+const MAX_ARRAY_ELEMENTS: usize = 1 << 20;
 
 /// Upper bound on the byte length of a single bulk string.
 ///
@@ -1202,8 +1207,17 @@ mod frame_tests {
     fn rejects_oversized_array() {
         // Count larger than MAX_ARRAY_ELEMENTS should fail immediately without
         // trying to allocate or read elements.
-        let err = parse_frame(b"*1000000\r\n").unwrap_err();
+        let err = parse_frame(b"*2000000\r\n").unwrap_err();
         assert!(matches!(err, FerrumError::ParseError(_)));
+    }
+
+    #[test]
+    fn array_header_alone_does_not_preallocate() {
+        // A 12-byte header must not reserve room for a million elements.
+        assert!(matches!(
+            parse_frame(b"*1000000\r\n").unwrap(),
+            FrameParse::Incomplete
+        ));
     }
 
     #[test]

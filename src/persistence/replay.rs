@@ -198,7 +198,9 @@ fn read_record<R: Read>(reader: &mut R) -> Result<Option<Vec<Vec<u8>>>, ReadErro
         });
     }
 
-    let mut parts: Vec<Vec<u8>> = Vec::with_capacity(array_len as usize);
+    // Cap the pre-allocation: a corrupt length prefix must not reserve
+    // gigabytes before the payload has been read.
+    let mut parts: Vec<Vec<u8>> = Vec::with_capacity((array_len as usize).min(1024));
     for _ in 0..array_len {
         let marker = expect_byte(reader, &mut consumed)?;
         if marker != b'$' {
