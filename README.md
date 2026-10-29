@@ -240,8 +240,11 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for conventions and review process.
 | v0.5.2 | SLOWLOG, AOF REWRITE / BGREWRITEAOF |
 | v0.5.3 | MONITOR, INFO fields expansion, WriteGuard refactor |
 | v0.6.0 | RESP3 protocol: HELLO handshake, typed replies (null/boolean/double/map), INCRBYFLOAT |
-| v0.6 | RESP3 protocol, typed replies, client-side caching |
+| v0.6.1 | Security and performance hardening: dashboard token/CSRF, AUTH redaction, shared-lock reads, scoped eviction indexes |
 | v0.7 | List, Hash, Set data types |
+| v0.8 | MULTI/EXEC with WATCH (needs a per-key version) |
+| v0.9 | ACL users and per-command permissions |
+| — | TLS is intentionally out of scope: terminate it in front of FerrumKV (stunnel, Envoy, cloud LB). See [SECURITY.md](./SECURITY.md). |
 
 Full roadmap: [`docs/design/product-strategy.md`](docs/design/product-strategy.md)
 
